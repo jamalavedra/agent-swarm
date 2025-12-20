@@ -280,7 +280,7 @@ function Help() {
           <Box width={30}>
             <Text color="yellow">-m, --msg {"<prompt>"}</Text>
           </Box>
-          <Text>Custom prompt (default: /setup-leader)</Text>
+          <Text>Custom prompt (default: /start-leader)</Text>
         </Box>
         <Box>
           <Box width={30}>

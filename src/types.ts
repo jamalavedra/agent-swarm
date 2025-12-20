@@ -62,7 +62,7 @@ export const AgentSchema = z.object({
   status: AgentStatusSchema,
 
   // Profile fields
-  description: z.string().max(500).optional(),
+  description: z.string().optional(),
   role: z.string().max(100).optional(), // Free-form, e.g., "frontend dev"
   capabilities: z.array(z.string()).default([]), // e.g., ["typescript", "react"]
 
@@ -117,7 +117,7 @@ export const ServiceSchema = z.object({
   agentId: z.uuid(),
   name: z.string().min(1).max(50),
   port: z.number().int().min(1).max(65535).default(3000),
-  description: z.string().max(500).optional(),
+  description: z.string().optional(),
   url: z.string().url().optional(),
   healthCheckPath: z.string().default("/health"),
   status: ServiceStatusSchema.default("starting"),

@@ -29,9 +29,8 @@ export const registerReadMessagesTool = (server: McpServer) => {
           .number()
           .int()
           .min(1)
-          .max(100)
           .default(20)
-          .describe("Max messages to return per channel (default: 20, max: 100)."),
+          .describe("Max messages to return per channel (default: 20)."),
         since: z.iso.datetime().optional().describe("Only messages after this ISO timestamp."),
         unreadOnly: z.boolean().default(false).describe("Only return unread messages."),
         mentionsOnly: z

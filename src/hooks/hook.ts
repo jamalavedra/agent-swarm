@@ -290,6 +290,12 @@ ${hasAgentIdHeader() ? `You have a pre-defined agent ID via header: ${mcpConfig?
       break;
 
     case "Stop":
+      // Save PM2 processes before shutdown (for container restart persistence)
+      try {
+        await Bun.$`pm2 save`.quiet();
+      } catch {
+        // PM2 not available or no processes - silently ignore
+      }
       // Mark the agent as offline
       await close();
       break;

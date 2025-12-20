@@ -18,7 +18,7 @@ export const registerJoinSwarmTool = (server: McpServer) => {
           .describe("Requested ID for the agent (overridden by X-Agent-ID header)."),
         lead: z.boolean().default(false).describe("Whether this agent should be the lead."),
         name: z.string().min(1).describe("The name of the agent joining the swarm."),
-        description: z.string().max(500).optional().describe("Agent description (max 500 chars)."),
+        description: z.string().optional().describe("Agent description."),
         role: z
           .string()
           .max(100)

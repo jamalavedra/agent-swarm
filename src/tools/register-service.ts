@@ -27,7 +27,7 @@ export const registerRegisterServiceTool = (server: McpServer) => {
           .default(3000)
           .optional()
           .describe("Port the service runs on (default: 3000)."),
-        description: z.string().max(500).optional().describe("What this service does."),
+        description: z.string().optional().describe("What this service does."),
         healthCheckPath: z
           .string()
           .optional()

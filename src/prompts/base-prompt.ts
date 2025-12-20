@@ -70,6 +70,8 @@ Port 3000 is exposed for web apps or APIs. Use PM2 for robust process management
 - \`pm2 logs [name]\` - View logs
 - \`pm2 list\` - Show running processes
 
+PM2 processes are auto-saved on session end and restored on container restart.
+
 **Service Registry Tools:**
 - \`register-service\` - Register your service for discovery by other agents
 - \`unregister-service\` - Remove your service from the registry

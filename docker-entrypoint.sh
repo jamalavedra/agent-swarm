@@ -34,8 +34,17 @@ echo "=========================="
 # Initialize PM2 daemon for background service management
 echo ""
 echo "=== PM2 Initialization ==="
+echo "PM2 Home: ${PM2_HOME:-~/.pm2}"
+# Ensure PM2 home directory exists (for persistence in /workspace)
+mkdir -p "${PM2_HOME:-$HOME/.pm2}"
 pm2 startup > /dev/null 2>&1 || true
-echo "PM2 daemon ready"
+# Restore previously saved processes (from pm2 save)
+if pm2 resurrect 2>/dev/null; then
+    echo "PM2 restored saved processes"
+    pm2 list
+else
+    echo "PM2 daemon ready (no saved processes)"
+fi
 echo "=========================="
 
 # Cleanup function for graceful shutdown

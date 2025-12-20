@@ -4,7 +4,7 @@ export type LeadOptions = RunnerOptions;
 
 const leadConfig: RunnerConfig = {
   role: "lead",
-  defaultPrompt: "/setup-leader Setup the agent swarm and begin coordinating workers!",
+  defaultPrompt: "/start-leader Coordinate the swarm workers!",
   yoloEnvVar: "LEAD_YOLO",
   logDirEnvVar: "LEAD_LOG_DIR",
   metadataType: "lead_metadata",

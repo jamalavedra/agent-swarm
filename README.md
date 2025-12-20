@@ -244,6 +244,7 @@ chmod 666 ./work/.mcp.json
 | `STARTUP_SCRIPT_STRICT` | No | Exit on startup script failure (default: `true`) |
 | `SWARM_URL` | No | Base domain for service URLs (default: `localhost`) |
 | `SERVICE_PORT` | No | Host port for exposed services (default: `3000`) |
+| `PM2_HOME` | No | PM2 state directory (default: `/workspace/.pm2`) |
 
 ### Startup Scripts
 
@@ -302,7 +303,10 @@ pm2 start index.js --name my-api  # Start a service
 pm2 stop|restart|delete my-api    # Manage services
 pm2 logs [name]                   # View logs
 pm2 list                          # Show running processes
+pm2 save                          # Save process list (auto-runs on session end)
 ```
+
+> **Note:** PM2 processes are automatically saved when the Claude session ends and restored on container restart. PM2 state is stored in `/workspace/.pm2` (via `PM2_HOME` env var) so it persists in the mounted volume.
 
 **MCP Tools for Service Registry:**
 - `register-service` - Register your service for discovery

@@ -12,7 +12,7 @@ export const registerUpdateProfileTool = (server: McpServer) => {
       description:
         "Updates the calling agent's profile information (description, role, capabilities).",
       inputSchema: z.object({
-        description: z.string().max(500).optional().describe("Agent description (max 500 chars)."),
+        description: z.string().optional().describe("Agent description."),
         role: z
           .string()
           .max(100)
