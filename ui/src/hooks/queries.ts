@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient, useInfiniteQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import type { AgentWithTasks } from "../types/api";
 
@@ -88,6 +88,42 @@ export function useMessages(channelId: string, filters?: MessageFilters) {
   });
 }
 
+const DEFAULT_MESSAGE_LIMIT = 100;
+
+export function useInfiniteMessages(channelId: string, pageSize = DEFAULT_MESSAGE_LIMIT) {
+  return useInfiniteQuery({
+    queryKey: ["infiniteMessages", channelId],
+    queryFn: async ({ pageParam }) => {
+      const result = await api.fetchMessages(channelId, {
+        limit: pageSize,
+        before: pageParam,
+      });
+      return result.messages;
+    },
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => {
+      // If we got fewer messages than requested, there are no more
+      if (lastPage.length < pageSize) return undefined;
+      // Get the oldest message's createdAt for the next page
+      const oldest = lastPage[0]; // Messages are in chronological order, first is oldest
+      return oldest?.createdAt;
+    },
+    enabled: !!channelId,
+    select: (data) => {
+      // Flatten all pages and dedupe by id, keeping chronological order
+      const allMessages = data.pages.flat();
+      const seen = new Set<string>();
+      const deduped = allMessages.filter((msg) => {
+        if (seen.has(msg.id)) return false;
+        seen.add(msg.id);
+        return true;
+      });
+      // Sort chronologically (oldest first)
+      return deduped.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    },
+  });
+}
+
 export function useThreadMessages(channelId: string, messageId: string) {
   return useQuery({
     queryKey: ["thread", channelId, messageId],
@@ -108,8 +144,9 @@ export function usePostMessage(channelId: string) {
         mentions: params.mentions,
       }),
     onSuccess: (_data, variables) => {
-      // Invalidate channel messages
+      // Invalidate channel messages (both regular and infinite)
       queryClient.invalidateQueries({ queryKey: ["messages", channelId] });
+      queryClient.invalidateQueries({ queryKey: ["infiniteMessages", channelId] });
       // Also invalidate thread if this was a reply
       if (variables.replyToId) {
         queryClient.invalidateQueries({ queryKey: ["thread", channelId, variables.replyToId] });

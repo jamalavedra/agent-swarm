@@ -681,7 +681,7 @@ export function getAllTasks(filters?: TaskFilters): AgentTask[] {
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  const query = `SELECT * FROM agent_tasks ${whereClause} ORDER BY priority DESC, lastUpdatedAt DESC`;
+  const query = `SELECT * FROM agent_tasks ${whereClause} ORDER BY lastUpdatedAt DESC, priority DESC`;
 
   let tasks = getDb()
     .prepare<AgentTaskRow, (string | AgentTaskStatus)[]>(query)

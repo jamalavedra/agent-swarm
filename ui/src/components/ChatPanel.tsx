@@ -1,16 +1,18 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import Box from "@mui/joy/Box";
 import Typography from "@mui/joy/Typography";
-import Input from "@mui/joy/Input";
+import Textarea from "@mui/joy/Textarea";
 import IconButton from "@mui/joy/IconButton";
 import Card from "@mui/joy/Card";
 import Link from "@mui/joy/Link";
 import Tooltip from "@mui/joy/Tooltip";
 import Drawer from "@mui/joy/Drawer";
 import { useColorScheme } from "@mui/joy/styles";
-import { useChannels, useMessages, useThreadMessages, usePostMessage, useAgents } from "../hooks/queries";
+import { useChannels, useInfiniteMessages, useThreadMessages, usePostMessage, useAgents } from "../hooks/queries";
 import type { ChannelMessage, Agent } from "../types/api";
 import { formatSmartTime } from "@/lib/utils";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 interface MentionInputProps {
   value: string;
@@ -27,7 +29,7 @@ interface MentionInputProps {
   isDark: boolean;
 }
 
-function MentionInput({
+const MentionInput = React.memo(function MentionInput({
   value,
   onChange,
   onSend,
@@ -46,7 +48,7 @@ function MentionInput({
   const [mentionStartPos, setMentionStartPos] = useState(0);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [mentions, setMentions] = useState<string[]>([]);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
 
   // Filter agents based on query
@@ -79,7 +81,7 @@ function MentionInput({
     }
   }, [value]);
 
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newValue = e.target.value;
     const cursorPos = e.target.selectionStart || 0;
     onChange(newValue);
@@ -166,13 +168,19 @@ function MentionInput({
   }, []);
 
   return (
-    <Box sx={{ position: "relative", display: "flex", gap: 1.5, flex: 1 }}>
-      <Input
-        ref={inputRef}
+    <Box sx={{ position: "relative", display: "flex", gap: 1.5, flex: 1, alignItems: "flex-end" }}>
+      <Textarea
+        slotProps={{
+          textarea: {
+            ref: inputRef,
+          },
+        }}
         placeholder={placeholder}
         value={value}
         onChange={handleInputChange}
         onKeyDown={handleKeyDown}
+        minRows={1}
+        maxRows={5}
         sx={{ ...inputStyles, flex: 1 }}
       />
 
@@ -239,17 +247,38 @@ function MentionInput({
                 }}
               />
               <Box sx={{ flex: 1, minWidth: 0 }}>
-                <Typography
-                  sx={{
-                    fontFamily: "'Space Grotesk', sans-serif",
-                    fontWeight: 600,
-                    fontSize: "0.85rem",
-                    color: colors.amber,
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {agent.name}
-                </Typography>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                  <Typography
+                    sx={{
+                      fontFamily: "'Space Grotesk', sans-serif",
+                      fontWeight: 600,
+                      fontSize: "0.85rem",
+                      color: agent.isLead ? colors.honey : colors.amber,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {agent.name}
+                  </Typography>
+                  {agent.isLead && (
+                    <Typography
+                      sx={{
+                        fontFamily: "'JetBrains Mono', monospace",
+                        fontSize: "0.55rem",
+                        fontWeight: 700,
+                        color: colors.honey,
+                        bgcolor: isDark ? "rgba(255, 184, 77, 0.15)" : "rgba(184, 115, 0, 0.1)",
+                        px: 0.75,
+                        py: 0.2,
+                        borderRadius: "4px",
+                        border: "1px solid",
+                        borderColor: isDark ? "rgba(255, 184, 77, 0.3)" : "rgba(184, 115, 0, 0.25)",
+                        letterSpacing: "0.05em",
+                      }}
+                    >
+                      LEAD
+                    </Typography>
+                  )}
+                </Box>
                 {agent.role && (
                   <Typography
                     sx={{
@@ -277,6 +306,73 @@ function MentionInput({
       </Box>
     </Box>
   );
+});
+
+// Helper to format date for dividers
+function formatDateDivider(dateStr: string): string {
+  const date = new Date(dateStr);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const messageDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
+  if (messageDate.getTime() === today.getTime()) {
+    return `Today (${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })})`;
+  }
+
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (messageDate.getTime() === yesterday.getTime()) {
+    return `Yesterday (${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })})`;
+  }
+
+  return date.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+    year: messageDate.getFullYear() !== now.getFullYear() ? "numeric" : undefined,
+  });
+}
+
+// Get date key for grouping (YYYY-MM-DD)
+function getDateKey(dateStr: string): string {
+  const date = new Date(dateStr);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+interface DateDividerProps {
+  date: string;
+  isDark: boolean;
+  colors: Record<string, string>;
+}
+
+function DateDivider({ date, isDark, colors }: DateDividerProps) {
+  return (
+    <Box
+      sx={{
+        display: "flex",
+        alignItems: "center",
+        gap: 2,
+        px: 2,
+        py: 1.5,
+        my: 1,
+      }}
+    >
+      <Box sx={{ flex: 1, height: 1, bgcolor: isDark ? "rgba(212, 165, 116, 0.2)" : "rgba(139, 105, 20, 0.15)" }} />
+      <Typography
+        sx={{
+          fontFamily: "'JetBrains Mono', monospace",
+          fontSize: "0.7rem",
+          fontWeight: 600,
+          color: colors.gold,
+          letterSpacing: "0.03em",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {formatDateDivider(date)}
+      </Typography>
+      <Box sx={{ flex: 1, height: 1, bgcolor: isDark ? "rgba(212, 165, 116, 0.2)" : "rgba(139, 105, 20, 0.15)" }} />
+    </Box>
+  );
 }
 
 interface MessageItemProps {
@@ -289,6 +385,7 @@ interface MessageItemProps {
   onAgentClick?: (agentId: string) => void;
   isSelected?: boolean;
   agentsByName?: Map<string, string>; // name -> id mapping for @mentions
+  isLeadAgent?: boolean; // Whether the message sender is the lead agent
 }
 
 function MessageItem({
@@ -301,8 +398,10 @@ function MessageItem({
   onAgentClick,
   isSelected,
   agentsByName,
+  isLeadAgent,
 }: MessageItemProps) {
   const [copied, setCopied] = useState(false);
+  const [showRaw, setShowRaw] = useState(false);
   const hasReplies = threadCount && threadCount > 0;
 
   const handleCopy = useCallback(() => {
@@ -311,97 +410,122 @@ function MessageItem({
     setTimeout(() => setCopied(false), 2000);
   }, [message.content]);
 
-  // Parse message content to make @mentions clickable
-  const renderContent = useMemo(() => {
-    if (!agentsByName || agentsByName.size === 0) {
-      return message.content;
-    }
+  const toggleRaw = useCallback(() => {
+    setShowRaw((prev) => !prev);
+  }, []);
 
-    // Build a regex pattern from agent names (sorted by length, longest first to match "master lord" before "master")
-    const agentNames = Array.from(agentsByName.keys()).sort((a, b) => b.length - a.length);
-    if (agentNames.length === 0) {
-      return message.content;
-    }
-
-    // Escape special regex characters in agent names
-    const escapedNames = agentNames.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    const mentionPattern = new RegExp(`@(${escapedNames.join('|')})(?=\\s|$|[.,!?;:])`, 'g');
-
-    const parts: React.ReactNode[] = [];
-    let lastIndex = 0;
-    let match;
-
-    while ((match = mentionPattern.exec(message.content)) !== null) {
-      // Add text before the mention
-      if (match.index > lastIndex) {
-        parts.push(message.content.slice(lastIndex, match.index));
+  // Custom markdown components to handle @mentions
+  const markdownComponents = useMemo(() => {
+    // Helper to render text with @mentions
+    const renderTextWithMentions = (text: string): React.ReactNode => {
+      if (!agentsByName || agentsByName.size === 0) {
+        return text;
       }
 
-      const mentionName = match[1] ?? "";
-      const agentId = agentsByName.get(mentionName);
+      // Build regex for agent names (longest first)
+      const agentNames = Array.from(agentsByName.keys()).sort((a, b) => b.length - a.length);
+      if (agentNames.length === 0) return text;
 
-      if (agentId && onAgentClick) {
-        const clickAgentId = agentId; // capture for closure
-        // Clickable mention
-        parts.push(
-          <Link
-            key={`${match.index}-${mentionName}`}
-            component="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onAgentClick(clickAgentId);
-            }}
-            sx={{
-              fontFamily: "'Space Grotesk', sans-serif",
-              fontWeight: 600,
-              fontSize: "inherit",
-              color: colors.amber,
-              textDecoration: "none",
-              cursor: "pointer",
-              whiteSpace: "nowrap",
-              bgcolor: isDark ? "rgba(245, 166, 35, 0.1)" : "rgba(212, 136, 6, 0.08)",
-              px: 0.5,
-              borderRadius: "4px",
-              "&:hover": {
-                textDecoration: "underline",
-                color: colors.honey,
-                bgcolor: isDark ? "rgba(245, 166, 35, 0.15)" : "rgba(212, 136, 6, 0.12)",
-              },
-            }}
-          >
-            @{mentionName}
-          </Link>
-        );
-      } else {
-        // Non-linked mention (agent not found)
-        parts.push(
-          <Box
-            key={`${match.index}-${mentionName}`}
-            component="span"
-            sx={{
-              fontWeight: 600,
-              color: colors.gold,
-              whiteSpace: "nowrap",
-              bgcolor: isDark ? "rgba(212, 165, 116, 0.1)" : "rgba(139, 105, 20, 0.08)",
-              px: 0.5,
-              borderRadius: "4px",
-            }}
-          >
-            @{mentionName}
-          </Box>
-        );
+      const escapedNames = agentNames.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+      const mentionPattern = new RegExp(`@(${escapedNames.join('|')})(?=\\s|$|[.,!?;:])`, 'g');
+
+      const parts: React.ReactNode[] = [];
+      let lastIndex = 0;
+      let match;
+      let keyCounter = 0;
+
+      while ((match = mentionPattern.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+          parts.push(text.slice(lastIndex, match.index));
+        }
+
+        const mentionName = match[1] ?? "";
+        const agentId = agentsByName.get(mentionName);
+
+        if (agentId && onAgentClick) {
+          parts.push(
+            <Link
+              key={`mention-${keyCounter++}`}
+              component="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onAgentClick(agentId);
+              }}
+              sx={{
+                fontFamily: "inherit",
+                fontWeight: 600,
+                fontSize: "inherit",
+                color: colors.amber,
+                textDecoration: "none",
+                cursor: "pointer",
+                bgcolor: isDark ? "rgba(245, 166, 35, 0.1)" : "rgba(212, 136, 6, 0.08)",
+                px: 0.5,
+                borderRadius: "4px",
+                "&:hover": {
+                  textDecoration: "underline",
+                  color: colors.honey,
+                },
+              }}
+            >
+              @{mentionName}
+            </Link>
+          );
+        } else {
+          parts.push(
+            <Box
+              key={`mention-${keyCounter++}`}
+              component="span"
+              sx={{
+                fontWeight: 600,
+                color: colors.gold,
+                bgcolor: isDark ? "rgba(212, 165, 116, 0.1)" : "rgba(139, 105, 20, 0.08)",
+                px: 0.5,
+                borderRadius: "4px",
+              }}
+            >
+              @{mentionName}
+            </Box>
+          );
+        }
+
+        lastIndex = match.index + match[0].length;
       }
 
-      lastIndex = match.index + match[0].length;
-    }
+      if (lastIndex < text.length) {
+        parts.push(text.slice(lastIndex));
+      }
 
-    // Add remaining text
-    if (lastIndex < message.content.length) {
-      parts.push(message.content.slice(lastIndex));
-    }
+      return parts.length > 0 ? parts : text;
+    };
 
-    return parts.length > 0 ? parts : message.content;
-  }, [message.content, agentsByName, onAgentClick, colors, isDark]);
+    return {
+      // Process text nodes to handle @mentions
+      p: ({ children }: { children?: React.ReactNode }) => {
+        const processChildren = (child: React.ReactNode): React.ReactNode => {
+          if (typeof child === "string") {
+            return renderTextWithMentions(child);
+          }
+          if (Array.isArray(child)) {
+            return child.map((c, i) => <React.Fragment key={i}>{processChildren(c)}</React.Fragment>);
+          }
+          return child;
+        };
+        return <p>{processChildren(children)}</p>;
+      },
+      li: ({ children }: { children?: React.ReactNode }) => {
+        const processChildren = (child: React.ReactNode): React.ReactNode => {
+          if (typeof child === "string") {
+            return renderTextWithMentions(child);
+          }
+          if (Array.isArray(child)) {
+            return child.map((c, i) => <React.Fragment key={i}>{processChildren(c)}</React.Fragment>);
+          }
+          return child;
+        };
+        return <li>{processChildren(children)}</li>;
+      },
+    };
+  }, [agentsByName, onAgentClick, colors, isDark]);
 
   return (
     <Box
@@ -430,19 +554,32 @@ function MessageItem({
     >
       {/* Header row */}
       <Box sx={{ display: "flex", alignItems: "center", gap: 1.5 }}>
-        {/* Agent indicator dot */}
-        <Box
-          sx={{
-            width: 8,
-            height: 8,
-            borderRadius: "50%",
-            bgcolor: message.agentId ? colors.amber : colors.blue,
-            flexShrink: 0,
-            boxShadow: message.agentId
-              ? (isDark ? "0 0 6px rgba(245, 166, 35, 0.4)" : "0 0 4px rgba(212, 136, 6, 0.3)")
-              : "0 0 6px rgba(59, 130, 246, 0.4)",
-          }}
-        />
+        {/* Indicator - hexagon for lead, dot for others */}
+        {isLeadAgent ? (
+          <Box
+            sx={{
+              width: 10,
+              height: 12,
+              clipPath: "polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%)",
+              bgcolor: colors.honey,
+              flexShrink: 0,
+              boxShadow: isDark ? "0 0 8px rgba(255, 184, 77, 0.5)" : "0 0 6px rgba(184, 115, 0, 0.4)",
+            }}
+          />
+        ) : (
+          <Box
+            sx={{
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              bgcolor: message.agentId ? colors.amber : colors.blue,
+              flexShrink: 0,
+              boxShadow: message.agentId
+                ? (isDark ? "0 0 6px rgba(245, 166, 35, 0.4)" : "0 0 4px rgba(212, 136, 6, 0.3)")
+                : "0 0 6px rgba(59, 130, 246, 0.4)",
+            }}
+          />
+        )}
 
         {/* Agent name - clickable if agent */}
         {message.agentId && onAgentClick ? (
@@ -456,13 +593,13 @@ function MessageItem({
               fontFamily: "'Space Grotesk', sans-serif",
               fontWeight: 600,
               fontSize: "0.85rem",
-              color: colors.amber,
+              color: isLeadAgent ? colors.honey : colors.amber,
               textDecoration: "none",
               cursor: "pointer",
               whiteSpace: "nowrap",
               "&:hover": {
                 textDecoration: "underline",
-                color: colors.honey,
+                color: isLeadAgent ? "#FFD699" : colors.honey,
               },
             }}
           >
@@ -474,11 +611,32 @@ function MessageItem({
               fontFamily: "'Space Grotesk', sans-serif",
               fontWeight: 600,
               fontSize: "0.85rem",
-              color: message.agentId ? colors.amber : colors.blue,
+              color: message.agentId ? (isLeadAgent ? colors.honey : colors.amber) : colors.blue,
               whiteSpace: "nowrap",
             }}
           >
             {message.agentName || "Human"}
+          </Typography>
+        )}
+
+        {/* Lead badge */}
+        {isLeadAgent && (
+          <Typography
+            sx={{
+              fontFamily: "'JetBrains Mono', monospace",
+              fontSize: "0.55rem",
+              fontWeight: 700,
+              color: colors.honey,
+              bgcolor: isDark ? "rgba(255, 184, 77, 0.15)" : "rgba(184, 115, 0, 0.1)",
+              px: 0.75,
+              py: 0.2,
+              borderRadius: "4px",
+              border: "1px solid",
+              borderColor: isDark ? "rgba(255, 184, 77, 0.3)" : "rgba(184, 115, 0, 0.25)",
+              letterSpacing: "0.05em",
+            }}
+          >
+            LEAD
           </Typography>
         )}
 
@@ -527,6 +685,29 @@ function MessageItem({
 
         {/* Action icons - appear on hover */}
         <Box className="action-icons" sx={{ display: "flex", gap: 0.5, opacity: 0, transition: "opacity 0.2s ease" }}>
+          {/* Toggle raw/markdown */}
+          <Tooltip title={showRaw ? "Show formatted" : "Show raw"} placement="top">
+            <IconButton
+              size="sm"
+              variant="plain"
+              onClick={toggleRaw}
+              sx={{
+                color: showRaw ? colors.amber : "text.tertiary",
+                fontSize: "0.75rem",
+                fontFamily: "'JetBrains Mono', monospace",
+                fontWeight: 600,
+                width: 28,
+                height: 28,
+                "&:hover": {
+                  color: colors.amber,
+                  bgcolor: colors.hoverBg,
+                },
+              }}
+            >
+              {showRaw ? "MD" : "</>"}
+            </IconButton>
+          </Tooltip>
+
           {/* Copy button */}
           <Tooltip title={copied ? "Copied!" : "Copy message"} placement="top">
             <IconButton
@@ -574,20 +755,134 @@ function MessageItem({
       </Box>
 
       {/* Message content */}
-      <Typography
-        component="div"
-        sx={{
-          fontFamily: "'Space Grotesk', sans-serif",
-          fontSize: "0.85rem",
-          color: "text.primary",
-          lineHeight: 1.5,
-          whiteSpace: "pre-wrap",
-          wordBreak: "break-word",
-          pl: 2.25,
-        }}
-      >
-        {renderContent}
-      </Typography>
+      {showRaw ? (
+        <Typography
+          component="div"
+          sx={{
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: "0.8rem",
+            color: "text.primary",
+            lineHeight: 1.5,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            pl: 2.25,
+            bgcolor: isDark ? "rgba(0, 0, 0, 0.2)" : "rgba(0, 0, 0, 0.03)",
+            borderRadius: "6px",
+            p: 1.5,
+            ml: 2.25,
+            mr: 1,
+          }}
+        >
+          {message.content}
+        </Typography>
+      ) : (
+        <Box
+          sx={{
+            pl: 2.25,
+            fontFamily: "'Space Grotesk', sans-serif",
+            fontSize: "0.85rem",
+            color: "text.primary",
+            lineHeight: 1.6,
+            wordBreak: "break-word",
+            "& p": {
+              m: 0,
+              mb: 0.5,
+              "&:last-child": { mb: 0 },
+            },
+            "& h1, & h2, & h3, & h4, & h5, & h6": {
+              fontFamily: "'Space Grotesk', sans-serif",
+              fontWeight: 600,
+              mt: 1,
+              mb: 0.5,
+              color: colors.amber,
+            },
+            "& h1": { fontSize: "1.25rem" },
+            "& h2": { fontSize: "1.1rem" },
+            "& h3": { fontSize: "1rem" },
+            "& code": {
+              fontFamily: "'JetBrains Mono', monospace",
+              fontSize: "0.8rem",
+              bgcolor: isDark ? "rgba(0, 0, 0, 0.3)" : "rgba(0, 0, 0, 0.06)",
+              px: 0.5,
+              py: 0.25,
+              borderRadius: "4px",
+            },
+            "& pre": {
+              bgcolor: isDark ? "rgba(0, 0, 0, 0.3)" : "rgba(0, 0, 0, 0.06)",
+              borderRadius: "6px",
+              p: 1.5,
+              overflow: "auto",
+              my: 1,
+              "& code": {
+                bgcolor: "transparent",
+                p: 0,
+              },
+            },
+            "& ul": {
+              pl: 2.5,
+              my: 0.5,
+              listStyleType: "disc",
+            },
+            "& ol": {
+              pl: 2.5,
+              my: 0.5,
+              listStyleType: "decimal",
+            },
+            "& li": {
+              mb: 0.25,
+              display: "list-item",
+            },
+            "& blockquote": {
+              borderLeft: "3px solid",
+              borderColor: colors.amber,
+              pl: 1.5,
+              ml: 0,
+              my: 1,
+              color: "text.secondary",
+              fontStyle: "italic",
+            },
+            "& a": {
+              color: colors.amber,
+              textDecoration: "none",
+              "&:hover": {
+                textDecoration: "underline",
+              },
+            },
+            "& table": {
+              borderCollapse: "collapse",
+              my: 1,
+              fontSize: "0.8rem",
+            },
+            "& th, & td": {
+              border: "1px solid",
+              borderColor: "neutral.outlinedBorder",
+              px: 1,
+              py: 0.5,
+            },
+            "& th": {
+              bgcolor: isDark ? "rgba(0, 0, 0, 0.2)" : "rgba(0, 0, 0, 0.04)",
+              fontWeight: 600,
+            },
+            "& hr": {
+              border: "none",
+              borderTop: "1px solid",
+              borderColor: "neutral.outlinedBorder",
+              my: 1,
+            },
+            "& img": {
+              maxWidth: "100%",
+              borderRadius: "6px",
+            },
+          }}
+        >
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={markdownComponents}
+          >
+            {message.content}
+          </ReactMarkdown>
+        </Box>
+      )}
     </Box>
   );
 }
@@ -639,7 +934,7 @@ export default function ChatPanel({
   const { mode } = useColorScheme();
   const isDark = mode === "dark";
 
-  const colors = {
+  const colors = useMemo(() => ({
     amber: isDark ? "#F5A623" : "#D48806",
     gold: isDark ? "#D4A574" : "#8B6914",
     honey: isDark ? "#FFB84D" : "#B87300",
@@ -651,10 +946,16 @@ export default function ChatPanel({
     amberBorder: isDark ? "rgba(245, 166, 35, 0.3)" : "rgba(212, 136, 6, 0.25)",
     inputBg: isDark ? "rgba(13, 9, 6, 0.6)" : "rgba(255, 255, 255, 0.8)",
     inputBorder: isDark ? "#3A2D1F" : "#E5D9CA",
-  };
+  }), [isDark]);
 
   const { data: channels, isLoading: channelsLoading } = useChannels();
-  const { data: messages, isLoading: messagesLoading } = useMessages(selectedChannelId || "");
+  const {
+    data: messages,
+    isLoading: messagesLoading,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteMessages(selectedChannelId || "");
   const { data: threadMessages } = useThreadMessages(
     selectedChannelId || "",
     selectedThreadId || ""
@@ -668,6 +969,15 @@ export default function ChatPanel({
     const map = new Map<string, string>();
     agents?.forEach((agent) => map.set(agent.name, agent.id));
     return map;
+  }, [agents]);
+
+  // Create set of lead agent IDs
+  const leadAgentIds = useMemo(() => {
+    const set = new Set<string>();
+    agents?.forEach((agent) => {
+      if (agent.isLead) set.add(agent.id);
+    });
+    return set;
   }, [agents]);
 
   // Track mentions for main and thread inputs
@@ -754,16 +1064,16 @@ export default function ChatPanel({
     }
   }, [onNavigateToAgent]);
 
-  // Input styles shared between main and thread
-  const inputStyles = {
+  // Input styles shared between main and thread (memoized to prevent re-renders)
+  const inputStyles = useMemo(() => ({
     flex: 1,
     fontFamily: "'Space Grotesk', sans-serif",
-    fontSize: "0.875rem",
+    fontSize: "16px", // 16px prevents iOS zoom on focus
     bgcolor: colors.inputBg,
     borderColor: colors.inputBorder,
     borderRadius: "8px",
-    "--Input-focusedThickness": "2px",
-    "--Input-focusedHighlight": colors.amber,
+    "--Textarea-focusedThickness": "2px",
+    "--Textarea-focusedHighlight": colors.amber,
     "&:hover": {
       borderColor: isDark ? "#4A3A2F" : "#D1C5B4",
     },
@@ -771,26 +1081,30 @@ export default function ChatPanel({
       borderColor: colors.amber,
       boxShadow: isDark ? "0 0 0 2px rgba(245, 166, 35, 0.15)" : "0 0 0 2px rgba(212, 136, 6, 0.1)",
     },
-    "& input": {
+    "& textarea": {
       fontFamily: "'Space Grotesk', sans-serif",
+      fontSize: "16px", // 16px prevents iOS zoom on focus
       color: isDark ? "#FFF8E7" : "#1A130E",
     },
-    "& input::placeholder": {
+    "& textarea::placeholder": {
       color: isDark ? "#8B7355" : "#8B7355",
       fontFamily: "'Space Grotesk', sans-serif",
     },
-  };
+  }), [colors.inputBg, colors.inputBorder, colors.amber, isDark]);
 
-  const sendButtonStyles = {
+  const sendButtonStyles = useMemo(() => ({
     fontFamily: "'Space Grotesk', sans-serif",
-    fontSize: "0.8rem",
+    fontSize: "0.9rem",
     fontWeight: 600,
     letterSpacing: "0.03em",
-    px: 2.5,
+    px: 3,
+    py: 1.5,
+    minHeight: 44, // Good touch target size
     borderRadius: "8px",
     bgcolor: colors.amber,
     color: isDark ? "#1A130E" : "#FFFFFF",
     border: "none",
+    cursor: "pointer",
     transition: "all 0.2s ease",
     "&:hover": {
       bgcolor: colors.honey,
@@ -802,10 +1116,11 @@ export default function ChatPanel({
     },
     "&:disabled": {
       opacity: 0.5,
+      cursor: "not-allowed",
       transform: "none",
       boxShadow: "none",
     },
-  };
+  }), [colors.amber, colors.honey, isDark]);
 
   // Channel list content - reused in drawer and desktop sidebar
   const channelListContent = (
@@ -1102,19 +1417,65 @@ export default function ChatPanel({
             </Box>
           ) : (
             <>
-              {topLevelMessages.map((message) => (
-                <MessageItem
-                  key={message.id}
-                  message={message}
-                  isDark={isDark}
-                  colors={colors}
-                  onOpenThread={() => handleOpenThread(message)}
-                  threadCount={replyCounts.get(message.id)}
-                  onAgentClick={handleAgentClick}
-                  isSelected={selectedThreadMessage?.id === message.id}
-                  agentsByName={agentsByName}
-                />
-              ))}
+              {/* Load more button */}
+              {hasNextPage && (
+                <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
+                  <Box
+                    component="button"
+                    onClick={() => fetchNextPage()}
+                    disabled={isFetchingNextPage}
+                    sx={{
+                      fontFamily: "'Space Grotesk', sans-serif",
+                      fontSize: "0.8rem",
+                      fontWeight: 600,
+                      color: colors.amber,
+                      bgcolor: "transparent",
+                      border: "1px solid",
+                      borderColor: colors.amberBorder,
+                      borderRadius: "6px",
+                      px: 3,
+                      py: 1,
+                      cursor: isFetchingNextPage ? "wait" : "pointer",
+                      transition: "all 0.2s ease",
+                      opacity: isFetchingNextPage ? 0.6 : 1,
+                      "&:hover": {
+                        bgcolor: colors.hoverBg,
+                        borderColor: colors.amber,
+                      },
+                    }}
+                  >
+                    {isFetchingNextPage ? "Loading..." : "Load older messages"}
+                  </Box>
+                </Box>
+              )}
+
+              {/* Messages with date dividers */}
+              {(() => {
+                let lastDateKey = "";
+                return topLevelMessages.map((message) => {
+                  const dateKey = getDateKey(message.createdAt);
+                  const showDivider = dateKey !== lastDateKey;
+                  lastDateKey = dateKey;
+                  return (
+                    <React.Fragment key={message.id}>
+                      {showDivider && (
+                        <DateDivider date={message.createdAt} isDark={isDark} colors={colors} />
+                      )}
+                      <MessageItem
+                        message={message}
+                        isDark={isDark}
+                        colors={colors}
+                        onOpenThread={() => handleOpenThread(message)}
+                        threadCount={replyCounts.get(message.id)}
+                        onAgentClick={handleAgentClick}
+                        isSelected={selectedThreadMessage?.id === message.id}
+                        agentsByName={agentsByName}
+                        isLeadAgent={message.agentId ? leadAgentIds.has(message.agentId) : false}
+                      />
+                    </React.Fragment>
+                  );
+                });
+              })()}
               <div ref={messagesEndRef} />
             </>
           )}
@@ -1243,6 +1604,8 @@ export default function ChatPanel({
               borderBottom: "1px solid",
               borderColor: "neutral.outlinedBorder",
               bgcolor: isDark ? "rgba(245, 166, 35, 0.03)" : "rgba(212, 136, 6, 0.02)",
+              maxHeight: "30vh",
+              overflow: "auto",
             }}
           >
             <MessageItem
@@ -1252,6 +1615,7 @@ export default function ChatPanel({
               isThreadView
               onAgentClick={handleAgentClick}
               agentsByName={agentsByName}
+              isLeadAgent={selectedThreadMessage.agentId ? leadAgentIds.has(selectedThreadMessage.agentId) : false}
             />
           </Box>
 
@@ -1290,6 +1654,7 @@ export default function ChatPanel({
                     isThreadView
                     onAgentClick={handleAgentClick}
                     agentsByName={agentsByName}
+                    isLeadAgent={message.agentId ? leadAgentIds.has(message.agentId) : false}
                   />
                 ))}
                 <div ref={threadEndRef} />
