@@ -508,6 +508,7 @@ export default function Dashboard({ onSettingsClick }: DashboardProps) {
               onSelectChannel={handleSelectChannel}
               onSelectThread={handleSelectThread}
               onNavigateToAgent={handleNavigateToAgent}
+              onNavigateToTask={handleNavigateToTask}
             />
           </TabPanel>
 

@@ -1338,6 +1338,10 @@ export function postMessage(
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
 
+  // Detect /task prefix - only create tasks when explicitly requested
+  const isTaskMessage = content.trimStart().startsWith("/task ");
+  const messageContent = isTaskMessage ? content.replace(/^\s*\/task\s+/, "") : content;
+
   const row = getDb()
     .prepare<
       ChannelMessageRow,
@@ -1350,7 +1354,7 @@ export function postMessage(
       id,
       channelId,
       agentId,
-      content,
+      messageContent,
       options?.replyToId ?? null,
       JSON.stringify(options?.mentions ?? []),
       now,
@@ -1366,10 +1370,11 @@ export function postMessage(
     });
   } catch {}
 
-  // Determine which agents should receive tasks
+  // Determine which agents should receive task notifications
   let targetMentions = options?.mentions ?? [];
 
   // Thread follow-up: If no explicit mentions and this is a reply, inherit from parent message
+  // Note: Only for notifications, not for task creation (requires explicit /task)
   if (targetMentions.length === 0 && options?.replyToId) {
     const parentMessage = getMessageById(options.replyToId);
     if (parentMessage?.mentions && parentMessage.mentions.length > 0) {
@@ -1377,43 +1382,59 @@ export function postMessage(
     }
   }
 
-  // Auto-create tasks for mentions (directly assigned to mentioned agent)
-  if (targetMentions.length > 0) {
+  // Only create tasks when /task prefix is used
+  if (isTaskMessage && targetMentions.length > 0) {
     const sender = agentId ? getAgentById(agentId) : null;
     const channel = getChannelById(channelId);
     const senderName = sender?.name ?? "Human";
     const channelName = channel?.name ?? "unknown";
-    const truncated = content.length > 80 ? `${content.slice(0, 80)}...` : content;
-    const isThreadFollowUp =
-      options?.replyToId && (!options.mentions || options.mentions.length === 0);
+    const truncated =
+      messageContent.length > 80 ? `${messageContent.slice(0, 80)}...` : messageContent;
 
     // Dedupe mentions (self-mentions allowed - agents can create tasks for themselves)
     const uniqueMentions = [...new Set(targetMentions)];
+    const createdTaskIds: string[] = [];
 
     for (const mentionedAgentId of uniqueMentions) {
       // Skip if agent doesn't exist
       const mentionedAgent = getAgentById(mentionedAgentId);
       if (!mentionedAgent) continue;
 
-      const taskDescription = isThreadFollowUp
-        ? `Thread follow-up from ${senderName} in #${channelName}: "${truncated}"`
-        : `@mention from ${senderName} in #${channelName}: "${truncated}"`;
+      const taskDescription = `Task from ${senderName} in #${channelName}: "${truncated}"`;
 
-      createTaskExtended(taskDescription, {
+      const task = createTaskExtended(taskDescription, {
         agentId: mentionedAgentId, // Direct assignment
         creatorAgentId: agentId ?? undefined,
         source: "mcp",
-        taskType: isThreadFollowUp ? "thread_followup" : "mention",
+        taskType: "task",
         priority: 50,
         mentionMessageId: id,
         mentionChannelId: channelId,
       });
+      createdTaskIds.push(task.id);
+    }
+
+    // Append task links to message content (markdown format for frontend)
+    if (createdTaskIds.length > 0) {
+      const taskLinks = createdTaskIds
+        .map((taskId) => `[#${taskId.slice(0, 8)}](task:${taskId})`)
+        .join(" ");
+      const updatedContent = `${messageContent}\n\n→ Created: ${taskLinks}`;
+      getDb()
+        .prepare(`UPDATE channel_messages SET content = ? WHERE id = ?`)
+        .run(updatedContent, id);
     }
   }
 
-  // Get agent name for the response
+  // Get agent name for the response - re-fetch to get updated content
   const agent = agentId ? getAgentById(agentId) : null;
-  return rowToChannelMessage(row, agent?.name);
+  const updatedRow = getDb()
+    .prepare<ChannelMessageRow, [string]>(
+      `SELECT m.*, a.name as agentName FROM channel_messages m
+       LEFT JOIN agents a ON m.agentId = a.id WHERE m.id = ?`,
+    )
+    .get(id);
+  return rowToChannelMessage(updatedRow ?? row, agent?.name);
 }
 
 export function getChannelMessages(

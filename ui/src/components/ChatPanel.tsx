@@ -383,6 +383,7 @@ interface MessageItemProps {
   threadCount?: number;
   isThreadView?: boolean;
   onAgentClick?: (agentId: string) => void;
+  onTaskClick?: (taskId: string) => void;
   isSelected?: boolean;
   agentsByName?: Map<string, string>; // name -> id mapping for @mentions
   isLeadAgent?: boolean; // Whether the message sender is the lead agent
@@ -396,6 +397,7 @@ function MessageItem({
   threadCount,
   isThreadView,
   onAgentClick,
+  onTaskClick,
   isSelected,
   agentsByName,
   isLeadAgent,
@@ -499,6 +501,59 @@ function MessageItem({
     };
 
     return {
+      // Handle task: links for navigating to tasks
+      a: ({ href, children }: { href?: string; children?: React.ReactNode }) => {
+        if (href?.startsWith("task:")) {
+          const taskId = href.slice(5); // Remove "task:" prefix
+          if (onTaskClick) {
+            return (
+              <Link
+                component="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onTaskClick(taskId);
+                }}
+                sx={{
+                  fontFamily: "'JetBrains Mono', monospace",
+                  fontSize: "0.85em",
+                  color: colors.gold,
+                  textDecoration: "none",
+                  cursor: "pointer",
+                  bgcolor: isDark ? "rgba(212, 165, 116, 0.1)" : "rgba(139, 105, 20, 0.08)",
+                  px: 0.75,
+                  py: 0.25,
+                  borderRadius: "4px",
+                  "&:hover": {
+                    textDecoration: "underline",
+                    bgcolor: isDark ? "rgba(212, 165, 116, 0.15)" : "rgba(139, 105, 20, 0.12)",
+                  },
+                }}
+              >
+                {children}
+              </Link>
+            );
+          }
+          // Non-clickable task reference
+          return (
+            <Box
+              component="span"
+              sx={{
+                fontFamily: "'JetBrains Mono', monospace",
+                fontSize: "0.85em",
+                color: colors.gold,
+                bgcolor: isDark ? "rgba(212, 165, 116, 0.1)" : "rgba(139, 105, 20, 0.08)",
+                px: 0.75,
+                py: 0.25,
+                borderRadius: "4px",
+              }}
+            >
+              {children}
+            </Box>
+          );
+        }
+        // Regular links - render normally
+        return <a href={href}>{children}</a>;
+      },
       // Process text nodes to handle @mentions
       p: ({ children }: { children?: React.ReactNode }) => {
         const processChildren = (child: React.ReactNode): React.ReactNode => {
@@ -525,7 +580,7 @@ function MessageItem({
         return <li>{processChildren(children)}</li>;
       },
     };
-  }, [agentsByName, onAgentClick, colors, isDark]);
+  }, [agentsByName, onAgentClick, onTaskClick, colors, isDark]);
 
   return (
     <Box
@@ -893,6 +948,7 @@ interface ChatPanelProps {
   onSelectChannel?: (channelId: string | null) => void;
   onSelectThread?: (threadId: string | null) => void;
   onNavigateToAgent?: (agentId: string) => void;
+  onNavigateToTask?: (taskId: string) => void;
 }
 
 export default function ChatPanel({
@@ -901,6 +957,7 @@ export default function ChatPanel({
   onSelectChannel,
   onSelectThread,
   onNavigateToAgent,
+  onNavigateToTask,
 }: ChatPanelProps) {
   // Internal state for uncontrolled mode
   const [internalChannelId, setInternalChannelId] = useState<string | null>(null);
@@ -1529,6 +1586,7 @@ export default function ChatPanel({
                         onOpenThread={() => handleOpenThread(message)}
                         threadCount={replyCounts.get(message.id)}
                         onAgentClick={handleAgentClick}
+                        onTaskClick={onNavigateToTask}
                         isSelected={selectedThreadMessage?.id === message.id}
                         agentsByName={agentsByName}
                         isLeadAgent={message.agentId ? leadAgentIds.has(message.agentId) : false}
@@ -1675,6 +1733,7 @@ export default function ChatPanel({
               colors={colors}
               isThreadView
               onAgentClick={handleAgentClick}
+              onTaskClick={onNavigateToTask}
               agentsByName={agentsByName}
               isLeadAgent={selectedThreadMessage.agentId ? leadAgentIds.has(selectedThreadMessage.agentId) : false}
             />
@@ -1714,6 +1773,7 @@ export default function ChatPanel({
                     colors={colors}
                     isThreadView
                     onAgentClick={handleAgentClick}
+                    onTaskClick={onNavigateToTask}
                     agentsByName={agentsByName}
                     isLeadAgent={message.agentId ? leadAgentIds.has(message.agentId) : false}
                   />
