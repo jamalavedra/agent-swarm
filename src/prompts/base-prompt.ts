@@ -38,9 +38,9 @@ As a worker agent of the swarm, you are responsible for executing tasks assigned
 #### Useful tools for workers
 
 - poll-task: Automatically waits for new tasks assigned by the lead or claimed from the unassigned pool.
-- read-messages: To read messages sent to you by the lead or other workers, by default when a task is found, it will auto-assign it to you.
 - store-progress: Critical tool to save your work and progress on tasks!
 - task-action: Manage tasks with different actions like claim, release, accept, reject, and complete.
+- read-messages: If communications enabled, use it to read messages sent to you by the lead or other workers, by default when a task is found, it will auto-assign it to you.
 `;
 
 const BASE_PROMPT_FILESYSTEM = `
@@ -57,8 +57,7 @@ const BASE_PROMPT_FILESYSTEM = `
 const BASE_PROMPT_GUIDELINES = `
 ### Agent Swarm Operational Guidelines
 
-- Communication: Use the /swarm-chat command to communicate with other agents and the human operator. Keep everyone informed of your progress and any issues you encounter. It will allow you to see the internal Slack-like communication platform to: create and view channels (or DMs), read messages, and post messages.
--
+- Follow the communicationes ettiquette and protocols established for the swarm. If not stated, do not use the chat features, focus on your tasks.
 `;
 
 const BASE_PROMPT_SYSTEM = `
@@ -67,7 +66,9 @@ const BASE_PROMPT_SYSTEM = `
 You have a full Ubuntu environment with some packages pre-installed: node, bun, python3, curl, wget, git, gh, jq, etc.
 
 If you need to install additional packages, use "sudo apt-get install {package_name}".
+`;
 
+const BASE_PROMPT_SERVICES = `
 ### External Swarm Access & Service Registry
 
 Port 3000 is exposed for web apps or APIs. Use PM2 for robust process management:
@@ -108,6 +109,7 @@ export type BasePromptArgs = {
   role: string;
   agentId: string;
   swarmUrl: string;
+  capabilities?: string[];
 };
 
 export const getBasePrompt = (args: BasePromptArgs): string => {
@@ -126,6 +128,20 @@ export const getBasePrompt = (args: BasePromptArgs): string => {
   prompt += BASE_PROMPT_FILESYSTEM;
   prompt += BASE_PROMPT_GUIDELINES;
   prompt += BASE_PROMPT_SYSTEM.replace("{swarmUrl}", swarmUrl);
+
+  if (!args.capabilities || args.capabilities.includes("services")) {
+    prompt += BASE_PROMPT_SERVICES;
+  }
+
+  if (args.capabilities) {
+    prompt += `
+### Capabilities enabled for this agent:
+
+- ${args.capabilities.join("\n- ")}
+`;
+  }
+
+  console.log(prompt);
 
   return prompt;
 };

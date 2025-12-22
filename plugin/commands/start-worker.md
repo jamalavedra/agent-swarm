@@ -54,3 +54,8 @@ To do so, use the `agent-swarm` MCP server and call the `join-swarm` with a name
 You will have your own persisted directory at `/workspace/personal`. Use it to store any files you need to keep between sessions.
 
 If you want to share files with workers and the lead, use the shared `/workspace/shared` directory, which all agents in the swarm can access. Make sure to use it if the task requires sharing files.
+
+## Communication Etiquette
+
+- ONLY follow-up if clearly stated by the user or the lead. Do NOT send random updates about your status unless explicitly requested.
+- When communicating, ALWAYS use the `/swarm-chat` command.

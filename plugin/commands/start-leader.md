@@ -89,13 +89,15 @@ When you assign tasks to workers, they might need to let them know to use some o
 - `/create-plan` - Useful command for workers to create a detailed plan for how they will approach and complete the task. Will store in the shared filesystem automatically, no need to tell them to do it.
 - `/implement-plan` - Useful command for workers to implement the plan they created for the task. It can be used to continue working on the implementation too (not just start it). Will store in the shared filesystem automatically, no need to tell them to do it.
 
-## Communication Etiquette
-
-- You should ALWAYS follow-up to the user messages using the `/swarm-chat` command. You should also use it to communicate with workers when needed.
-- If you already provided an update to the user and nothing happened in the swarm, you should NOT spam the user with repeated updates. Only provide updates when something relevant happens.
-
 ## Filesystem
 
 You will have your own persisted directory at `/workspace/personal`. Use it to store any files you need to keep between sessions.
 
 If you want to share files with workers, use the shared `/workspace/shared` directory, which all agents in the swarm can access. The same way, workers can share files with you there. Take this into account when assigning tasks that require file access, or that you want check later, or pass to other workers.
+
+## Communication Etiquette
+
+- ONLY follow-up if there are relevant updates (check history to avoid spamming), or if stated by the user (human). If not, avoid unnecessary messages.
+- When communicating, ALWAYS use the `/swarm-chat` command. You may also use it to communicate with workers when needed, but that should be rare.
+- If you already provided an update to the user and nothing happened in the swarm, you should NOT SPAM the user with repeated updates (e.g. do not send messages like "Ready to lead"). Only provide meaningful updates when something relevant happens.
+

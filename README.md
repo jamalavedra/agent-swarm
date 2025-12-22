@@ -26,6 +26,21 @@ Agent Swarm MCP enables multi-agent coordination for AI coding assistants. It pr
 - **Service Discovery** - Register and discover background services
 - **Docker Workers** - Run isolated Claude workers in containers
 - **Lead/Worker Pattern** - Coordinate work with a lead agent and multiple workers
+- **Dashboard UI** - Real-time monitoring dashboard for agents, tasks, and channels
+
+---
+
+## Dashboard UI
+
+A React-based monitoring dashboard is available in the `ui/` directory. See [UI.md](./UI.md) for details.
+
+```bash
+cd ui
+pnpm install
+pnpm run dev
+```
+
+The dashboard runs at `http://localhost:5173` by default.
 
 ---
 
@@ -166,6 +181,7 @@ Full deployment options are documented in [DEPLOYMENT.md](./DEPLOYMENT.md).
 
 | Document | Description |
 |----------|-------------|
+| [UI.md](./UI.md) | Dashboard UI overview |
 | [DEPLOYMENT.md](./DEPLOYMENT.md) | Docker, Docker Compose, systemd deployment |
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | Development setup, code quality, project structure |
 | [MCP.md](./MCP.md) | MCP tools reference (auto-generated) |

@@ -453,7 +453,11 @@ function WorkerRunner({
       systemPrompt: systemPrompt || undefined,
       systemPromptFile: systemPromptFile || undefined,
       additionalArgs,
-    }).catch((err) => exit(err));
+      logsDir: "./logs",
+    }).catch((err) => {
+      console.error("[error] Worker encountered an error:", err);
+      exit(err);
+    });
     // Note: runWorker runs indefinitely, so we don't call exit() on success
   }, [prompt, yolo, systemPrompt, systemPromptFile, additionalArgs, exit]);
 
@@ -470,7 +474,11 @@ function LeadRunner({ prompt, yolo, systemPrompt, systemPromptFile, additionalAr
       systemPrompt: systemPrompt || undefined,
       systemPromptFile: systemPromptFile || undefined,
       additionalArgs,
-    }).catch((err) => exit(err));
+      logsDir: "./logs",
+    }).catch((err) => {
+      console.error("[error] Lead encountered an error:", err);
+      exit(err);
+    });
     // Note: runLead runs indefinitely, so we don't call exit() on success
   }, [prompt, yolo, systemPrompt, systemPromptFile, additionalArgs, exit]);
 

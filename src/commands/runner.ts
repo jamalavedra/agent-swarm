@@ -33,6 +33,8 @@ export interface RunnerConfig {
   defaultPrompt: string;
   /** Metadata type for log files, e.g., "worker_metadata" */
   metadataType: string;
+  /** Optional capabilities of the agent */
+  capabilities?: string[];
 }
 
 export interface RunnerOptions {
@@ -40,6 +42,7 @@ export interface RunnerOptions {
   yolo?: boolean;
   systemPrompt?: string;
   systemPromptFile?: string;
+  logsDir?: string;
   additionalArgs?: string[];
 }
 
@@ -139,7 +142,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   setupShutdownHandlers(role);
 
   const sessionId = process.env.SESSION_ID || crypto.randomUUID().slice(0, 8);
-  const baseLogDir = process.env.LOG_DIR || "/logs";
+  const baseLogDir = opts.logsDir || process.env.LOG_DIR || "/logs";
   const logDir = `${baseLogDir}/${sessionId}`;
 
   await mkdir(logDir, { recursive: true });
@@ -152,7 +155,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   const swarmUrl = process.env.SWARM_URL || "localhost";
 
   // Generate base prompt that's always included
-  const basePrompt = getBasePrompt({ role, agentId, swarmUrl });
+  const basePrompt = getBasePrompt({ role, agentId, swarmUrl, capabilities: config.capabilities });
 
   // Resolve additional system prompt: CLI flag > env var
   let additionalSystemPrompt: string | undefined;
