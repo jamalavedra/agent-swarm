@@ -33,6 +33,7 @@ interface ParsedArgs {
   systemPrompt: string;
   systemPromptFile: string;
   additionalArgs: string[];
+  aiLoop: boolean;
 }
 
 function parseArgs(args: string[]): ParsedArgs {
@@ -48,6 +49,7 @@ function parseArgs(args: string[]): ParsedArgs {
   let systemPrompt = "";
   let systemPromptFile = "";
   let additionalArgs: string[] = [];
+  let aiLoop = false;
 
   // Find if there's a "--" separator for additional args
   const separatorIndex = args.indexOf("--");
@@ -81,6 +83,8 @@ function parseArgs(args: string[]): ParsedArgs {
     } else if (arg === "--system-prompt-file") {
       systemPromptFile = mainArgs[i + 1] || systemPromptFile;
       i++;
+    } else if (arg === "--ai-loop") {
+      aiLoop = true;
     }
   }
 
@@ -97,6 +101,7 @@ function parseArgs(args: string[]): ParsedArgs {
     systemPrompt,
     systemPromptFile,
     additionalArgs,
+    aiLoop,
   };
 }
 
@@ -268,6 +273,12 @@ function Help() {
         </Box>
         <Box>
           <Box width={30}>
+            <Text color="yellow">--ai-loop</Text>
+          </Box>
+          <Text>Use AI-based polling (legacy mode)</Text>
+        </Box>
+        <Box>
+          <Box width={30}>
             <Text color="yellow">-- {"<args...>"}</Text>
           </Box>
           <Text>Additional arguments to pass to Claude CLI</Text>
@@ -352,6 +363,12 @@ function Help() {
           </Box>
           <Text>Path to system prompt file</Text>
         </Box>
+        <Box>
+          <Box width={32}>
+            <Text color="magenta">AI_LOOP</Text>
+          </Box>
+          <Text>If "true", use AI-based polling</Text>
+        </Box>
       </Box>
     </Box>
   );
@@ -435,6 +452,7 @@ interface RunnerProps {
   systemPrompt: string;
   systemPromptFile: string;
   additionalArgs: string[];
+  aiLoop: boolean;
 }
 
 function WorkerRunner({
@@ -443,6 +461,7 @@ function WorkerRunner({
   systemPrompt,
   systemPromptFile,
   additionalArgs,
+  aiLoop,
 }: RunnerProps) {
   const { exit } = useApp();
 
@@ -454,17 +473,25 @@ function WorkerRunner({
       systemPromptFile: systemPromptFile || undefined,
       additionalArgs,
       logsDir: "./logs",
+      aiLoop,
     }).catch((err) => {
       console.error("[error] Worker encountered an error:", err);
       exit(err);
     });
     // Note: runWorker runs indefinitely, so we don't call exit() on success
-  }, [prompt, yolo, systemPrompt, systemPromptFile, additionalArgs, exit]);
+  }, [prompt, yolo, systemPrompt, systemPromptFile, additionalArgs, aiLoop, exit]);
 
   return null;
 }
 
-function LeadRunner({ prompt, yolo, systemPrompt, systemPromptFile, additionalArgs }: RunnerProps) {
+function LeadRunner({
+  prompt,
+  yolo,
+  systemPrompt,
+  systemPromptFile,
+  additionalArgs,
+  aiLoop,
+}: RunnerProps) {
   const { exit } = useApp();
 
   useEffect(() => {
@@ -475,12 +502,13 @@ function LeadRunner({ prompt, yolo, systemPrompt, systemPromptFile, additionalAr
       systemPromptFile: systemPromptFile || undefined,
       additionalArgs,
       logsDir: "./logs",
+      aiLoop,
     }).catch((err) => {
       console.error("[error] Lead encountered an error:", err);
       exit(err);
     });
     // Note: runLead runs indefinitely, so we don't call exit() on success
-  }, [prompt, yolo, systemPrompt, systemPromptFile, additionalArgs, exit]);
+  }, [prompt, yolo, systemPrompt, systemPromptFile, additionalArgs, aiLoop, exit]);
 
   return null;
 }
@@ -528,6 +556,7 @@ function App({ args }: { args: ParsedArgs }) {
     systemPrompt,
     systemPromptFile,
     additionalArgs,
+    aiLoop,
   } = args;
 
   switch (command) {
@@ -545,6 +574,7 @@ function App({ args }: { args: ParsedArgs }) {
           systemPrompt={systemPrompt}
           systemPromptFile={systemPromptFile}
           additionalArgs={additionalArgs}
+          aiLoop={aiLoop}
         />
       );
     case "lead":
@@ -555,6 +585,7 @@ function App({ args }: { args: ParsedArgs }) {
           systemPrompt={systemPrompt}
           systemPromptFile={systemPromptFile}
           additionalArgs={additionalArgs}
+          aiLoop={aiLoop}
         />
       );
     case "version":

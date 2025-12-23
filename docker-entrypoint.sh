@@ -16,6 +16,9 @@ fi
 ROLE="${AGENT_ROLE:-worker}"
 MCP_URL="${MCP_BASE_URL:-http://host.docker.internal:3013}"
 
+# Get version from compiled binary (extract just the version number)
+VERSION=$(/usr/local/bin/agent-swarm version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+
 # Determine YOLO mode based on role
 if [ "$ROLE" = "lead" ]; then
     YOLO_MODE="${LEAD_YOLO:-false}"
@@ -23,7 +26,7 @@ else
     YOLO_MODE="${WORKER_YOLO:-false}"
 fi
 
-echo "=== Agent Swarm ${ROLE^} ==="
+echo "=== Agent Swarm ${ROLE^} v${VERSION} ==="
 echo "Agent ID: ${AGENT_ID:-<not set>}"
 echo "MCP Base URL: $MCP_URL"
 echo "YOLO Mode: $YOLO_MODE"

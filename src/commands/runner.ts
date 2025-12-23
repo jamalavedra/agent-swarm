@@ -44,6 +44,7 @@ export interface RunnerOptions {
   systemPromptFile?: string;
   logsDir?: string;
   additionalArgs?: string[];
+  aiLoop?: boolean; // Use AI-based loop (old behavior)
 }
 
 interface RunClaudeIterationOptions {
@@ -52,6 +53,118 @@ interface RunClaudeIterationOptions {
   systemPrompt?: string;
   additionalArgs?: string[];
   role: string;
+}
+
+/** Trigger types returned by the poll API */
+interface Trigger {
+  type: "task_assigned" | "task_offered" | "unread_mentions" | "pool_tasks_available";
+  taskId?: string;
+  task?: unknown;
+  mentionsCount?: number;
+  count?: number;
+}
+
+/** Options for polling */
+interface PollOptions {
+  apiUrl: string;
+  apiKey: string;
+  agentId: string;
+  pollInterval: number;
+  pollTimeout: number;
+}
+
+/** Register agent via HTTP API */
+async function registerAgent(opts: {
+  apiUrl: string;
+  apiKey: string;
+  agentId: string;
+  name: string;
+  isLead: boolean;
+  capabilities?: string[];
+}): Promise<void> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-Agent-ID": opts.agentId,
+  };
+  if (opts.apiKey) {
+    headers.Authorization = `Bearer ${opts.apiKey}`;
+  }
+
+  const response = await fetch(`${opts.apiUrl}/api/agents`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      name: opts.name,
+      isLead: opts.isLead,
+      capabilities: opts.capabilities,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to register agent: ${response.status} ${error}`);
+  }
+}
+
+/** Poll for triggers via HTTP API */
+async function pollForTrigger(opts: PollOptions): Promise<Trigger | null> {
+  const startTime = Date.now();
+  const headers: Record<string, string> = {
+    "X-Agent-ID": opts.agentId,
+  };
+  if (opts.apiKey) {
+    headers.Authorization = `Bearer ${opts.apiKey}`;
+  }
+
+  while (Date.now() - startTime < opts.pollTimeout) {
+    try {
+      const response = await fetch(`${opts.apiUrl}/api/poll`, {
+        method: "GET",
+        headers,
+      });
+
+      if (!response.ok) {
+        console.warn(`[runner] Poll request failed: ${response.status}`);
+        await Bun.sleep(opts.pollInterval);
+        continue;
+      }
+
+      const data = (await response.json()) as { trigger: Trigger | null };
+      if (data.trigger) {
+        return data.trigger;
+      }
+    } catch (error) {
+      console.warn(`[runner] Poll request error: ${error}`);
+    }
+
+    await Bun.sleep(opts.pollInterval);
+  }
+
+  return null; // Timeout reached, no trigger found
+}
+
+/** Build prompt based on trigger type */
+function buildPromptForTrigger(trigger: Trigger, defaultPrompt: string): string {
+  switch (trigger.type) {
+    case "task_assigned":
+      // Use the work-on-task command with task ID
+      return `/work-on-task ${trigger.taskId}`;
+
+    case "task_offered":
+      // Use the review-offered-task command to accept/reject
+      return `/review-offered-task ${trigger.taskId}`;
+
+    case "unread_mentions":
+      // Check messages
+      return "/swarm-chat";
+
+    case "pool_tasks_available":
+      // Let lead review and assign tasks
+      return defaultPrompt;
+
+    default:
+      return defaultPrompt;
+  }
 }
 
 async function runClaudeIteration(opts: RunClaudeIterationOptions): Promise<number> {
@@ -152,10 +265,14 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
 
   // Get agent identity and swarm URL for base prompt
   const agentId = process.env.AGENT_ID || "unknown";
+
+  const apiUrl = process.env.MCP_BASE_URL || "http://localhost:3013";
   const swarmUrl = process.env.SWARM_URL || "localhost";
 
+  const capabilities = config.capabilities;
+
   // Generate base prompt that's always included
-  const basePrompt = getBasePrompt({ role, agentId, swarmUrl, capabilities: config.capabilities });
+  const basePrompt = getBasePrompt({ role, agentId, swarmUrl, capabilities });
 
   // Resolve additional system prompt: CLI flag > env var
   let additionalSystemPrompt: string | undefined;
@@ -192,67 +309,175 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     : basePrompt;
 
   console.log(`[${role}] Starting ${role}`);
+  console.log(`[${role}] Agent ID: ${agentId}`);
   console.log(`[${role}] Session ID: ${sessionId}`);
   console.log(`[${role}] Log directory: ${logDir}`);
   console.log(`[${role}] YOLO mode: ${isYolo ? "enabled" : "disabled"}`);
   console.log(`[${role}] Prompt: ${prompt}`);
-  console.log(`[${role}] Swarm URL: ${swarmUrl}`);
+  console.log(`[${role}] API URL: ${apiUrl}`);
+  console.log(`[${role}] Swarm URL: ${apiUrl}`);
   console.log(`[${role}] Base prompt: included (${basePrompt.length} chars)`);
   console.log(
     `[${role}] Additional system prompt: ${additionalSystemPrompt ? "provided" : "none"}`,
   );
   console.log(`[${role}] Total system prompt length: ${resolvedSystemPrompt.length} chars`);
 
+  const isAiLoop = opts.aiLoop || process.env.AI_LOOP === "true";
+  const apiKey = process.env.API_KEY || "";
+
+  // Constants for polling
+  const POLL_INTERVAL_MS = 2000; // 2 seconds between polls
+  const POLL_TIMEOUT_MS = 60000; // 1 minute timeout before retrying
+
   let iteration = 0;
 
-  while (true) {
-    iteration++;
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const logFile = `${logDir}/${timestamp}.jsonl`;
+  if (!isAiLoop) {
+    // NEW: Runner-level polling mode
+    console.log(`[${role}] Mode: runner-level polling (use --ai-loop for AI-based polling)`);
 
-    console.log(`\n[${role}] === Iteration ${iteration} ===`);
-    console.log(`[${role}] Logging to: ${logFile}`);
-
-    const metadata = {
-      type: metadataType,
-      sessionId,
-      iteration,
-      timestamp: new Date().toISOString(),
-      prompt,
-      yolo: isYolo,
-    };
-    await Bun.write(logFile, `${JSON.stringify(metadata)}\n`);
-
-    const exitCode = await runClaudeIteration({
-      prompt,
-      logFile,
-      systemPrompt: resolvedSystemPrompt,
-      additionalArgs: opts.additionalArgs,
-      role,
-    });
-
-    if (exitCode !== 0) {
-      const errorLog = {
-        timestamp: new Date().toISOString(),
-        iteration,
-        exitCode,
-        error: true,
-      };
-
-      const errorsFile = `${logDir}/errors.jsonl`;
-      const errorsFileRef = Bun.file(errorsFile);
-      const existingErrors = (await errorsFileRef.exists()) ? await errorsFileRef.text() : "";
-      await Bun.write(errorsFile, `${existingErrors}${JSON.stringify(errorLog)}\n`);
-
-      if (!isYolo) {
-        console.error(`[${role}] Claude exited with code ${exitCode}. Stopping.`);
-        console.error(`[${role}] Error logged to: ${errorsFile}`);
-        process.exit(exitCode);
-      }
-
-      console.warn(`[${role}] Claude exited with code ${exitCode}. YOLO mode - continuing...`);
+    // Register agent before starting
+    const agentName = process.env.AGENT_NAME || `${role}-${agentId.slice(0, 8)}`;
+    try {
+      await registerAgent({
+        apiUrl,
+        apiKey,
+        agentId,
+        name: agentName,
+        isLead: role === "lead",
+        capabilities: config.capabilities,
+      });
+      console.log(`[${role}] Registered as "${agentName}" (ID: ${agentId})`);
+    } catch (error) {
+      console.error(`[${role}] Failed to register: ${error}`);
+      process.exit(1);
     }
 
-    console.log(`[${role}] Iteration ${iteration} complete. Starting next iteration...`);
+    while (true) {
+      console.log(`\n[${role}] Polling for triggers...`);
+
+      const trigger = await pollForTrigger({
+        apiUrl,
+        apiKey,
+        agentId,
+        pollInterval: POLL_INTERVAL_MS,
+        pollTimeout: POLL_TIMEOUT_MS,
+      });
+
+      if (!trigger) {
+        console.log(`[${role}] No trigger found, polling again...`);
+        continue;
+      }
+
+      console.log(`[${role}] Trigger received: ${trigger.type}`);
+
+      // Build prompt based on trigger
+      const triggerPrompt = buildPromptForTrigger(trigger, prompt);
+
+      iteration++;
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const logFile = `${logDir}/${timestamp}.jsonl`;
+
+      console.log(`\n[${role}] === Iteration ${iteration} ===`);
+      console.log(`[${role}] Logging to: ${logFile}`);
+      console.log(`[${role}] Prompt: ${triggerPrompt}`);
+
+      const metadata = {
+        type: metadataType,
+        sessionId,
+        iteration,
+        timestamp: new Date().toISOString(),
+        prompt: triggerPrompt,
+        trigger: trigger.type,
+        yolo: isYolo,
+      };
+      await Bun.write(logFile, `${JSON.stringify(metadata)}\n`);
+
+      const exitCode = await runClaudeIteration({
+        prompt: triggerPrompt,
+        logFile,
+        systemPrompt: resolvedSystemPrompt,
+        additionalArgs: opts.additionalArgs,
+        role,
+      });
+
+      if (exitCode !== 0) {
+        const errorLog = {
+          timestamp: new Date().toISOString(),
+          iteration,
+          exitCode,
+          trigger: trigger.type,
+          error: true,
+        };
+
+        const errorsFile = `${logDir}/errors.jsonl`;
+        const errorsFileRef = Bun.file(errorsFile);
+        const existingErrors = (await errorsFileRef.exists()) ? await errorsFileRef.text() : "";
+        await Bun.write(errorsFile, `${existingErrors}${JSON.stringify(errorLog)}\n`);
+
+        if (!isYolo) {
+          console.error(`[${role}] Claude exited with code ${exitCode}. Stopping.`);
+          console.error(`[${role}] Error logged to: ${errorsFile}`);
+          process.exit(exitCode);
+        }
+
+        console.warn(`[${role}] Claude exited with code ${exitCode}. YOLO mode - continuing...`);
+      }
+
+      console.log(`[${role}] Iteration ${iteration} complete. Polling for next trigger...`);
+    }
+  } else {
+    // Original AI-loop mode (existing behavior)
+    console.log(`[${role}] Mode: AI-based polling (legacy)`);
+
+    while (true) {
+      iteration++;
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const logFile = `${logDir}/${timestamp}.jsonl`;
+
+      console.log(`\n[${role}] === Iteration ${iteration} ===`);
+      console.log(`[${role}] Logging to: ${logFile}`);
+
+      const metadata = {
+        type: metadataType,
+        sessionId,
+        iteration,
+        timestamp: new Date().toISOString(),
+        prompt,
+        yolo: isYolo,
+      };
+      await Bun.write(logFile, `${JSON.stringify(metadata)}\n`);
+
+      const exitCode = await runClaudeIteration({
+        prompt,
+        logFile,
+        systemPrompt: resolvedSystemPrompt,
+        additionalArgs: opts.additionalArgs,
+        role,
+      });
+
+      if (exitCode !== 0) {
+        const errorLog = {
+          timestamp: new Date().toISOString(),
+          iteration,
+          exitCode,
+          error: true,
+        };
+
+        const errorsFile = `${logDir}/errors.jsonl`;
+        const errorsFileRef = Bun.file(errorsFile);
+        const existingErrors = (await errorsFileRef.exists()) ? await errorsFileRef.text() : "";
+        await Bun.write(errorsFile, `${existingErrors}${JSON.stringify(errorLog)}\n`);
+
+        if (!isYolo) {
+          console.error(`[${role}] Claude exited with code ${exitCode}. Stopping.`);
+          console.error(`[${role}] Error logged to: ${errorsFile}`);
+          process.exit(exitCode);
+        }
+
+        console.warn(`[${role}] Claude exited with code ${exitCode}. YOLO mode - continuing...`);
+      }
+
+      console.log(`[${role}] Iteration ${iteration} complete. Starting next iteration...`);
+    }
   }
 }

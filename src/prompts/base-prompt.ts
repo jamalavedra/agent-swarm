@@ -141,7 +141,5 @@ export const getBasePrompt = (args: BasePromptArgs): string => {
 `;
   }
 
-  console.log(prompt);
-
   return prompt;
 };

@@ -71,149 +71,166 @@ function formatToolInput(input: Record<string, unknown>): string {
 
 /** Pretty print a single JSON line from Claude output */
 export function prettyPrintLine(line: string, role: string): void {
-  if (!line.trim()) return;
-
-  let json: Record<string, unknown>;
   try {
-    json = JSON.parse(line.trim());
-  } catch {
-    // Raw output - just print it
-    console.log(`${c.dim}[${role}]${c.reset} ${line.trim()}`);
-    return;
-  }
+    if (!line.trim()) return;
 
-  const type = json.type as string;
-  const prefix = `${c.dim}[${role}]${c.reset}`;
+    let json: Record<string, unknown>;
+    try {
+      json = JSON.parse(line.trim());
+    } catch {
+      // Raw output - just print it
+      console.log(`${c.dim}[${role}]${c.reset} ${line.trim()}`);
+      return;
+    }
 
-  switch (type) {
-    case "system": {
-      const subtype = json.subtype as string;
-      if (subtype === "init") {
-        const model = json.model as string;
-        const tools = json.tools as string[];
+    const type = json.type as string;
+    const prefix = `${c.dim}[${role}]${c.reset}`;
+
+    switch (type) {
+      case "system": {
+        const subtype = json.subtype as string;
+        if (subtype === "init") {
+          const model = json.model as string;
+          const tools = json.tools as string[];
+          console.log(
+            `${prefix} ${c.cyan}●${c.reset} ${c.bold}Session started${c.reset} ${c.dim}(${model}, ${tools?.length || 0} tools)${c.reset}`,
+          );
+        } else if (subtype === "hook_response") {
+          const hookName = json.hook_name as string;
+          const stdout = json.stdout as string;
+          console.log(`${prefix} ${c.yellow}⚡${c.reset} Hook: ${c.yellow}${hookName}${c.reset}`);
+          if (stdout) {
+            const lines = stdout.split("\n").filter((l) => l.trim());
+            for (const l of lines.slice(0, 3)) {
+              console.log(`${prefix}    ${c.dim}${truncate(l, 80)}${c.reset}`);
+            }
+            if (lines.length > 3) {
+              console.log(`${prefix}    ${c.dim}... (${lines.length - 3} more lines)${c.reset}`);
+            }
+          }
+        } else {
+          const msg = (json.message as string) || (json.content as string) || "";
+          console.log(
+            `${prefix} ${c.cyan}ℹ${c.reset} System${subtype ? ` (${subtype})` : ""}: ${truncate(msg, 100)}`,
+          );
+        }
+        break;
+      }
+
+      case "assistant": {
+        const message = json.message as Record<string, unknown>;
+        if (!message) break;
+
+        const content = message.content as Array<Record<string, unknown>>;
+        if (!content) break;
+
+        for (const block of content) {
+          if (block.type === "text") {
+            const text = block.text as string;
+            console.log(`${prefix} ${c.green}◆${c.reset} ${c.bold}Assistant:${c.reset}`);
+            // Print text with nice indentation, truncate long lines
+            const lines = text.split("\n");
+            for (const l of lines.slice(0, 5)) {
+              console.log(`${prefix}    ${truncate(l, 100)}`);
+            }
+            if (lines.length > 5) {
+              console.log(`${prefix}    ${c.dim}... (${lines.length - 5} more lines)${c.reset}`);
+            }
+          } else if (block.type === "tool_use") {
+            const toolName = formatToolName((block.name as string) || "unknown");
+            const input = (block.input as Record<string, unknown>) || {};
+            console.log(
+              `${prefix} ${c.magenta}▶${c.reset} Tool: ${c.magenta}${toolName}${c.reset}${formatToolInput(input)}`,
+            );
+          } else if (block.type === "thinking") {
+            const thinking = block.thinking as string;
+            console.log(`${prefix} ${c.blue}💭${c.reset} ${c.dim}Thinking...${c.reset}`);
+            if (thinking) {
+              console.log(`${prefix}    ${c.dim}${truncate(thinking, 80)}${c.reset}`);
+            }
+          }
+        }
+        break;
+      }
+
+      case "user": {
+        const message = json.message as Record<string, unknown>;
+        const rawToolResult = json.tool_use_result;
+        const toolResult =
+          typeof rawToolResult === "string"
+            ? rawToolResult
+            : rawToolResult
+              ? JSON.stringify(rawToolResult)
+              : null;
+
+        if (toolResult) {
+          const isError = toolResult.includes("Error") || toolResult.includes("error");
+          const icon = isError ? `${c.red}✗${c.reset}` : `${c.green}✓${c.reset}`;
+          console.log(`${prefix} ${icon} Result: ${truncate(toolResult, 100)}`);
+        } else if (message) {
+          const content = message.content as Array<Record<string, unknown>>;
+          if (content) {
+            for (const block of content) {
+              if (block.type === "tool_result") {
+                const rawResult = block.content;
+                const result =
+                  typeof rawResult === "string"
+                    ? rawResult
+                    : rawResult
+                      ? JSON.stringify(rawResult)
+                      : "";
+                const isError = block.is_error as boolean;
+                const icon = isError ? `${c.red}✗${c.reset}` : `${c.green}✓${c.reset}`;
+                console.log(`${prefix} ${icon} Result: ${truncate(result, 100)}`);
+              }
+            }
+          }
+        }
+        break;
+      }
+
+      case "result": {
+        const subtype = json.subtype as string;
+        const isError = json.is_error as boolean;
+        const duration = json.duration_ms as number;
+        const cost = json.total_cost_usd as number;
+        const numTurns = json.num_turns as number;
+        const result = json.result as string;
+
+        const icon = isError ? `${c.red}✗${c.reset}` : `${c.green}✓${c.reset}`;
+        const durationStr = duration ? `${(duration / 1000).toFixed(1)}s` : "";
+        const costStr = cost ? `$${cost.toFixed(4)}` : "";
+
         console.log(
-          `${prefix} ${c.cyan}●${c.reset} ${c.bold}Session started${c.reset} ${c.dim}(${model}, ${tools?.length || 0} tools)${c.reset}`,
+          `${prefix} ${icon} ${c.bold}Done${c.reset} ${c.dim}(${subtype}, ${numTurns} turns, ${durationStr}, ${costStr})${c.reset}`,
         );
-      } else if (subtype === "hook_response") {
-        const hookName = json.hook_name as string;
-        const stdout = json.stdout as string;
-        console.log(`${prefix} ${c.yellow}⚡${c.reset} Hook: ${c.yellow}${hookName}${c.reset}`);
-        if (stdout) {
-          const lines = stdout.split("\n").filter((l) => l.trim());
+
+        if (result) {
+          const lines = result.split("\n").filter((l) => l.trim());
           for (const l of lines.slice(0, 3)) {
-            console.log(`${prefix}    ${c.dim}${truncate(l, 80)}${c.reset}`);
+            console.log(`${prefix}    ${truncate(l, 100)}`);
           }
           if (lines.length > 3) {
             console.log(`${prefix}    ${c.dim}... (${lines.length - 3} more lines)${c.reset}`);
           }
         }
-      } else {
-        const msg = (json.message as string) || (json.content as string) || "";
-        console.log(
-          `${prefix} ${c.cyan}ℹ${c.reset} System${subtype ? ` (${subtype})` : ""}: ${truncate(msg, 100)}`,
-        );
+        break;
       }
-      break;
-    }
 
-    case "assistant": {
-      const message = json.message as Record<string, unknown>;
-      if (!message) break;
-
-      const content = message.content as Array<Record<string, unknown>>;
-      if (!content) break;
-
-      for (const block of content) {
-        if (block.type === "text") {
-          const text = block.text as string;
-          console.log(`${prefix} ${c.green}◆${c.reset} ${c.bold}Assistant:${c.reset}`);
-          // Print text with nice indentation, truncate long lines
-          const lines = text.split("\n");
-          for (const l of lines.slice(0, 5)) {
-            console.log(`${prefix}    ${truncate(l, 100)}`);
-          }
-          if (lines.length > 5) {
-            console.log(`${prefix}    ${c.dim}... (${lines.length - 5} more lines)${c.reset}`);
-          }
-        } else if (block.type === "tool_use") {
-          const toolName = formatToolName((block.name as string) || "unknown");
-          const input = (block.input as Record<string, unknown>) || {};
-          console.log(
-            `${prefix} ${c.magenta}▶${c.reset} Tool: ${c.magenta}${toolName}${c.reset}${formatToolInput(input)}`,
-          );
-        } else if (block.type === "thinking") {
-          const thinking = block.thinking as string;
-          console.log(`${prefix} ${c.blue}💭${c.reset} ${c.dim}Thinking...${c.reset}`);
-          if (thinking) {
-            console.log(`${prefix}    ${c.dim}${truncate(thinking, 80)}${c.reset}`);
-          }
-        }
+      case "error": {
+        const error = (json.error as string) || (json.message as string) || JSON.stringify(json);
+        console.log(`${prefix} ${c.red}✗ Error:${c.reset} ${truncate(error, 100)}`);
+        break;
       }
-      break;
-    }
 
-    case "user": {
-      const message = json.message as Record<string, unknown>;
-      const toolResult = json.tool_use_result as string;
-
-      if (toolResult) {
-        const isError = toolResult.includes("Error") || toolResult.includes("error");
-        const icon = isError ? `${c.red}✗${c.reset}` : `${c.green}✓${c.reset}`;
-        console.log(`${prefix} ${icon} Result: ${truncate(toolResult, 100)}`);
-      } else if (message) {
-        const content = message.content as Array<Record<string, unknown>>;
-        if (content) {
-          for (const block of content) {
-            if (block.type === "tool_result") {
-              const result = block.content as string;
-              const isError = block.is_error as boolean;
-              const icon = isError ? `${c.red}✗${c.reset}` : `${c.green}✓${c.reset}`;
-              console.log(`${prefix} ${icon} Result: ${truncate(result || "", 100)}`);
-            }
-          }
-        }
+      default: {
+        // Unknown type - print a summary
+        console.log(`${prefix} ${c.dim}[${type}]${c.reset} ${truncate(JSON.stringify(json), 100)}`);
       }
-      break;
     }
-
-    case "result": {
-      const subtype = json.subtype as string;
-      const isError = json.is_error as boolean;
-      const duration = json.duration_ms as number;
-      const cost = json.total_cost_usd as number;
-      const numTurns = json.num_turns as number;
-      const result = json.result as string;
-
-      const icon = isError ? `${c.red}✗${c.reset}` : `${c.green}✓${c.reset}`;
-      const durationStr = duration ? `${(duration / 1000).toFixed(1)}s` : "";
-      const costStr = cost ? `$${cost.toFixed(4)}` : "";
-
-      console.log(
-        `${prefix} ${icon} ${c.bold}Done${c.reset} ${c.dim}(${subtype}, ${numTurns} turns, ${durationStr}, ${costStr})${c.reset}`,
-      );
-
-      if (result) {
-        const lines = result.split("\n").filter((l) => l.trim());
-        for (const l of lines.slice(0, 3)) {
-          console.log(`${prefix}    ${truncate(l, 100)}`);
-        }
-        if (lines.length > 3) {
-          console.log(`${prefix}    ${c.dim}... (${lines.length - 3} more lines)${c.reset}`);
-        }
-      }
-      break;
-    }
-
-    case "error": {
-      const error = (json.error as string) || (json.message as string) || JSON.stringify(json);
-      console.log(`${prefix} ${c.red}✗ Error:${c.reset} ${truncate(error, 100)}`);
-      break;
-    }
-
-    default: {
-      // Unknown type - print a summary
-      console.log(`${prefix} ${c.dim}[${type}]${c.reset} ${truncate(JSON.stringify(json), 100)}`);
-    }
+  } catch (_err) {
+    // Never let pretty-print crash the runner - just log raw line
+    console.log(`${c.dim}[${role}]${c.reset} ${line}`);
   }
 }
 

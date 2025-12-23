@@ -10,16 +10,14 @@
 
 services:
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: "ghcr.io/desplega-ai/agent-swarm:latest"
+    pull_policy: always
 
     environment:
-      - ENV=${ENV:-development}
       - API_KEY=${API_KEY}
 
-      - MCP_BASE_URL=${MCP_BASE_URL:-http://localhost:3013}
-      - APP_URL=${APP_URL:-http://localhost:5175}
+      - MCP_BASE_URL=${MCP_BASE_URL}
+      - APP_URL=${APP_URL}
 
       # Optional: Enable Slack integration
       - SLACK_DISABLE=${SLACK_DISABLE:-false}
@@ -30,97 +28,102 @@ services:
       - "3013:3013"
 
     volumes:
-      # For the sqlite database
       - swarm_api:/app
 
     restart: unless-stopped
 
-  worker-1:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-
-    environment:
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
-      - API_KEY=${API_KEY}
-      - AGENT_ID=${AGENT_ID}
-      - AGENT_ROLE=worker
-
-      - MCP_BASE_URL=${MCP_BASE_URL:-http://api:3013}
-
-      # Optional environment variables
-      - SESSION_ID=${SESSION_ID:-}
-      - YOLO=${YOLO:-false}
-      # GitHub credentials for git push and PR operations
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_EMAIL=${GITHUB_EMAIL:-}
-      - GITHUB_NAME=${GITHUB_NAME:-}
-      # Service registry URL (for service discovery)
-      - SWARM_URL=${SWARM_URL:-localhost}
-
-    ports:
-      # Expose service port for PM2 processes
-      - "${SERVICE_PORT:-3001}:3000"
-
-    volumes:
-      - swarm_logs:/logs
-      # Optional: mount a workspace directory for persistent work
-      - swarm_shared:/workspace/shared
-      - swarm_worker_1/personal:/workspace/personal
-
-    restart: unless-stopped
-
-  worker-2:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-
-    environment:
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
-      - API_KEY=${API_KEY}
-      - AGENT_ID=${AGENT_ID_2}
-      - AGENT_ROLE=worker
-
-      - MCP_BASE_URL=${MCP_BASE_URL:-http://api:3013}
-
-      # Same as above...
-
-    ports:
-      # Expose service port for PM2 processes
-      - "${SERVICE_PORT:-3002}:3000"
-
-    volumes:
-      - swarm_logs:/logs
-      - swarm_shared:/workspace/shared
-      - swarm_worker_2/personal:/workspace/personal
-
-    restart: unless-stopped
-
   lead:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+    pull_policy: always
 
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
       - API_KEY=${API_KEY}
-      - AGENT_ID=${AGENT_ID_LEAD}
+      # Replace by a valid UUID
+      - AGENT_ID=d454d1a5-4df9-49bd-8a89-e58d6a657dc3
 
       # Important: Lead agent role
       - AGENT_ROLE=lead
 
-      - MCP_BASE_URL=${MCP_BASE_URL:-http://api:3013}
+      # - MCP_BASE_URL=${MCP_BASE_URL:-http://api:3013}
+      # If in the same Docker network, use the service name
+      - MCP_BASE_URL=http://api:3013
 
-      # Same as above...
+      - YOLO=true
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-}
+      - GITHUB_NAME=${GITHUB_NAME:-}
+      - SWARM_URL=${SWARM_URL:-localhost}
 
     ports:
-      # Expose service port for PM2 processes
-      - "${SERVICE_PORT:-3003}:3000"
+      - "${SERVICE_PORT:-3020}:3000"
 
     volumes:
       - swarm_logs:/logs
       - swarm_shared:/workspace/shared
-      - swarm_personal_lead:/workspace/personal
+      - swarm_lead:/workspace/personal
+
+    restart: unless-stopped
+
+  worker-1:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+    pull_policy: always
+
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - API_KEY=${API_KEY}
+      # Replace by a valid UUID
+      - AGENT_ID=38d36438-58a0-45b5-8602-a5d52b07c2f1
+      - AGENT_ROLE=worker
+
+      # - MCP_BASE_URL=${MCP_BASE_URL:-http://api:3013}
+      # If in the same Docker network, use the service name
+      - MCP_BASE_URL=http://api:3013
+
+      - YOLO=true
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-}
+      - GITHUB_NAME=${GITHUB_NAME:-}
+      - SWARM_URL=${SWARM_URL:-localhost}
+
+    ports:
+      - "${SERVICE_PORT:-3021}:3000"
+
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_worker_1:/workspace/personal
+
+    restart: unless-stopped
+
+  worker-2:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+    pull_policy: always
+
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - API_KEY=${API_KEY}
+      # Replace by a valid UUID
+      - AGENT_ID=c1e2f3a4-5678-90ab-cdef-1234567890ab
+      - AGENT_ROLE=worker
+
+      # - MCP_BASE_URL=${MCP_BASE_URL:-http://api:3013}
+      # If in the same Docker network, use the service name
+      - MCP_BASE_URL=http://api:3013
+
+      - YOLO=true
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-}
+      - GITHUB_NAME=${GITHUB_NAME:-}
+      - SWARM_URL=${SWARM_URL:-localhost}
+
+    ports:
+      - "${SERVICE_PORT:-3022}:3000"
+
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_worker_2:/workspace/personal
 
     restart: unless-stopped
 
@@ -131,7 +134,3 @@ volumes:
   swarm_lead:
   swarm_worker_1:
   swarm_worker_2:
-
-networks:
-  default:
-    driver: bridge

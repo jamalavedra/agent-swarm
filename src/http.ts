@@ -10,6 +10,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createServer } from "@/server";
 import {
   closeDb,
+  createAgent,
   getAgentById,
   getAgentWithTasks,
   getAllAgents,
@@ -24,8 +25,11 @@ import {
   getInboxSummary,
   getLogsByAgentId,
   getLogsByTaskId,
+  getOfferedTasksForAgent,
+  getPendingTaskForAgent,
   getServicesByAgentId,
   getTaskById,
+  getUnassignedTasksCount,
   postMessage,
   updateAgentStatus,
 } from "./be/db";
@@ -209,6 +213,147 @@ const httpServer = createHttpServer(async (req, res) => {
     return;
   }
 
+  // ============================================================================
+  // Runner-Level Polling Endpoints
+  // ============================================================================
+
+  const pathSegments = getPathSegments(req.url || "");
+
+  // POST /api/agents - Register a new agent (or return existing if already registered)
+  if (
+    req.method === "POST" &&
+    pathSegments[0] === "api" &&
+    pathSegments[1] === "agents" &&
+    !pathSegments[2]
+  ) {
+    // Parse request body
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+
+    // Validate required fields
+    if (!body.name || typeof body.name !== "string") {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing or invalid 'name' field" }));
+      return;
+    }
+
+    // Use X-Agent-ID header if provided, otherwise generate new UUID
+    const agentId = myAgentId || crypto.randomUUID();
+
+    // Use transaction to ensure atomicity of check-and-create/update
+    const result = getDb().transaction(() => {
+      // Check if agent already exists
+      const existingAgent = getAgentById(agentId);
+      if (existingAgent) {
+        // Update status to idle if offline
+        if (existingAgent.status === "offline") {
+          updateAgentStatus(existingAgent.id, "idle");
+        }
+        return { agent: getAgentById(agentId), created: false };
+      }
+
+      // Create new agent
+      const agent = createAgent({
+        id: agentId,
+        name: body.name,
+        isLead: body.isLead ?? false,
+        status: "idle",
+        description: body.description,
+        role: body.role,
+        capabilities: body.capabilities,
+      });
+
+      return { agent, created: true };
+    })();
+
+    res.writeHead(result.created ? 201 : 200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(result.agent));
+    return;
+  }
+
+  // GET /api/poll - Poll for triggers (tasks, mentions, etc.)
+  if (req.method === "GET" && pathSegments[0] === "api" && pathSegments[1] === "poll") {
+    if (!myAgentId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing X-Agent-ID header" }));
+      return;
+    }
+
+    // Use transaction for consistent reads across all trigger checks
+    const result = getDb().transaction(() => {
+      const agent = getAgentById(myAgentId);
+      if (!agent) {
+        return { error: "Agent not found", status: 404 };
+      }
+
+      // Check for offered tasks first (highest priority)
+      const offeredTasks = getOfferedTasksForAgent(myAgentId);
+      const firstOfferedTask = offeredTasks[0];
+      if (firstOfferedTask) {
+        return {
+          trigger: {
+            type: "task_offered",
+            taskId: firstOfferedTask.id,
+            task: firstOfferedTask,
+          },
+        };
+      }
+
+      // Check for pending tasks (assigned directly to this agent)
+      const pendingTask = getPendingTaskForAgent(myAgentId);
+      if (pendingTask) {
+        return {
+          trigger: {
+            type: "task_assigned",
+            taskId: pendingTask.id,
+            task: pendingTask,
+          },
+        };
+      }
+
+      // For lead agents, check for unread mentions
+      if (agent.isLead) {
+        const inbox = getInboxSummary(myAgentId);
+        if (inbox.mentionsCount > 0) {
+          return {
+            trigger: {
+              type: "unread_mentions",
+              mentionsCount: inbox.mentionsCount,
+            },
+          };
+        }
+
+        // Check for tasks needing assignment (unassigned tasks in pool)
+        const unassignedCount = getUnassignedTasksCount();
+        if (unassignedCount > 0) {
+          return {
+            trigger: {
+              type: "pool_tasks_available",
+              count: unassignedCount,
+            },
+          };
+        }
+      }
+
+      // No trigger found
+      return { trigger: null };
+    })();
+
+    // Handle error case
+    if ("error" in result) {
+      res.writeHead(result.status ?? 500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: result.error }));
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
   // GET /ecosystem - Generate PM2 ecosystem config for agent's services
   if (req.method === "GET" && req.url === "/ecosystem") {
     if (!myAgentId) {
@@ -249,7 +394,6 @@ const httpServer = createHttpServer(async (req, res) => {
   // REST API Endpoints (for frontend dashboard)
   // ============================================================================
 
-  const pathSegments = getPathSegments(req.url || "");
   const queryParams = parseQueryParams(req.url || "");
 
   // GET /api/agents - List all agents (optionally with tasks)

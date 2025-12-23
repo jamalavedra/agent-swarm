@@ -3,8 +3,8 @@
 import { $ } from "bun";
 import * as readline from "node:readline";
 
-const DB_PATH = "/opt/agent-swarm/agent-swarm-db.sqlite";
-const SSH_HOST = process.argv[2] || "hetzner";
+const DB_PATH = "/var/lib/docker/volumes/agent-swarm-nrz8v0_swarm_api/_data/agent-swarm-db.sqlite";
+const SSH_HOST = process.argv[2] || "swarm";
 
 console.log(`Connected to ${SSH_HOST}:${DB_PATH}`);
 console.log("Type SQL queries or .tables, .schema, etc. Ctrl+C to exit.\n");
