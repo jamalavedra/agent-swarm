@@ -118,7 +118,7 @@ WORKDIR /workspace
 VOLUME ["/logs"]
 
 RUN mkdir -p ./personal ./shared
-VOLUME ["/workspace/personal" "/workspace/shared"]
+VOLUME ["/workspace/personal", "/workspace/shared"]
 
 # Expose service port for PM2 processes
 EXPOSE 3000
