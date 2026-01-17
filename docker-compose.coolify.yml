@@ -148,3 +148,16 @@ services:
         is_directory: true
 
     exclude_from_hc: true
+
+  dashboard:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=${APP_URL:-https://swarm.yourdomain.com}
+    restart: unless-stopped
+    depends_on:
+      - api
+    labels:
+      - "coolify.managed=true"
+      - "coolify.port=80"
