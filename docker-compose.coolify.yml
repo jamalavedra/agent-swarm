@@ -149,6 +149,106 @@ services:
 
     exclude_from_hc: true
 
+  worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    stop_grace_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      # Required
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
+      - API_KEY=${API_KEY:?}
+
+      # Agent identity (stable ID for task resume)
+      - AGENT_ID=${AGENT_ID_WORKER2:-7904b1d0-110e-4e12-994b-6b468f0a4518}
+      - AGENT_NAME=${AGENT_NAME_WORKER2:-worker-2}
+      - AGENT_ROLE=worker
+
+      # Internal connection to API
+      - MCP_BASE_URL=http://api:3013
+
+      # Behavior
+      - YOLO=${YOLO:-true}
+      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+
+      # Git config
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
+      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+
+      # Specialist prompt (optional)
+      - SYSTEM_PROMPT=${SYSTEM_PROMPT_WORKER2:-}
+
+    volumes:
+      - type: bind
+        source: ./logs
+        target: /logs
+        is_directory: true
+      - type: bind
+        source: ./workspace/shared
+        target: /workspace/shared
+        is_directory: true
+      - type: bind
+        source: ./workspace/worker-2
+        target: /workspace/personal
+        is_directory: true
+
+    exclude_from_hc: true
+
+  worker-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    stop_grace_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      # Required
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
+      - API_KEY=${API_KEY:?}
+
+      # Agent identity (stable ID for task resume)
+      - AGENT_ID=${AGENT_ID_WORKER3:-f00ed190-8066-4e4a-b7b7-f688e407430c}
+      - AGENT_NAME=${AGENT_NAME_WORKER3:-worker-3}
+      - AGENT_ROLE=worker
+
+      # Internal connection to API
+      - MCP_BASE_URL=http://api:3013
+
+      # Behavior
+      - YOLO=${YOLO:-true}
+      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+
+      # Git config
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
+      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+
+      # Specialist prompt (optional)
+      - SYSTEM_PROMPT=${SYSTEM_PROMPT_WORKER3:-}
+
+    volumes:
+      - type: bind
+        source: ./logs
+        target: /logs
+        is_directory: true
+      - type: bind
+        source: ./workspace/shared
+        target: /workspace/shared
+        is_directory: true
+      - type: bind
+        source: ./workspace/worker-3
+        target: /workspace/personal
+        is_directory: true
+
+    exclude_from_hc: true
+
   dashboard:
     build:
       context: ./ui
