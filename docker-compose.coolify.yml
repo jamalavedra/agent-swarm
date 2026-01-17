@@ -15,6 +15,9 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    labels:
+      - "coolify.managed=true"
+      - "coolify.port=3013"
     environment:
       # Required
       - API_KEY=${API_KEY:?}
@@ -43,11 +46,11 @@ services:
         is_directory: true
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3013/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:3013/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
   lead:
     build:
