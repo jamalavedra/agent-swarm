@@ -2,7 +2,24 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { getAgentById, getInboxMessageById, getTaskById } from "@/be/db";
 import { getSlackApp } from "@/slack/app";
+import { downloadFile } from "@/slack/files";
 import { createToolRegistrar } from "@/tools/utils";
+
+/**
+ * Default download directory for auto-downloaded Slack files (inside MCP container).
+ * This differs from the agent's /workspace/shared path as the MCP server runs in a separate container.
+ */
+const AUTO_DOWNLOAD_DIR = "/app/shared/downloads/slack";
+
+const SlackFileSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  mimetype: z.string(),
+  filetype: z.string(),
+  size: z.number(),
+  url_private_download: z.string(),
+  localPath: z.string().optional(),
+});
 
 const SlackMessageSchema = z.object({
   user: z.string().optional(),
@@ -10,6 +27,7 @@ const SlackMessageSchema = z.object({
   isBot: z.boolean(),
   text: z.string(),
   ts: z.string(),
+  files: z.array(SlackFileSchema).optional(),
 });
 
 export const registerSlackReadTool = (server: McpServer) => {
@@ -37,6 +55,10 @@ export const registerSlackReadTool = (server: McpServer) => {
           .max(100)
           .default(20)
           .describe("Maximum number of messages to retrieve (default: 20, max: 100)."),
+        includeFiles: z
+          .boolean()
+          .default(true)
+          .describe("Include file attachments in the response (default: true)."),
       }),
       outputSchema: z.object({
         success: z.boolean(),
@@ -46,7 +68,11 @@ export const registerSlackReadTool = (server: McpServer) => {
         messages: z.array(SlackMessageSchema),
       }),
     },
-    async ({ inboxMessageId, taskId, channelId, threadTs, limit = 20 }, requestInfo, _meta) => {
+    async (
+      { inboxMessageId, taskId, channelId, threadTs, limit = 20, includeFiles = true },
+      requestInfo,
+      _meta,
+    ) => {
       if (!requestInfo.agentId) {
         return {
           content: [{ type: "text", text: "Agent ID not found." }],
@@ -158,6 +184,15 @@ export const registerSlackReadTool = (server: McpServer) => {
       try {
         const client = app.client;
 
+        type RawFile = {
+          id: string;
+          name: string;
+          mimetype: string;
+          filetype: string;
+          size: number;
+          url_private_download: string;
+        };
+
         type RawMessage = {
           user?: string;
           bot_id?: string;
@@ -165,6 +200,7 @@ export const registerSlackReadTool = (server: McpServer) => {
           subtype?: string;
           text?: string;
           ts: string;
+          files?: RawFile[];
         };
 
         let rawMessages: RawMessage[] = [];
@@ -207,6 +243,9 @@ export const registerSlackReadTool = (server: McpServer) => {
           }
         }
 
+        // Get token for auto-download
+        const token = process.env.SLACK_BOT_TOKEN;
+
         // Format messages
         const messages: Array<{
           user: string | undefined;
@@ -214,10 +253,20 @@ export const registerSlackReadTool = (server: McpServer) => {
           isBot: boolean;
           text: string;
           ts: string;
+          files?: Array<{
+            id: string;
+            name: string;
+            mimetype: string;
+            filetype: string;
+            size: number;
+            url_private_download: string;
+            localPath?: string;
+          }>;
         }> = [];
 
         for (const m of rawMessages) {
-          if (!m.text) continue;
+          // Include messages with text OR files
+          if (!m.text && (!m.files || m.files.length === 0)) continue;
 
           const isBot =
             m.user === botUserId || m.bot_id !== undefined || m.subtype === "bot_message";
@@ -229,18 +278,80 @@ export const registerSlackReadTool = (server: McpServer) => {
             username = await getUserDisplayName(m.user);
           }
 
+          // Extract file information if includeFiles is true
+          let files:
+            | Array<{
+                id: string;
+                name: string;
+                mimetype: string;
+                filetype: string;
+                size: number;
+                url_private_download: string;
+                localPath?: string;
+              }>
+            | undefined;
+
+          if (includeFiles && m.files && m.files.length > 0) {
+            files = [];
+            for (const f of m.files) {
+              const fileInfo: (typeof files)[number] = {
+                id: f.id,
+                name: f.name,
+                mimetype: f.mimetype,
+                filetype: f.filetype,
+                size: f.size,
+                url_private_download: f.url_private_download,
+              };
+
+              // Auto-download file if token is available
+              if (token && f.url_private_download) {
+                const savePath = `${AUTO_DOWNLOAD_DIR}/${f.id}_${f.name}`;
+                try {
+                  const downloadResult = await downloadFile({
+                    file: f.url_private_download,
+                    savePath,
+                    token,
+                  });
+                  if (downloadResult.success && downloadResult.savedPath) {
+                    fileInfo.localPath = downloadResult.savedPath;
+                  }
+                } catch {
+                  // Download failed silently, localPath will be undefined
+                }
+              }
+
+              files.push(fileInfo);
+            }
+          }
+
           messages.push({
             user: m.user,
             username,
             isBot,
-            text: m.text,
+            text: m.text || "",
             ts: m.ts,
+            files,
           });
         }
 
         // Format for text output
         const textOutput = messages
-          .map((m) => `[${m.username || m.user || "Unknown"}]: ${m.text}`)
+          .map((m) => {
+            let text = `[${m.username || m.user || "Unknown"}]: ${m.text}`;
+            if (m.files && m.files.length > 0) {
+              const fileList = m.files
+                .map((f) => {
+                  let line = `  - ${f.name} (${f.mimetype}, ${Math.round(f.size / 1024)} KB)`;
+                  if (f.localPath) {
+                    line += ` [Downloaded: ${f.localPath}]`;
+                  }
+                  return line;
+                })
+                .join("\n");
+              text += `\n  [Attachments: ${m.files.length} file(s)]\n${fileList}`;
+            }
+            return text;
+          })
           .join("\n\n");
 
         return {

@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import {
   acceptTask,
+  checkDependencies,
   claimTask,
   createTaskExtended,
   getActiveTaskCount,
@@ -9,13 +10,23 @@ import {
   getDb,
   getTaskById,
   hasCapacity,
+  moveTaskFromBacklog,
+  moveTaskToBacklog,
   rejectTask,
   releaseTask,
 } from "@/be/db";
 import { createToolRegistrar } from "@/tools/utils";
 import { AgentTaskSchema } from "@/types";
 
-const TaskActionSchema = z.enum(["create", "claim", "release", "accept", "reject"]);
+const TaskActionSchema = z.enum([
+  "create",
+  "claim",
+  "release",
+  "accept",
+  "reject",
+  "to_backlog",
+  "from_backlog",
+]);
 
 export const registerTaskActionTool = (server: McpServer) => {
   createToolRegistrar(server)(
@@ -26,7 +37,7 @@ export const registerTaskActionTool = (server: McpServer) => {
         "Perform task pool operations: create unassigned tasks, claim/release tasks from pool, accept/reject offered tasks.",
       inputSchema: z.object({
         action: TaskActionSchema.describe(
-          "The action to perform: 'create' creates an unassigned task, 'claim' takes a task from pool, 'release' returns task to pool, 'accept' accepts offered task, 'reject' declines offered task.",
+          "The action to perform: 'create' creates an unassigned task, 'claim' takes a task from pool, 'release' returns task to pool, 'accept' accepts offered task, 'reject' declines offered task, 'to_backlog' moves task to backlog, 'from_backlog' moves task from backlog to pool.",
         ),
         // For 'create' action:
         task: z.string().min(1).optional().describe("Task description (required for 'create')."),
@@ -115,6 +126,14 @@ export const registerTaskActionTool = (server: McpServer) => {
                 message: `Task "${taskId}" is not unassigned (status: ${existingTask.status}).`,
               };
             }
+            // Check if task dependencies are met
+            const { ready, blockedBy } = checkDependencies(taskId);
+            if (!ready) {
+              return {
+                success: false,
+                message: `Task "${taskId}" has unmet dependencies: ${blockedBy.join(", ")}. Cannot claim until dependencies are completed.`,
+              };
+            }
             const claimedTask = claimTask(taskId, agentId);
             if (!claimedTask) {
               return { success: false, message: `Failed to claim task "${taskId}".` };
@@ -168,6 +187,14 @@ export const registerTaskActionTool = (server: McpServer) => {
             if (existingTask.offeredTo !== agentId) {
               return { success: false, message: `Task "${taskId}" was not offered to you.` };
             }
+            // Check if task dependencies are met
+            const { ready, blockedBy } = checkDependencies(taskId);
+            if (!ready) {
+              return {
+                success: false,
+                message: `Task "${taskId}" has unmet dependencies: ${blockedBy.join(", ")}. Cannot accept until dependencies are completed.`,
+              };
+            }
             const acceptedTask = acceptTask(taskId, agentId);
             if (!acceptedTask) {
               return { success: false, message: `Failed to accept task "${taskId}".` };
@@ -201,6 +228,56 @@ export const registerTaskActionTool = (server: McpServer) => {
               success: true,
               message: `Rejected task "${taskId}". Task returned to pool.`,
               task: rejectedTask,
+            };
+          }
+
+          case "to_backlog": {
+            if (!taskId) {
+              return { success: false, message: "Task ID is required for 'to_backlog' action." };
+            }
+            const existingTask = getTaskById(taskId);
+            if (!existingTask) {
+              return { success: false, message: `Task "${taskId}" not found.` };
+            }
+            if (existingTask.status !== "unassigned") {
+              return {
+                success: false,
+                message: `Task "${taskId}" is not unassigned (status: ${existingTask.status}). Only unassigned tasks can be moved to backlog.`,
+              };
+            }
+            const backlogTask = moveTaskToBacklog(taskId);
+            if (!backlogTask) {
+              return { success: false, message: `Failed to move task "${taskId}" to backlog.` };
+            }
+            return {
+              success: true,
+              message: `Moved task "${taskId}" to backlog.`,
+              task: backlogTask,
+            };
+          }
+
+          case "from_backlog": {
+            if (!taskId) {
+              return { success: false, message: "Task ID is required for 'from_backlog' action." };
+            }
+            const existingTask = getTaskById(taskId);
+            if (!existingTask) {
+              return { success: false, message: `Task "${taskId}" not found.` };
+            }
+            if (existingTask.status !== "backlog") {
+              return {
+                success: false,
+                message: `Task "${taskId}" is not in backlog (status: ${existingTask.status}).`,
+              };
+            }
+            const unassignedTask = moveTaskFromBacklog(taskId);
+            if (!unassignedTask) {
+              return { success: false, message: `Failed to move task "${taskId}" from backlog.` };
+            }
+            return {
+              success: true,
+              message: `Moved task "${taskId}" from backlog to pool.`,
+              task: unassignedTask,
             };
           }
 
