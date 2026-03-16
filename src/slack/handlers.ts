@@ -1,7 +1,20 @@
 import type { App } from "@slack/bolt";
 import type { WebClient } from "@slack/web-api";
-import { createInboxMessage, createTask, getAgentById, getTasksByAgentId } from "../be/db";
+import {
+  createTask,
+  createTaskExtended,
+  getAgentById,
+  getAgentWorkingOnThread,
+  getLeadAgent,
+  getMostRecentTaskInThread,
+  getTasksByAgentId,
+} from "../be/db";
+import { workflowEventBus } from "../workflows/event-bus";
+import { buildAssignmentSummaryBlocks } from "./blocks";
+import type { SlackFile } from "./files";
 import { extractTaskFromMessage, routeMessage } from "./router";
+import { bufferThreadMessage, getBufferMessageCount, instantFlush } from "./thread-buffer";
+import { registerTaskMessage } from "./watcher";
 
 // User filtering configuration from environment variables
 const allowedEmailDomains = (process.env.SLACK_ALLOWED_EMAIL_DOMAINS || "")
@@ -132,6 +145,7 @@ interface MessageEvent {
   channel: string;
   ts: string;
   thread_ts?: string;
+  files?: SlackFile[];
 }
 
 interface ThreadMessage {
@@ -210,17 +224,43 @@ async function getThreadContext(
   }
 }
 
-const appUrl = process.env.APP_URL || "";
+/**
+ * Format a file size in bytes to a human-readable string.
+ */
+export function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
 
 /**
- * Get a link to the task in the dashboard, or just the task ID if no APP_URL.
+ * Build a text representation of file attachments for inclusion in messages.
+ * Each file is formatted as: [File: filename.ext (mimetype, size) id=FILE_ID]
  */
-function getTaskLink(taskId: string): string {
-  const shortId = taskId.slice(0, 8);
-  if (appUrl) {
-    return `<${appUrl}?tab=tasks&task=${taskId}&expand=true|\`${shortId}\`>`;
+export function buildAttachmentText(files: SlackFile[]): string {
+  return files
+    .map((f) => `[File: ${f.name} (${f.mimetype}, ${formatFileSize(f.size)}) id=${f.id}]`)
+    .join("\n");
+}
+
+/**
+ * Build the effective message text from the original text and any file attachments.
+ * - Text only: returns the text as-is
+ * - Files only: returns the attachment metadata
+ * - Both: returns text followed by attachment metadata
+ */
+export function buildEffectiveText(text: string | undefined, files?: SlackFile[]): string {
+  const hasText = !!text?.trim();
+  const hasFiles = files && files.length > 0;
+
+  if (hasText && hasFiles) {
+    return `${text}\n\n${buildAttachmentText(files)}`;
   }
-  return `\`${shortId}\``;
+  if (hasFiles) {
+    return buildAttachmentText(files);
+  }
+  return text || "";
 }
 
 // Message deduplication (prevents duplicate event processing)
@@ -275,7 +315,11 @@ export function registerMessageHandler(app: App): void {
     }
 
     const msg = event as MessageEvent;
-    if (!msg.text || !msg.user) return;
+    const hasText = !!msg.text?.trim();
+    const hasFiles = !!(msg.files && msg.files.length > 0);
+
+    // Require either text or files, and always require a user
+    if ((!hasText && !hasFiles) || !msg.user) return;
 
     // Deduplicate events (Slack can send same event twice)
     const messageKey = `${msg.channel}:${msg.ts}`;
@@ -289,29 +333,135 @@ export function registerMessageHandler(app: App): void {
       return;
     }
 
+    // Emit workflow trigger event for Slack messages
+    workflowEventBus.emit("slack.message", {
+      channel: msg.channel,
+      text: msg.text,
+      user: msg.user,
+      ts: msg.ts,
+      threadTs: msg.thread_ts,
+    });
+
+    // Build effective text that includes attachment metadata
+    const effectiveText = buildEffectiveText(msg.text, msg.files);
+
     // Get bot's user ID
     const authResult = await client.auth.test();
     const botUserId = authResult.user_id as string;
 
-    // Check if bot was mentioned
-    const botMentioned = msg.text.includes(`<@${botUserId}>`);
+    // Check if bot was mentioned (in original text only)
+    const botMentioned = !!msg.text?.includes(`<@${botUserId}>`);
 
-    // Build thread context for routing (if we're in a thread)
+    // ADDITIVE_SLACK: Check for !now command in threads
+    const additiveSlack = process.env.ADDITIVE_SLACK === "true";
+    if (additiveSlack && msg.thread_ts) {
+      const stripped = effectiveText.replace(/<@[A-Z0-9]+>/g, "").trim();
+      if (stripped.startsWith("!now")) {
+        const nowMessage = stripped.replace(/^!now\s*/, "").trim();
+        const threadKey = `${msg.channel}:${msg.thread_ts}`;
+
+        console.log(
+          `[Slack] !now command detected in thread ${threadKey}${nowMessage ? ` with message: "${nowMessage}"` : ""}`,
+        );
+
+        if (nowMessage) {
+          bufferThreadMessage(msg.channel, msg.thread_ts, nowMessage, msg.user, msg.ts);
+        }
+
+        // Instant flush — no dependency
+        await instantFlush(threadKey);
+
+        try {
+          await client.reactions.add({ channel: msg.channel, name: "zap", timestamp: msg.ts });
+        } catch (e) {
+          console.log(`[Slack] Reaction failed: ${e instanceof Error ? e.message : e}`);
+        }
+
+        return;
+      }
+    }
+
+    // ADDITIVE_SLACK: Buffer non-mention thread messages
+    if (additiveSlack && !botMentioned && msg.thread_ts) {
+      // Check if this thread has any swarm activity (existing tasks)
+      const hasSwarmActivity = getAgentWorkingOnThread(msg.channel, msg.thread_ts) !== null;
+
+      if (hasSwarmActivity) {
+        const threadKey = `${msg.channel}:${msg.thread_ts}`;
+        bufferThreadMessage(msg.channel, msg.thread_ts, effectiveText, msg.user, msg.ts);
+
+        // Slack feedback: react with :eyes: on first buffer, :heavy_plus_sign: on appends
+        const count = getBufferMessageCount(threadKey);
+        console.log(
+          `[Slack] Additive buffer: ${threadKey} (message #${count}, reaction: ${count === 1 ? "eyes" : "heavy_plus_sign"})`,
+        );
+        try {
+          await client.reactions.add({
+            channel: msg.channel,
+            name: count === 1 ? "eyes" : "heavy_plus_sign",
+            timestamp: msg.ts,
+          });
+        } catch (e) {
+          console.log(`[Slack] Reaction failed: ${e instanceof Error ? e.message : e}`);
+        }
+
+        return; // Don't process further — buffer will flush
+      }
+    }
+
+    // Route message to agents (use original text for routing to preserve mention/name matching)
+    const routingText = msg.text || effectiveText;
     const routingThreadContext = msg.thread_ts
       ? { channelId: msg.channel, threadTs: msg.thread_ts }
       : undefined;
-
-    // Route message to agents
-    const matches = routeMessage(msg.text, botUserId, botMentioned, routingThreadContext);
+    const matches = routeMessage(routingText, botUserId, botMentioned, routingThreadContext);
 
     if (matches.length === 0) {
-      // No agents matched - ignore message unless bot was directly mentioned
-      if (botMentioned) {
+      if (!botMentioned) return;
+
+      // Bot was mentioned but no online agents matched — queue the request
+      if (!checkRateLimit(msg.user)) {
         await say({
-          text: ":satellite: _No agents are currently available. Use `/agent-swarm-status` to check the swarm._",
+          text: ":satellite: _You're sending too many requests. Please slow down._",
           thread_ts: msg.thread_ts || msg.ts,
         });
+        return;
       }
+
+      const taskDescription = extractTaskFromMessage(effectiveText, botUserId);
+      if (!taskDescription) {
+        await say({
+          text: ":satellite: _Please provide a task description after mentioning an agent._",
+          thread_ts: msg.thread_ts || msg.ts,
+        });
+        return;
+      }
+
+      const threadTs = msg.thread_ts || msg.ts;
+      const threadContext = await getThreadContext(
+        client,
+        msg.channel,
+        msg.thread_ts,
+        msg.ts,
+        botUserId,
+      );
+      const fullTaskDescription = threadContext
+        ? `<thread_context>\n${threadContext}\n</thread_context>\n\n${taskDescription}`
+        : taskDescription;
+
+      const lead = getLeadAgent();
+      createTaskExtended(fullTaskDescription, {
+        agentId: lead?.id,
+        source: "slack",
+        slackChannelId: msg.channel,
+        slackThreadTs: threadTs,
+        slackUserId: msg.user,
+      });
+
+      await say({
+        text: ":satellite: _No agents are online right now. Your request has been queued and will be processed when agents come back up._",
+        thread_ts: threadTs,
+      });
       return;
     }
 
@@ -324,8 +474,8 @@ export function registerMessageHandler(app: App): void {
       return;
     }
 
-    // Extract task description
-    const taskDescription = extractTaskFromMessage(msg.text, botUserId);
+    // Extract task description (using effective text which includes attachment metadata)
+    const taskDescription = extractTaskFromMessage(effectiveText, botUserId);
     if (!taskDescription) {
       await say({
         text: ":satellite: _Please provide a task description after mentioning an agent._",
@@ -345,39 +495,35 @@ export function registerMessageHandler(app: App): void {
       msg.ts,
       botUserId,
     );
-    // Structure content with clear separation for inbox messages
-    const structuredContent = threadContext
-      ? `<new_message>\n${taskDescription}\n</new_message>\n\n<thread_history>\n${threadContext}\n</thread_history>`
-      : taskDescription;
-    // For workers (tasks), keep using the old format for backwards compatibility
     const fullTaskDescription = threadContext
       ? `<thread_context>\n${threadContext}\n</thread_context>\n\n${taskDescription}`
       : taskDescription;
-    const results: { assigned: string[]; queued: string[]; failed: string[] } = {
-      assigned: [],
-      queued: [],
-      failed: [],
-    };
+    const results: {
+      assigned: Array<{ agentName: string; taskId: string }>;
+      queued: Array<{ agentName: string; taskId: string }>;
+      failed: Array<{ agentName: string; reason: string }>;
+    } = { assigned: [], queued: [], failed: [] };
 
     for (const match of matches) {
       const agent = getAgentById(match.agent.id);
 
       if (!agent) {
-        results.failed.push(`\`${match.agent.name}\` (not found)`);
+        results.failed.push({ agentName: match.agent.name, reason: "not found" });
         continue;
       }
 
       try {
-        // Lead agents receive inbox messages, not tasks
+        const latestTask = getMostRecentTaskInThread(msg.channel, threadTs);
         if (agent.isLead) {
-          createInboxMessage(agent.id, structuredContent, {
+          const task = createTaskExtended(fullTaskDescription, {
+            agentId: agent.id,
             source: "slack",
             slackChannelId: msg.channel,
             slackThreadTs: threadTs,
             slackUserId: msg.user,
-            matchedText: match.matchedText,
+            parentTaskId: latestTask?.id,
           });
-          results.assigned.push(`*${agent.name}* (inbox)`);
+          results.assigned.push({ agentName: agent.name, taskId: task.id });
           continue;
         }
 
@@ -396,32 +542,46 @@ export function registerMessageHandler(app: App): void {
         );
 
         if (inProgressInThread) {
-          results.queued.push(`*${agent.name}* (${getTaskLink(task.id)})`);
+          results.queued.push({ agentName: agent.name, taskId: task.id });
         } else {
-          results.assigned.push(`*${agent.name}* (${getTaskLink(task.id)})`);
+          results.assigned.push({ agentName: agent.name, taskId: task.id });
         }
       } catch {
-        results.failed.push(`\`${agent.name}\` (error)`);
+        results.failed.push({ agentName: agent.name, reason: "error" });
       }
     }
 
-    // Send consolidated summary
-    const parts: string[] = [];
-    if (results.assigned.length > 0) {
-      parts.push(`:satellite: _Task assigned to: ${results.assigned.join(", ")}_`);
-    }
-    if (results.queued.length > 0) {
-      parts.push(`:satellite: _Task queued for: ${results.queued.join(", ")}_`);
-    }
-    if (results.failed.length > 0) {
-      parts.push(`:satellite: _Could not assign to: ${results.failed.join(", ")}_`);
-    }
+    // Send consolidated summary with Block Kit
+    const totalResults = results.assigned.length + results.queued.length + results.failed.length;
+    if (totalResults > 0) {
+      // Build plain-text fallback
+      const parts: string[] = [];
+      if (results.assigned.length > 0) {
+        const names = results.assigned.map((a) => `${a.agentName}`).join(", ");
+        parts.push(`Task assigned to: ${names}`);
+      }
+      if (results.queued.length > 0) {
+        const names = results.queued.map((q) => `${q.agentName}`).join(", ");
+        parts.push(`Task queued for: ${names}`);
+      }
+      if (results.failed.length > 0) {
+        const names = results.failed.map((f) => `${f.agentName}`).join(", ");
+        parts.push(`Could not assign to: ${names}`);
+      }
 
-    if (parts.length > 0) {
-      await say({
-        text: parts.join("\n"),
+      const resp = await say({
+        text: parts.join(". "),
+        blocks: buildAssignmentSummaryBlocks(results),
         thread_ts: msg.thread_ts || msg.ts,
       });
+
+      // Register the assignment message so the watcher can update it in-place
+      // (assignment → progress → completion all in one evolving message)
+      if (resp?.ts) {
+        for (const { taskId } of results.assigned) {
+          registerTaskMessage(taskId, msg.channel, threadTs, resp.ts);
+        }
+      }
     }
   });
 

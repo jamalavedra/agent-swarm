@@ -9,11 +9,19 @@ If no `taskId` is provided, you should call the `poll-task` tool to get a new ta
 
 ## Workflow
 
-Once you get a task assigned, you need to immidiately start working on it. To do so, the first thing you need to do is call the MCP tool `get-task-details` to get all the details about the task you need to work on.
+Once you get a task assigned, you need to immediately start working on it. To do so, the first thing you need to do is call the MCP tool `get-task-details` to get all the details about the task you need to work on.
 
 Once you have the task details, you should:
 
-1. Figure out if you need to use any of the available commands to help you with your work (see below for available commands)
+<!-- claude-only -->
+1. **Recall relevant memories (REQUIRED):** Before starting any work, search your memory for relevant context:
+   - Use `memory-search` with the task description as query
+   - If the task has an epicId, also search with the epic name/goal
+   - Review any returned memories — they may contain solutions, patterns, or warnings from previous tasks
+   - Use `memory-get` on any highly relevant results to get full details
+   - This step is NOT optional. Past learnings compound your effectiveness.
+<!-- /claude-only -->
+2. Figure out if you need to use any of the available commands to help you with your work (see below for available commands)
 2. Use the `/todos` command to add a new todo item indicating you are starting to work on the task (e.g. "Work on task XXX: <short description>"). This will help on restarts, as it will be easier to remember what you were doing.
 3. Call `store-progress` tool to mark the task as "in-progress" with a progress set to something like "Starting work on the task XXX, blah blah". Additionally use `/swarm-chat` command to notify the swarm, human and lead when applicable. Do not be too verbose, nor spammy.
 4. Start working on the task, providing updates as needed by calling `store-progress` tool, use the `progress` field to indicate what you are doing.
@@ -50,4 +58,15 @@ Once you are done, or in a real dead-end, you should call `store-progress` tool 
 
 If you used the `/todos` command to add a todo item when starting the task, make sure to mark it as completed or remove it as needed.
 
-Once you are done (either ok or not), finish the session by just replying "DONE".
+Once you are done (either ok or not), perform the Post-Task Reflection below, then finish the session by just replying "DONE".
+
+### Post-Task Reflection (REQUIRED)
+
+After calling `store-progress` to complete or fail a task, do the following before finishing:
+
+1. **Transferable learning?** If you learned something reusable (a pattern, a gotcha, a fix), write it to `/workspace/personal/memory/<descriptive-name>.md`
+2. **Swarm-relevant?** If the learning applies to all agents (not just you), write it to `/workspace/shared/memory/<your-id>/<descriptive-name>.md` so all agents can find it via `memory-search`
+3. **Identity update?** If you discovered a new area of expertise or working style preference, update your IDENTITY.md
+4. **Tools update?** If you found a new service, API, or tool, update your TOOLS.md
+
+Skip this section ONLY if the task was trivially simple (single file edit, no debugging, no new knowledge gained).

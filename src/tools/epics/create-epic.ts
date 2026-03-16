@@ -8,6 +8,7 @@ export const registerCreateEpicTool = (server: McpServer) => {
     "create-epic",
     {
       title: "Create Epic",
+      annotations: { destructiveHint: false },
       description: "Create a new epic (project) to organize related tasks.",
       inputSchema: z.object({
         name: z.string().min(1).max(200).describe("Unique name for the epic"),
@@ -22,8 +23,8 @@ export const registerCreateEpicTool = (server: McpServer) => {
         planDocPath: z.string().optional().describe("Path to plan document"),
         slackChannelId: z.string().optional(),
         slackThreadTs: z.string().optional(),
-        githubRepo: z.string().optional(),
-        githubMilestone: z.string().optional(),
+        vcsRepo: z.string().optional(),
+        vcsMilestone: z.string().optional(),
       }),
       outputSchema: z.object({
         yourAgentId: z.string().uuid().optional(),

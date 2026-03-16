@@ -6,8 +6,10 @@ import {
   getAgentById,
   getDb,
   getEpicById,
+  getTaskById,
   hasCapacity,
 } from "@/be/db";
+import { findDuplicateTask } from "@/tools/task-dedup";
 import { createToolRegistrar } from "@/tools/utils";
 import { AgentTaskSchema } from "@/types";
 
@@ -16,6 +18,7 @@ export const registerSendTaskTool = (server: McpServer) => {
     "send-task",
     {
       title: "Send a task",
+      annotations: { destructiveHint: false },
       description:
         "Sends a task to a specific agent, creates an unassigned task for the pool, or offers a task for acceptance.",
       inputSchema: z.object({
@@ -46,6 +49,38 @@ export const registerSendTaskTool = (server: McpServer) => {
           .describe("Priority 0-100 (default: 50)."),
         dependsOn: z.array(z.uuid()).optional().describe("Task IDs this task depends on."),
         epicId: z.string().uuid().optional().describe("Epic to associate this task with."),
+        parentTaskId: z
+          .uuid()
+          .optional()
+          .describe(
+            "Parent task ID for session continuity. Child task will resume the parent's Claude session. Auto-routes to the same worker unless agentId is explicitly provided.",
+          ),
+        dir: z
+          .string()
+          .min(1)
+          .startsWith("/")
+          .optional()
+          .describe(
+            "Working directory (absolute path) for the agent to start in. If the directory doesn't exist, falls back to the default working directory.",
+          ),
+        vcsRepo: z
+          .string()
+          .optional()
+          .describe(
+            "VCS repo identifier (e.g., 'desplega-ai/agent-swarm' for GitHub or 'group/project' for GitLab). Links the task to a registered repo for workspace context.",
+          ),
+        model: z
+          .enum(["haiku", "sonnet", "opus"])
+          .optional()
+          .describe(
+            "Model to use for this task ('haiku', 'sonnet', or 'opus'). If not set, uses agent/global config MODEL_OVERRIDE or defaults to 'opus'.",
+          ),
+        allowDuplicate: z
+          .boolean()
+          .default(false)
+          .describe(
+            "If true, skip duplicate detection and create the task even if a similar one exists.",
+          ),
       }),
       outputSchema: z.object({
         yourAgentId: z.string().uuid().optional(),
@@ -55,7 +90,21 @@ export const registerSendTaskTool = (server: McpServer) => {
       }),
     },
     async (
-      { agentId, task, offerMode, taskType, tags, priority, dependsOn, epicId },
+      {
+        agentId,
+        task,
+        offerMode,
+        taskType,
+        tags,
+        priority,
+        dependsOn,
+        epicId,
+        dir,
+        parentTaskId,
+        vcsRepo,
+        model,
+        allowDuplicate,
+      },
       requestInfo,
       _meta,
     ) => {
@@ -91,7 +140,8 @@ export const registerSendTaskTool = (server: McpServer) => {
         };
       }
 
-      // Validate epicId if provided
+      // Validate epicId and auto-inherit vcsRepo from epic if not explicitly provided
+      let effectiveVcsRepo = vcsRepo;
       if (epicId) {
         const epic = getEpicById(epicId);
         if (!epic) {
@@ -104,14 +154,46 @@ export const registerSendTaskTool = (server: McpServer) => {
             },
           };
         }
+        if (!vcsRepo && epic.vcsRepo) {
+          effectiveVcsRepo = epic.vcsRepo;
+        }
+      }
+
+      // Auto-route to parent's worker if parentTaskId is set and no explicit agentId
+      let effectiveAgentId = agentId;
+      if (parentTaskId && !agentId) {
+        const parentTask = getTaskById(parentTaskId);
+        if (parentTask?.agentId) {
+          effectiveAgentId = parentTask.agentId;
+        }
+      }
+
+      // Dedup guard: check for similar recent tasks
+      if (!allowDuplicate && requestInfo.agentId) {
+        const duplicate = findDuplicateTask({
+          taskDescription: task,
+          creatorAgentId: requestInfo.agentId,
+          targetAgentId: effectiveAgentId ?? undefined,
+        });
+        if (duplicate) {
+          const msg = `Duplicate task detected (matches task ${duplicate.task.id.slice(0, 8)}, ${duplicate.reason}). Skipping. Use allowDuplicate: true to override.`;
+          return {
+            content: [{ type: "text", text: msg }],
+            structuredContent: {
+              yourAgentId: requestInfo.agentId,
+              success: false,
+              message: msg,
+            },
+          };
+        }
       }
 
       const txn = getDb().transaction(() => {
         // Build tags with epic tag if epicId is provided
         const finalTags = epicId ? [...(tags || []), `epic:${getEpicById(epicId)?.name}`] : tags;
 
-        // If no agentId, create an unassigned task for the pool
-        if (!agentId) {
+        // If no agentId (and no auto-routed agentId), create an unassigned task for the pool
+        if (!effectiveAgentId) {
           const newTask = createTaskExtended(task, {
             creatorAgentId: requestInfo.agentId,
             taskType,
@@ -119,6 +201,10 @@ export const registerSendTaskTool = (server: McpServer) => {
             priority,
             dependsOn,
             epicId,
+            dir,
+            parentTaskId,
+            vcsRepo: effectiveVcsRepo,
+            model,
           });
 
           return {
@@ -128,12 +214,12 @@ export const registerSendTaskTool = (server: McpServer) => {
           };
         }
 
-        const agent = getAgentById(agentId);
+        const agent = getAgentById(effectiveAgentId);
 
         if (!agent) {
           return {
             success: false,
-            message: `Agent with ID "${agentId}" not found.`,
+            message: `Agent with ID "${effectiveAgentId}" not found.`,
           };
         }
 
@@ -145,8 +231,8 @@ export const registerSendTaskTool = (server: McpServer) => {
         }
 
         // For direct assignment (not offer), check if agent has capacity
-        if (!offerMode && !hasCapacity(agentId)) {
-          const activeCount = getActiveTaskCount(agentId);
+        if (!offerMode && !hasCapacity(effectiveAgentId)) {
+          const activeCount = getActiveTaskCount(effectiveAgentId);
           return {
             success: false,
             message: `Agent "${agent.name}" is at capacity (${activeCount}/${agent.maxTasks ?? 1} tasks). Use offerMode: true to offer the task instead, or wait for a task to complete.`,
@@ -156,13 +242,17 @@ export const registerSendTaskTool = (server: McpServer) => {
         if (offerMode) {
           // Offer the task to the agent (they must accept/reject)
           const newTask = createTaskExtended(task, {
-            offeredTo: agentId,
+            offeredTo: effectiveAgentId,
             creatorAgentId: requestInfo.agentId,
             taskType,
             tags: finalTags,
             priority,
             dependsOn,
             epicId,
+            dir,
+            parentTaskId,
+            vcsRepo: effectiveVcsRepo,
+            model,
           });
 
           return {
@@ -174,13 +264,17 @@ export const registerSendTaskTool = (server: McpServer) => {
 
         // Direct assignment
         const newTask = createTaskExtended(task, {
-          agentId,
+          agentId: effectiveAgentId,
           creatorAgentId: requestInfo.agentId,
           taskType,
           tags: finalTags,
           priority,
           dependsOn,
           epicId,
+          dir,
+          parentTaskId,
+          vcsRepo: effectiveVcsRepo,
+          model,
         });
 
         return {

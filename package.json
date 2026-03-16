@@ -1,13 +1,13 @@
 {
   "name": "@desplega.ai/agent-swarm",
-  "version": "1.20.0",
-  "description": "Agent orchestration layer MCP for Claude Code, Codex, Gemini CLI, and more!",
+  "version": "1.44.5",
+  "description": "Multi-agent orchestration for Claude Code, Codex, Gemini CLI, and other AI coding assistants",
   "license": "MIT",
-  "author": "desplega.ai <contact@desplega.ai>",
+  "author": "desplega.sh <contact@desplega.sh>",
   "maintainers": [
     {
       "name": "Taras",
-      "email": "t@desplega.ai"
+      "email": "t@desplega.sh"
     }
   ],
   "repository": {
@@ -31,6 +31,7 @@
     "name": "agent-swarm"
   },
   "scripts": {
+    "build:pi-skills": "bun run plugin/build-pi-skills.ts",
     "tsc:check": "bun tsc --noEmit",
     "cli": "bun src/cli.tsx",
     "hook": "bun src/hooks/hook.ts",
@@ -58,7 +59,10 @@
     "deploy:update": "bun deploy/update.ts",
     "deploy:uninstall": "bun deploy/uninstall.ts",
     "deploy:docker": "bun deploy/docker-push.ts",
+    "e2e:workflows": "bun scripts/e2e-workflow-test.ts",
+    "e2e:workflows:docker": "bun scripts/e2e-workflow-test.ts --with-docker",
     "docs:mcp": "bun scripts/generate-mcp-docs.ts",
+    "docs:openapi": "bun scripts/generate-openapi.ts",
     "pm2-start": "pm2 start ecosystem.config.cjs",
     "pm2-stop": "pm2 stop ecosystem.config.cjs",
     "pm2-restart": "pm2 restart ecosystem.config.cjs",
@@ -76,15 +80,31 @@
     "bun": ">=1.0.26"
   },
   "dependencies": {
+    "@ai-sdk/openai": "^3.0.41",
+    "@asteasolutions/zod-to-openapi": "^8.0.0",
+    "@desplega.ai/localtunnel": "^2.2.0",
     "@inkjs/ui": "^2.0.0",
+    "@mariozechner/pi-agent-core": "^0.57.1",
+    "@mariozechner/pi-ai": "^0.57.1",
+    "@mariozechner/pi-coding-agent": "^0.57.1",
     "@modelcontextprotocol/sdk": "^1.25.1",
+    "@openfort/openfort-node": "^0.9.1",
     "@slack/bolt": "^4.6.0",
     "@types/react": "^19.2.7",
+    "@x402/core": "^2.5.0",
+    "@x402/evm": "^2.5.0",
+    "@x402/fetch": "^2.5.0",
+    "ai": "^6.0.116",
     "cron-parser": "^5.4.0",
     "date-fns": "^4.1.0",
+    "hono": "^4.12.3",
     "ink": "^6.5.1",
+    "openai": "^6.22.0",
     "react": "^19.2.3",
     "react-devtools-core": "^7.0.1",
-    "zod": "^4.2.1"
+    "svix": "^1.62.0",
+    "viem": "^2.46.3",
+    "zod": "^4.2.1",
+    "zod-to-json-schema": "^3.25.1"
   }
 }

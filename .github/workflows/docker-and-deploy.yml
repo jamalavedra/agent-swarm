@@ -4,7 +4,14 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "docs-site/**"
+      - "landing/**"
   workflow_dispatch:
+
+concurrency:
+  group: docker-and-deploy
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -12,7 +19,7 @@ env:
 
 jobs:
   build-and-push-server:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       contents: read
       packages: write
@@ -42,6 +49,11 @@ jobs:
             type=raw,value=${{ steps.version.outputs.version }}
             type=sha
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -50,10 +62,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          no-cache: true
 
   build-and-push-worker:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       contents: read
       packages: write
@@ -83,6 +94,11 @@ jobs:
             type=raw,value=${{ steps.version.outputs.version }}
             type=sha
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -91,11 +107,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          no-cache: true
 
   deploy:
     name: Deploy
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     needs:
       - build-and-push-server

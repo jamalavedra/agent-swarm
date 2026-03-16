@@ -1,7 +1,11 @@
+.roam
+
 # MCP
 .mcp.json
 # Not the one inside cc-plugin/
 !cc-plugin/.mcp.json
+
+.qa-use-tests.json
 
 # Docker agent bindings
 logs
@@ -49,3 +53,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 *.sqlite-wal
 *.sqlite-shm
 
+
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/

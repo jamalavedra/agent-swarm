@@ -2,12 +2,19 @@
 
 import pkg from "../../package.json";
 import type { Agent } from "../types";
+import { checkToolLoop, clearToolHistory } from "./tool-loop-detection";
 
 const SERVER_NAME = pkg.config?.name ?? "agent-swarm";
 
 // CLAUDE.md file paths
 const CLAUDE_MD_PATH = `${process.env.HOME}/.claude/CLAUDE.md`;
 const CLAUDE_MD_BACKUP_PATH = `${process.env.HOME}/.claude/CLAUDE.md.bak`;
+
+// Identity and workspace file paths
+const SOUL_MD_PATH = "/workspace/SOUL.md";
+const IDENTITY_MD_PATH = "/workspace/IDENTITY.md";
+const TOOLS_MD_PATH = "/workspace/TOOLS.md";
+const SETUP_SCRIPT_PATH = "/workspace/start-up.sh";
 
 type McpServerConfig = {
   url: string;
@@ -65,6 +72,31 @@ interface CancelledTasksResponse {
 }
 
 /**
+ * Check if a path is under the agent's own subdirectory on the shared disk.
+ * Shared disk categories: thoughts, memory, downloads, misc.
+ * Each agent can only write to /workspace/shared/{category}/{agentId}/
+ */
+function isOwnedSharedPath(path: string, agentId: string): boolean {
+  const sharedCategories = ["thoughts", "memory", "downloads", "misc"];
+  return sharedCategories.some((cat) => path.startsWith(`/workspace/shared/${cat}/${agentId}/`));
+}
+
+/**
+ * Build the shared disk write warning message for a given agent ID.
+ */
+function sharedDiskWriteWarning(agentId: string): string {
+  return (
+    `⚠️ This write will fail: You don't have write access to this directory.\n\n` +
+    `On shared workspaces, each agent can only write to their own directories:\n` +
+    `- /workspace/shared/thoughts/${agentId}/\n` +
+    `- /workspace/shared/memory/${agentId}/\n` +
+    `- /workspace/shared/downloads/${agentId}/\n` +
+    `- /workspace/shared/misc/${agentId}/\n\n` +
+    `You CAN read any file on the shared disk. For writes, use your own subdirectory.`
+  );
+}
+
+/**
  * Hook response for blocking actions
  * See: https://code.claude.com/docs/en/hooks
  */
@@ -98,6 +130,24 @@ async function readTaskFile(): Promise<TaskFileData | null> {
       return null;
     }
     return (await file.json()) as TaskFileData;
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch task details from API (for PreCompact goal reminder) */
+async function fetchTaskDetails(
+  taskId: string,
+): Promise<{ id: string; task: string; progress?: string } | null> {
+  const apiUrl = process.env.MCP_BASE_URL || "http://localhost:3013";
+  const apiKey = process.env.API_KEY || "";
+  const headers: Record<string, string> = {};
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  try {
+    const response = await fetch(`${apiUrl}/api/tasks/${taskId}`, { headers });
+    if (!response.ok) return null;
+    return (await response.json()) as { id: string; task: string; progress?: string };
   } catch {
     return null;
   }
@@ -232,6 +282,50 @@ export async function handleHook(): Promise<void> {
     return;
   };
 
+  interface ConcurrentContextResponse {
+    processingInboxMessages: Array<{
+      id: string;
+      content: string;
+      source: string;
+      slackChannelId: string | null;
+      slackThreadTs: string | null;
+      createdAt: string;
+    }>;
+    recentTaskDelegations: Array<{
+      id: string;
+      task: string;
+      agentId: string | null;
+      agentName: string | null;
+      creatorAgentId: string | null;
+      status: string;
+      createdAt: string;
+    }>;
+    activeSwarmTasks: Array<{
+      id: string;
+      task: string;
+      agentId: string | null;
+      agentName: string | null;
+      status: string;
+      createdAt: string;
+      progress: string | null;
+    }>;
+  }
+
+  const fetchConcurrentContext = async (): Promise<ConcurrentContextResponse | undefined> => {
+    if (!mcpConfig) return undefined;
+
+    try {
+      const resp = await fetch(`${getBaseUrl()}/api/concurrent-context`, {
+        method: "GET",
+        headers: mcpConfig.headers,
+      });
+      if (!resp.ok) return undefined;
+      return (await resp.json()) as ConcurrentContextResponse;
+    } catch {
+      return undefined;
+    }
+  };
+
   /**
    * Sync CLAUDE.md content back to the server
    */
@@ -253,10 +347,107 @@ export async function handleHook(): Promise<void> {
           ...mcpConfig.headers,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ claudeMd: content }),
+        body: JSON.stringify({ claudeMd: content, changeSource: "session_sync" }),
       });
     } catch {
       // Silently fail - don't block shutdown
+    }
+  };
+
+  /**
+   * Sync SOUL.md and IDENTITY.md content back to the server
+   */
+  const syncIdentityFilesToServer = async (
+    agentId: string,
+    changeSource: "self_edit" | "session_sync" = "session_sync",
+  ): Promise<void> => {
+    if (!mcpConfig) return;
+
+    const updates: Record<string, string> = {};
+
+    const soulFile = Bun.file(SOUL_MD_PATH);
+    if (await soulFile.exists()) {
+      const content = await soulFile.text();
+      if (content.trim() && content.length <= 65536) {
+        updates.soulMd = content;
+      }
+    }
+
+    const identityFile = Bun.file(IDENTITY_MD_PATH);
+    if (await identityFile.exists()) {
+      const content = await identityFile.text();
+      if (content.trim() && content.length <= 65536) {
+        updates.identityMd = content;
+      }
+    }
+
+    const toolsMdFile = Bun.file(TOOLS_MD_PATH);
+    if (await toolsMdFile.exists()) {
+      const content = await toolsMdFile.text();
+      if (content.trim() && content.length <= 65536) {
+        updates.toolsMd = content;
+      }
+    }
+
+    if (Object.keys(updates).length === 0) return;
+
+    try {
+      await fetch(`${getBaseUrl()}/api/agents/${agentId}/profile`, {
+        method: "PUT",
+        headers: {
+          ...mcpConfig.headers,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ...updates, changeSource }),
+      });
+    } catch {
+      // Silently fail
+    }
+  };
+
+  /**
+   * Sync setup script content back to the server.
+   * Extracts only agent-managed content between markers to avoid duplicating operator content.
+   */
+  const syncSetupScriptToServer = async (
+    agentId: string,
+    changeSource: "self_edit" | "session_sync" = "session_sync",
+  ): Promise<void> => {
+    if (!mcpConfig) return;
+
+    const file = Bun.file(SETUP_SCRIPT_PATH);
+    if (!(await file.exists())) return;
+
+    const raw = await file.text();
+    if (!raw.trim()) return;
+
+    const markerStart = "# === Agent-managed setup (from DB) ===";
+    const markerEnd = "# === End agent-managed setup ===";
+    const startIdx = raw.indexOf(markerStart);
+    const endIdx = raw.indexOf(markerEnd);
+
+    let content: string;
+    if (startIdx !== -1 && endIdx !== -1) {
+      // Markers present — extract ONLY the content between them.
+      content = raw.substring(startIdx + markerStart.length, endIdx).trim();
+    } else {
+      // No markers — agent created/replaced the entire file. Store as-is minus shebang.
+      content = raw.replace(/^#!\/bin\/bash\n/, "").trim();
+    }
+
+    if (!content || content.length > 65536) return;
+
+    try {
+      await fetch(`${getBaseUrl()}/api/agents/${agentId}/profile`, {
+        method: "PUT",
+        headers: {
+          ...mcpConfig.headers,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ setupScript: content, changeSource }),
+      });
+    } catch {
+      /* silently fail */
     }
   };
 
@@ -505,11 +696,94 @@ ${hasAgentIdHeader() ? `You have a pre-defined agent ID via header: ${mcpConfig?
           console.log(`Warning: Could not load CLAUDE.md: ${(error as Error).message}`);
         }
       }
+
+      // For lead agents: inject concurrent session context
+      if (agentInfo.isLead) {
+        try {
+          const concurrentCtx = await fetchConcurrentContext();
+          if (concurrentCtx) {
+            const lines: string[] = [];
+
+            if (concurrentCtx.processingInboxMessages.length > 0) {
+              lines.push("=== CONCURRENT SESSION AWARENESS ===");
+              lines.push("");
+              lines.push("**Other sessions are currently processing these inbox messages:**");
+              for (const msg of concurrentCtx.processingInboxMessages) {
+                const preview =
+                  msg.content.length > 120 ? `${msg.content.slice(0, 120)}...` : msg.content;
+                lines.push(`- [${msg.source}] "${preview}" (received ${msg.createdAt})`);
+              }
+            }
+
+            if (concurrentCtx.recentTaskDelegations.length > 0) {
+              if (lines.length === 0) lines.push("=== CONCURRENT SESSION AWARENESS ===");
+              lines.push("");
+              lines.push("**Recent task delegations (last 5 min):**");
+              for (const task of concurrentCtx.recentTaskDelegations) {
+                const preview =
+                  task.task.length > 120 ? `${task.task.slice(0, 120)}...` : task.task;
+                lines.push(`- "${preview}" → ${task.agentName ?? "unassigned"} [${task.status}]`);
+              }
+            }
+
+            if (concurrentCtx.activeSwarmTasks.length > 0) {
+              if (lines.length === 0) lines.push("=== CONCURRENT SESSION AWARENESS ===");
+              lines.push("");
+              lines.push("**Currently active tasks across the swarm:**");
+              for (const task of concurrentCtx.activeSwarmTasks) {
+                const preview =
+                  task.task.length > 100 ? `${task.task.slice(0, 100)}...` : task.task;
+                lines.push(`- ${task.agentName ?? "unassigned"}: "${preview}" [${task.status}]`);
+              }
+            }
+
+            if (lines.length > 0) {
+              lines.push("");
+              lines.push(
+                "IMPORTANT: Avoid duplicating work that is already being handled by other sessions or agents.",
+              );
+              lines.push("=== END CONCURRENT SESSION AWARENESS ===");
+              console.log(lines.join("\n"));
+            }
+          }
+        } catch {
+          // Don't block session start if concurrent context fetch fails
+        }
+      }
+
+      // Clear stale tool loop history for this session
+      {
+        const startTaskFile = await readTaskFile();
+        if (startTaskFile?.taskId) {
+          await clearToolHistory(startTaskFile.taskId);
+        }
+      }
       break;
 
-    case "PreCompact":
-      // Covered by SessionStart hook
+    case "PreCompact": {
+      // Inject goal reminder before context compaction
+      const taskFileData = await readTaskFile();
+      if (taskFileData?.taskId) {
+        try {
+          const taskDetails = await fetchTaskDetails(taskFileData.taskId);
+          if (taskDetails) {
+            const reminder = [
+              "=== GOAL REMINDER (injected before context compaction) ===",
+              `Task ID: ${taskDetails.id}`,
+              `Task: ${taskDetails.task}`,
+            ];
+            if (taskDetails.progress) {
+              reminder.push(`Current Progress: ${taskDetails.progress}`);
+            }
+            reminder.push("=== Continue working on this task after compaction ===");
+            console.log(reminder.join("\n"));
+          }
+        } catch {
+          // Don't block compaction if fetch fails
+        }
+      }
       break;
+    }
 
     case "PreToolUse": {
       // For worker agents, check if their task has been cancelled
@@ -517,6 +791,31 @@ ${hasAgentIdHeader() ? `You have a pre-defined agent ID via header: ${mcpConfig?
       if (agentInfo && !agentInfo.isLead && agentInfo.status === "busy") {
         if (await checkAndBlockIfCancelled(true)) {
           return; // Exit early - don't process other hooks
+        }
+      }
+
+      // Tool loop detection (workers only, when processing a task)
+      if (agentInfo && !agentInfo.isLead && agentInfo.status === "busy") {
+        const loopTaskFile = await readTaskFile();
+        if (loopTaskFile?.taskId && msg.tool_name && msg.tool_input) {
+          const loopResult = await checkToolLoop(
+            loopTaskFile.taskId,
+            msg.tool_name,
+            msg.tool_input as Record<string, unknown>,
+          );
+
+          if (loopResult.blocked) {
+            outputBlockResponse(
+              `LOOP DETECTED: ${loopResult.reason} ` +
+                "Stop repeating this action and try a fundamentally different approach. " +
+                "If you're truly stuck, use store-progress to report the blocker.",
+            );
+            return;
+          }
+
+          if (loopResult.severity === "warning" && loopResult.reason) {
+            console.log(`Warning: ${loopResult.reason}`);
+          }
         }
       }
 
@@ -531,11 +830,135 @@ ${hasAgentIdHeader() ? `You have a pre-defined agent ID via header: ${mcpConfig?
           return;
         }
       }
+
+      // Shared disk write prevention (Archil only — skip in local dev)
+      if (process.env.ARCHIL_MOUNT_TOKEN) {
+        const preAgentId = process.env.AGENT_ID;
+        if (preAgentId && (msg.tool_name === "Write" || msg.tool_name === "Edit")) {
+          const targetPath =
+            (msg.tool_input as { file_path?: string } | undefined)?.file_path ?? "";
+          if (
+            targetPath.startsWith("/workspace/shared/") &&
+            !isOwnedSharedPath(targetPath, preAgentId)
+          ) {
+            console.log(sharedDiskWriteWarning(preAgentId));
+          }
+        }
+      }
       break;
     }
 
     case "PostToolUse":
+      // Active session heartbeat (workers only, fire-and-forget)
+      if (agentInfo && !agentInfo.isLead) {
+        const heartbeatTaskFile = await readTaskFile();
+        if (heartbeatTaskFile?.taskId) {
+          void fetch(`${getBaseUrl()}/api/active-sessions/heartbeat/${heartbeatTaskFile.taskId}`, {
+            method: "PUT",
+            headers: mcpConfig!.headers,
+          }).catch(() => {});
+        }
+      }
+
+      // Update agent last activity timestamp (fire-and-forget)
       if (agentInfo) {
+        void fetch(`${getBaseUrl()}/api/agents/${agentInfo.id}/activity`, {
+          method: "PUT",
+          headers: mcpConfig!.headers,
+        }).catch((e) => {
+          console.debug("Failed to update agent activity timestamp:", e);
+        });
+      }
+
+      // Shared disk write failure detection (Archil only — safety net)
+      if (process.env.ARCHIL_MOUNT_TOKEN) {
+        const postAgentId = process.env.AGENT_ID;
+        if (
+          postAgentId &&
+          (msg.tool_name === "Write" || msg.tool_name === "Edit" || msg.tool_name === "Bash")
+        ) {
+          const toolResponse = msg.tool_response as
+            | { output?: string; stderr?: string }
+            | undefined;
+          const responseStr = JSON.stringify(toolResponse ?? "");
+          if (responseStr.includes("Read-only file system")) {
+            const postTargetPath =
+              (msg.tool_input as { file_path?: string; command?: string } | undefined)?.file_path ??
+              "";
+            if (
+              postTargetPath.startsWith("/workspace/shared/") &&
+              !isOwnedSharedPath(postTargetPath, postAgentId)
+            ) {
+              console.log(sharedDiskWriteWarning(postAgentId));
+            } else if (!postTargetPath) {
+              // Bash tool — no file_path, just warn generically
+              console.log(sharedDiskWriteWarning(postAgentId));
+            }
+          }
+        }
+      }
+
+      if (agentInfo) {
+        // Sync workspace file edits back to DB
+        const toolName = msg.tool_name;
+        const toolInput = msg.tool_input as { file_path?: string } | undefined;
+        const editedPath = toolInput?.file_path;
+
+        if ((toolName === "Write" || toolName === "Edit") && editedPath) {
+          try {
+            // Identity files: SOUL.md, IDENTITY.md, TOOLS.md
+            if (
+              editedPath === SOUL_MD_PATH ||
+              editedPath === IDENTITY_MD_PATH ||
+              editedPath === TOOLS_MD_PATH
+            ) {
+              await syncIdentityFilesToServer(agentInfo.id, "self_edit");
+            }
+
+            // Setup script: start-up.sh (or start-up.*)
+            if (editedPath.startsWith("/workspace/start-up")) {
+              await syncSetupScriptToServer(agentInfo.id, "self_edit");
+            }
+          } catch {
+            // Non-blocking — don't interrupt the agent's workflow
+          }
+        }
+
+        // Auto-index files written to memory directories
+        if (
+          (toolName === "Write" || toolName === "Edit") &&
+          editedPath &&
+          (editedPath.startsWith("/workspace/personal/memory/") ||
+            editedPath.startsWith("/workspace/shared/memory/"))
+        ) {
+          try {
+            const apiUrl = process.env.MCP_BASE_URL || "http://localhost:3013";
+            const apiKey = process.env.API_KEY || "";
+            const fileContent = await Bun.file(editedPath).text();
+            const isShared = editedPath.startsWith("/workspace/shared/");
+            const fileName = editedPath.split("/").pop() ?? "unnamed";
+
+            await fetch(`${apiUrl}/api/memory/index`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+                "X-Agent-ID": agentInfo.id,
+              },
+              body: JSON.stringify({
+                agentId: agentInfo.id,
+                content: fileContent,
+                name: fileName.replace(/\.\w+$/, ""),
+                scope: isShared ? "swarm" : "agent",
+                source: "file_index",
+                sourcePath: editedPath,
+              }),
+            });
+          } catch {
+            // Non-blocking — don't interrupt the agent's workflow
+          }
+        }
+
         if (agentInfo.isLead) {
           if (msg.tool_name?.endsWith("send-task")) {
             const maybeTaskId = (msg.tool_response as { task?: { id?: string } })?.task?.id;
@@ -564,6 +987,25 @@ ${hasAgentIdHeader() ? `You have a pre-defined agent ID via header: ${mcpConfig?
     }
 
     case "Stop":
+      // Clean up any artifact tunnels managed by PM2
+      try {
+        const pm2ListOutput = await Bun.$`pm2 jlist 2>/dev/null || echo "[]"`.text();
+        const pm2Processes = JSON.parse(pm2ListOutput.trim());
+        const artifactProcesses = (pm2Processes as { name?: string }[]).filter((p) =>
+          p.name?.startsWith("artifact-"),
+        );
+
+        for (const proc of artifactProcesses) {
+          try {
+            await Bun.$`pm2 delete ${proc.name!}`.quiet();
+          } catch {
+            // Process might already be stopped
+          }
+        }
+      } catch {
+        // Non-fatal: PM2 might not be available
+      }
+
       // Save PM2 processes before shutdown (for container restart persistence)
       try {
         await Bun.$`pm2 save`.quiet();
@@ -571,13 +1013,120 @@ ${hasAgentIdHeader() ? `You have a pre-defined agent ID via header: ${mcpConfig?
         // PM2 not available or no processes - silently ignore
       }
 
-      // Sync CLAUDE.md back to database and restore backup
+      // Sync CLAUDE.md, identity files, and setup script back to database, then restore backup
       if (agentInfo?.id) {
         try {
           await syncClaudeMdToServer(agentInfo.id);
+          await syncIdentityFilesToServer(agentInfo.id);
+          await syncSetupScriptToServer(agentInfo.id);
           await restoreClaudeMdBackup();
         } catch {
           // Silently fail - don't block shutdown
+        }
+      }
+
+      // Session summarization via Claude Haiku
+      // Skip if this is a child session spawned by the summarization itself (prevents recursion)
+      if (agentInfo?.id && msg.transcript_path && !process.env.SKIP_SESSION_SUMMARY) {
+        try {
+          let transcript = "";
+          try {
+            const fullTranscript = await Bun.file(msg.transcript_path).text();
+            transcript =
+              fullTranscript.length > 20000 ? fullTranscript.slice(-20000) : fullTranscript;
+          } catch {
+            /* no transcript */
+          }
+
+          if (transcript.length > 100) {
+            // Read task context if available
+            let taskContext = "";
+            let taskId: string | undefined;
+            const taskFile = process.env.TASK_FILE;
+            if (taskFile) {
+              try {
+                const taskData = JSON.parse(await Bun.file(taskFile).text());
+                taskContext = `Task: ${taskData.task || "Unknown"}`;
+                taskId = taskData.id;
+              } catch {
+                /* no task file */
+              }
+            }
+
+            // Summarize with Claude Haiku — extract only high-value learnings
+            const summarizePrompt = `You are summarizing an AI agent's work session. Extract ONLY high-value learnings.
+
+DO NOT include:
+- Generic descriptions of what was done ("worked on task X")
+- Tool calls or file reads
+- Routine progress updates
+
+DO include (if present):
+- **Mistakes made and corrections** — what went wrong and what fixed it
+- **Discovered patterns** — reusable approaches, APIs, or codebase conventions
+- **Codebase knowledge** — important file paths, architecture decisions, gotchas
+- **Environment knowledge** — service URLs, config details, tool quirks
+- **Failed approaches** — what was tried and didn't work (and why)
+
+Format as a bulleted list of concrete, reusable facts. If the session was routine with no significant learnings, respond with exactly: "No significant learnings."
+${taskContext ? `\nTask context: ${taskContext}` : ""}
+Transcript:
+${transcript}`;
+
+            const tmpFile = `/tmp/session-summary-${Date.now()}.txt`;
+            await Bun.write(tmpFile, summarizePrompt);
+            const proc = Bun.spawn(
+              ["bash", "-c", `cat "${tmpFile}" | claude -p --model haiku --output-format json`],
+              {
+                stdout: "pipe",
+                stderr: "pipe",
+                env: { ...process.env, SKIP_SESSION_SUMMARY: "1" },
+              },
+            );
+            const timeoutId = setTimeout(() => proc.kill(), 30000);
+            const result = { stdout: await new Response(proc.stdout).text() };
+            clearTimeout(timeoutId);
+            await Bun.$`rm -f ${tmpFile}`.quiet();
+
+            let summary: string;
+            try {
+              const summaryOutput = JSON.parse(result.stdout);
+              summary = summaryOutput.result ?? result.stdout;
+            } catch {
+              summary = result.stdout;
+            }
+
+            // Skip indexing if the session had no significant learnings
+            if (
+              summary &&
+              summary.length > 20 &&
+              !summary.trim().toLowerCase().includes("no significant learnings")
+            ) {
+              const apiUrl = process.env.MCP_BASE_URL || "http://localhost:3013";
+              const apiKey = process.env.API_KEY || "";
+
+              await fetch(`${apiUrl}/api/memory/index`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+                  "X-Agent-ID": agentInfo.id,
+                },
+                body: JSON.stringify({
+                  agentId: agentInfo.id,
+                  content: summary,
+                  name: taskContext
+                    ? `Session: ${taskContext.slice(0, 80)}`
+                    : `Session: ${new Date().toISOString().slice(0, 16)}`,
+                  scope: "agent",
+                  source: "session_summary",
+                  ...(taskId ? { sourceTaskId: taskId } : {}),
+                }),
+              });
+            }
+          }
+        } catch {
+          // Non-blocking — session summarization failure should never block shutdown
         }
       }
 

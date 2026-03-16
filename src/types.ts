@@ -30,7 +30,7 @@ export const InboxMessageSchema = z.object({
   id: z.uuid(),
   agentId: z.uuid(), // Lead agent who received this
   content: z.string().min(1), // The message content
-  source: z.enum(["slack"]).default("slack"),
+  source: z.enum(["slack", "agentmail"]).default("slack"),
   status: InboxMessageStatusSchema.default("unread"),
 
   // Slack context (for replying)
@@ -53,7 +53,17 @@ export const InboxMessageSchema = z.object({
 export type InboxMessageStatus = z.infer<typeof InboxMessageStatusSchema>;
 export type InboxMessage = z.infer<typeof InboxMessageSchema>;
 
-export const AgentTaskSourceSchema = z.enum(["mcp", "slack", "api", "github"]);
+export const AgentTaskSourceSchema = z.enum([
+  "mcp",
+  "slack",
+  "api",
+  "github",
+  "gitlab",
+  "agentmail",
+  "system",
+  "schedule",
+  "workflow",
+]);
 export type AgentTaskSource = z.infer<typeof AgentTaskSourceSchema>;
 
 export const AgentTaskSchema = z.object({
@@ -92,13 +102,19 @@ export const AgentTaskSchema = z.object({
   slackThreadTs: z.string().optional(),
   slackUserId: z.string().optional(),
 
-  // GitHub-specific metadata (optional)
-  githubRepo: z.string().optional(),
-  githubEventType: z.string().optional(),
-  githubNumber: z.number().int().optional(),
-  githubCommentId: z.number().int().optional(),
-  githubAuthor: z.string().optional(),
-  githubUrl: z.string().optional(),
+  // VCS metadata (GitHub / GitLab — provider-agnostic)
+  vcsProvider: z.enum(["github", "gitlab"]).optional(),
+  vcsRepo: z.string().optional(),
+  vcsEventType: z.string().optional(),
+  vcsNumber: z.number().int().optional(),
+  vcsCommentId: z.number().int().optional(),
+  vcsAuthor: z.string().optional(),
+  vcsUrl: z.string().optional(),
+
+  // AgentMail-specific metadata (optional)
+  agentmailInboxId: z.string().optional(),
+  agentmailMessageId: z.string().optional(),
+  agentmailThreadId: z.string().optional(),
 
   // Mention-to-task metadata (optional)
   mentionMessageId: z.uuid().optional(),
@@ -106,6 +122,23 @@ export const AgentTaskSchema = z.object({
 
   // Epic association (optional)
   epicId: z.uuid().optional(),
+
+  // Working directory (optional — must be an absolute path for the agent process)
+  dir: z.string().min(1).startsWith("/").optional(),
+
+  // Session attachment (optional)
+  parentTaskId: z.uuid().optional(),
+  claudeSessionId: z.string().optional(),
+
+  // Model selection (optional — defaults to "opus" via runner)
+  model: z.enum(["haiku", "sonnet", "opus"]).optional(),
+
+  // Schedule linking (optional — set when task was created by a schedule)
+  scheduleId: z.uuid().optional(),
+
+  // Workflow linking (optional — set when task was created by a workflow)
+  workflowRunId: z.string().uuid().nullable().optional(),
+  workflowRunStepId: z.string().uuid().nullable().optional(),
 });
 
 export const AgentStatusSchema = z.enum(["idle", "busy", "offline"]);
@@ -124,11 +157,23 @@ export const AgentSchema = z.object({
   // Personal CLAUDE.md content (max 64KB)
   claudeMd: z.string().max(65536).optional(),
 
+  // Soul: Persona, behavioral directives (injected via --append-system-prompt)
+  soulMd: z.string().max(65536).optional(),
+  // Identity: Expertise, working style, self-evolution notes (injected via --append-system-prompt)
+  identityMd: z.string().max(65536).optional(),
+  // Setup script: Runs at container start, agent-evolved (synced to /workspace/start-up.sh)
+  setupScript: z.string().max(65536).optional(),
+  // Tools/environment reference: Operational knowledge (synced to /workspace/TOOLS.md)
+  toolsMd: z.string().max(65536).optional(),
+
   // Concurrency limit (defaults to 1 for backwards compatibility)
   maxTasks: z.number().int().min(1).max(20).optional(),
 
   // Polling limit tracking (consecutive empty polls)
   emptyPollCount: z.number().int().min(0).optional(),
+
+  // Last session activity timestamp (updated on tool calls, task updates, etc.)
+  lastActivityAt: z.iso.datetime().optional(),
 
   createdAt: z.iso.datetime().default(() => new Date().toISOString()),
   lastUpdatedAt: z.iso.datetime().default(() => new Date().toISOString()),
@@ -144,6 +189,50 @@ export type AgentTask = z.infer<typeof AgentTaskSchema>;
 export type AgentStatus = z.infer<typeof AgentStatusSchema>;
 export type Agent = z.infer<typeof AgentSchema>;
 export type AgentWithTasks = z.infer<typeof AgentWithTasksSchema>;
+
+// ============================================================================
+// Context Versioning Types
+// ============================================================================
+
+export const ChangeSourceSchema = z.enum([
+  "self_edit",
+  "lead_coaching",
+  "api",
+  "system",
+  "session_sync",
+]);
+
+export const VersionableFieldSchema = z.enum([
+  "soulMd",
+  "identityMd",
+  "toolsMd",
+  "claudeMd",
+  "setupScript",
+]);
+
+export const ContextVersionSchema = z.object({
+  id: z.uuid(),
+  agentId: z.uuid(),
+  field: VersionableFieldSchema,
+  content: z.string(),
+  version: z.number().int().min(1),
+  changeSource: ChangeSourceSchema,
+  changedByAgentId: z.uuid().nullable(),
+  changeReason: z.string().nullable(),
+  contentHash: z.string(),
+  previousVersionId: z.uuid().nullable(),
+  createdAt: z.iso.datetime(),
+});
+
+export type ChangeSource = z.infer<typeof ChangeSourceSchema>;
+export type VersionableField = z.infer<typeof VersionableFieldSchema>;
+export type ContextVersion = z.infer<typeof ContextVersionSchema>;
+
+export type VersionMeta = {
+  changeSource?: ChangeSource;
+  changedByAgentId?: string | null;
+  changeReason?: string | null;
+};
 
 // Channel Types
 export const ChannelTypeSchema = z.enum(["public", "dm"]);
@@ -291,12 +380,23 @@ export const ScheduledTaskSchema = z
     nextRunAt: z.iso.datetime().optional(),
     createdByAgentId: z.uuid().optional(),
     timezone: z.string().default("UTC"),
+    consecutiveErrors: z.number().int().min(0).default(0),
+    lastErrorAt: z.iso.datetime().optional(),
+    lastErrorMessage: z.string().optional(),
+    model: z.enum(["haiku", "sonnet", "opus"]).optional(),
+    scheduleType: z.enum(["recurring", "one_time"]).default("recurring"),
     createdAt: z.iso.datetime(),
     lastUpdatedAt: z.iso.datetime(),
   })
-  .refine((data) => data.cronExpression || data.intervalMs, {
-    message: "Either cronExpression or intervalMs must be provided",
-  });
+  .refine(
+    (data) => {
+      if (data.scheduleType === "one_time") return true;
+      return data.cronExpression || data.intervalMs;
+    },
+    {
+      message: "Either cronExpression or intervalMs must be provided for recurring schedules",
+    },
+  );
 
 export type ScheduledTask = z.infer<typeof ScheduledTaskSchema>;
 
@@ -329,8 +429,10 @@ export const EpicSchema = z.object({
   planDocPath: z.string().optional(),
   slackChannelId: z.string().optional(),
   slackThreadTs: z.string().optional(),
-  githubRepo: z.string().optional(),
-  githubMilestone: z.string().optional(),
+  vcsProvider: z.enum(["github", "gitlab"]).optional(),
+  vcsRepo: z.string().optional(),
+  vcsMilestone: z.string().optional(),
+  nextSteps: z.string().optional(), // Lead's notes on what to do next for this epic
   createdAt: z.iso.datetime(),
   lastUpdatedAt: z.iso.datetime(),
   startedAt: z.iso.datetime().optional(),
@@ -353,3 +455,188 @@ export const EpicWithProgressSchema = EpicSchema.extend({
 });
 
 export type EpicWithProgress = z.infer<typeof EpicWithProgressSchema>;
+
+// ============================================================================
+// Swarm Config Types (Centralized Environment/Config Management)
+// ============================================================================
+
+export const SwarmConfigScopeSchema = z.enum(["global", "agent", "repo"]);
+
+export const SwarmConfigSchema = z.object({
+  id: z.string().uuid(),
+  scope: SwarmConfigScopeSchema,
+  scopeId: z.string().nullable(), // agentId or repoId, null for global
+  key: z.string().min(1).max(255),
+  value: z.string(),
+  isSecret: z.boolean(),
+  envPath: z.string().nullable(),
+  description: z.string().nullable(),
+  createdAt: z.string(),
+  lastUpdatedAt: z.string(),
+});
+
+export type SwarmConfigScope = z.infer<typeof SwarmConfigScopeSchema>;
+export type SwarmConfig = z.infer<typeof SwarmConfigSchema>;
+
+// ============================================================================
+// Swarm Repos Types (Centralized Repository Management)
+// ============================================================================
+
+export const SwarmRepoSchema = z.object({
+  id: z.string().uuid(),
+  url: z.string().min(1),
+  name: z.string().min(1).max(100),
+  clonePath: z.string().min(1),
+  defaultBranch: z.string().default("main"),
+  autoClone: z.boolean().default(true),
+  createdAt: z.string(),
+  lastUpdatedAt: z.string(),
+});
+
+export type SwarmRepo = z.infer<typeof SwarmRepoSchema>;
+
+// ============================================================================
+// Agent Memory Types (Persistent Memory System)
+// ============================================================================
+
+export const AgentMemoryScopeSchema = z.enum(["agent", "swarm"]);
+export const AgentMemorySourceSchema = z.enum([
+  "manual",
+  "file_index",
+  "session_summary",
+  "task_completion",
+]);
+
+export const AgentMemorySchema = z.object({
+  id: z.string().uuid(),
+  agentId: z.string().uuid().nullable(),
+  scope: AgentMemoryScopeSchema,
+  name: z.string().min(1).max(500),
+  content: z.string(),
+  summary: z.string().nullable(),
+  source: AgentMemorySourceSchema,
+  sourceTaskId: z.string().uuid().nullable(),
+  sourcePath: z.string().nullable(),
+  chunkIndex: z.number().int().min(0).default(0),
+  totalChunks: z.number().int().min(1).default(1),
+  tags: z.array(z.string()),
+  createdAt: z.string(),
+  accessedAt: z.string(),
+});
+
+export type AgentMemoryScope = z.infer<typeof AgentMemoryScopeSchema>;
+export type AgentMemorySource = z.infer<typeof AgentMemorySourceSchema>;
+export type AgentMemory = z.infer<typeof AgentMemorySchema>;
+
+// ============================================================================
+// Active Session Types (runner session tracking)
+// ============================================================================
+
+export const ActiveSessionSchema = z.object({
+  id: z.uuid(),
+  agentId: z.uuid(),
+  taskId: z.string().nullable(),
+  triggerType: z.string(),
+  inboxMessageId: z.string().nullable(),
+  taskDescription: z.string().nullable(),
+  startedAt: z.iso.datetime(),
+  lastHeartbeatAt: z.iso.datetime(),
+});
+
+export type ActiveSession = z.infer<typeof ActiveSessionSchema>;
+
+// ============================================================================
+// Workflow Engine Types
+// ============================================================================
+
+export const WorkflowNodeTypeSchema = z.enum([
+  "trigger-new-task",
+  "trigger-task-completed",
+  "trigger-webhook",
+  "trigger-email",
+  "trigger-slack-message",
+  "trigger-github-event",
+  "trigger-gitlab-event",
+  "llm-classify",
+  "property-match",
+  "code-match",
+  "create-task",
+  "send-message",
+  "delegate-to-agent",
+]);
+export type WorkflowNodeType = z.infer<typeof WorkflowNodeTypeSchema>;
+
+export const WorkflowNodeSchema = z.object({
+  id: z.string(),
+  type: WorkflowNodeTypeSchema,
+  label: z.string().optional(),
+  config: z.record(z.string(), z.unknown()),
+});
+export type WorkflowNode = z.infer<typeof WorkflowNodeSchema>;
+
+export const WorkflowEdgeSchema = z.object({
+  id: z.string(),
+  source: z.string(),
+  sourcePort: z.string(),
+  target: z.string(),
+});
+export type WorkflowEdge = z.infer<typeof WorkflowEdgeSchema>;
+
+export const WorkflowDefinitionSchema = z.object({
+  nodes: z.array(WorkflowNodeSchema),
+  edges: z.array(WorkflowEdgeSchema),
+});
+export type WorkflowDefinition = z.infer<typeof WorkflowDefinitionSchema>;
+
+export const WorkflowSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+  description: z.string().optional(),
+  enabled: z.boolean(),
+  definition: WorkflowDefinitionSchema,
+  webhookSecret: z.string().optional(),
+  createdByAgentId: z.string().uuid().optional(),
+  createdAt: z.string(),
+  lastUpdatedAt: z.string(),
+});
+export type Workflow = z.infer<typeof WorkflowSchema>;
+
+export const WorkflowRunStatusSchema = z.enum(["running", "waiting", "completed", "failed"]);
+export type WorkflowRunStatus = z.infer<typeof WorkflowRunStatusSchema>;
+
+export const WorkflowRunSchema = z.object({
+  id: z.string().uuid(),
+  workflowId: z.string().uuid(),
+  status: WorkflowRunStatusSchema,
+  triggerData: z.unknown().optional(),
+  context: z.record(z.string(), z.unknown()).optional(),
+  error: z.string().optional(),
+  startedAt: z.string(),
+  lastUpdatedAt: z.string(),
+  finishedAt: z.string().optional(),
+});
+export type WorkflowRun = z.infer<typeof WorkflowRunSchema>;
+
+export const WorkflowRunStepStatusSchema = z.enum([
+  "pending",
+  "running",
+  "waiting",
+  "completed",
+  "failed",
+  "skipped",
+]);
+export type WorkflowRunStepStatus = z.infer<typeof WorkflowRunStepStatusSchema>;
+
+export const WorkflowRunStepSchema = z.object({
+  id: z.string().uuid(),
+  runId: z.string().uuid(),
+  nodeId: z.string(),
+  nodeType: z.string(),
+  status: WorkflowRunStepStatusSchema,
+  input: z.unknown().optional(),
+  output: z.unknown().optional(),
+  error: z.string().optional(),
+  startedAt: z.string(),
+  finishedAt: z.string().optional(),
+});
+export type WorkflowRunStep = z.infer<typeof WorkflowRunStepSchema>;

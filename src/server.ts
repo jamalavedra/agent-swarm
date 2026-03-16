@@ -2,7 +2,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import pkg from "../package.json";
 import { initDb } from "./be/db";
 import { registerCancelTaskTool } from "./tools/cancel-task";
+import { registerContextDiffTool } from "./tools/context-diff";
+import { registerContextHistoryTool } from "./tools/context-history";
 import { registerCreateChannelTool } from "./tools/create-channel";
+import { registerDeleteChannelTool } from "./tools/delete-channel";
 // Epics capability
 import {
   registerAssignTaskToEpicTool,
@@ -13,20 +16,22 @@ import {
   registerUnassignTaskFromEpicTool,
   registerUpdateEpicTool,
 } from "./tools/epics";
-// Lead inbox tools
-import { registerGetInboxMessageTool } from "./tools/get-inbox-message";
 import { registerGetSwarmTool } from "./tools/get-swarm";
 import { registerGetTaskDetailsTool } from "./tools/get-task-details";
 import { registerGetTasksTool } from "./tools/get-tasks";
-import { registerInboxDelegateTool } from "./tools/inbox-delegate";
+import { registerInjectLearningTool } from "./tools/inject-learning";
 import { registerJoinSwarmTool } from "./tools/join-swarm";
 // Messaging capability
 import { registerListChannelsTool } from "./tools/list-channels";
 import { registerListServicesTool } from "./tools/list-services";
+// Memory capability
+import { registerMemoryGetTool } from "./tools/memory-get";
+import { registerMemorySearchTool } from "./tools/memory-search";
 import { registerMyAgentInfoTool } from "./tools/my-agent-info";
 import { registerPollTaskTool } from "./tools/poll-task";
 import { registerPostMessageTool } from "./tools/post-message";
 import { registerReadMessagesTool } from "./tools/read-messages";
+import { registerRegisterAgentMailInboxTool } from "./tools/register-agentmail-inbox";
 // Services capability
 import { registerRegisterServiceTool } from "./tools/register-service";
 // Scheduling capability
@@ -45,16 +50,36 @@ import { registerSlackReadTool } from "./tools/slack-read";
 import { registerSlackReplyTool } from "./tools/slack-reply";
 import { registerSlackUploadFileTool } from "./tools/slack-upload-file";
 import { registerStoreProgressTool } from "./tools/store-progress";
+// Swarm config tools
+import {
+  registerDeleteConfigTool,
+  registerGetConfigTool,
+  registerListConfigTool,
+  registerSetConfigTool,
+} from "./tools/swarm-config";
 // Task pool capability
 import { registerTaskActionTool } from "./tools/task-action";
 import { registerUnregisterServiceTool } from "./tools/unregister-service";
 // Profiles capability
 import { registerUpdateProfileTool } from "./tools/update-profile";
 import { registerUpdateServiceStatusTool } from "./tools/update-service-status";
+// Workflows capability
+import {
+  registerCreateWorkflowTool,
+  registerDeleteWorkflowTool,
+  registerGetWorkflowRunTool,
+  registerGetWorkflowTool,
+  registerListWorkflowRunsTool,
+  registerListWorkflowsTool,
+  registerRetryWorkflowRunTool,
+  registerTriggerWorkflowTool,
+  registerUpdateWorkflowTool,
+} from "./tools/workflows";
 
 // Capability-based feature flags
 // Default: all capabilities enabled
-const DEFAULT_CAPABILITIES = "core,task-pool,messaging,profiles,services,scheduling,epics";
+const DEFAULT_CAPABILITIES =
+  "core,task-pool,messaging,profiles,services,scheduling,epics,memory,workflows";
 const CAPABILITIES = new Set(
   (process.env.CAPABILITIES || DEFAULT_CAPABILITIES).split(",").map((s) => s.trim()),
 );
@@ -96,6 +121,12 @@ export function createServer() {
   registerMyAgentInfoTool(server);
   registerCancelTaskTool(server);
 
+  // Swarm config tools - always registered (config management is fundamental)
+  registerSetConfigTool(server);
+  registerGetConfigTool(server);
+  registerListConfigTool(server);
+  registerDeleteConfigTool(server);
+
   // Slack integration tools (always registered, will no-op if Slack not configured)
   registerSlackReplyTool(server);
   registerSlackReadTool(server);
@@ -103,8 +134,9 @@ export function createServer() {
   registerSlackListChannelsTool(server);
   registerSlackUploadFileTool(server);
   registerSlackDownloadFileTool(server);
-  registerInboxDelegateTool(server);
-  registerGetInboxMessageTool(server);
+
+  // AgentMail integration tool (always registered, self-service inbox mapping)
+  registerRegisterAgentMailInboxTool(server);
 
   // Task pool capability - task pool operations (create unassigned, claim, release, accept, reject)
   if (hasCapability("task-pool")) {
@@ -115,6 +147,7 @@ export function createServer() {
   if (hasCapability("messaging")) {
     registerListChannelsTool(server);
     registerCreateChannelTool(server);
+    registerDeleteChannelTool(server);
     registerPostMessageTool(server);
     registerReadMessagesTool(server);
   }
@@ -122,6 +155,8 @@ export function createServer() {
   // Profiles capability - agent profile management
   if (hasCapability("profiles")) {
     registerUpdateProfileTool(server);
+    registerContextHistoryTool(server);
+    registerContextDiffTool(server);
   }
 
   // Services capability - PM2/background service registry
@@ -150,6 +185,26 @@ export function createServer() {
     registerDeleteEpicTool(server);
     registerAssignTaskToEpicTool(server);
     registerUnassignTaskFromEpicTool(server);
+  }
+
+  // Memory capability - persistent memory with vector search
+  if (hasCapability("memory")) {
+    registerMemorySearchTool(server);
+    registerMemoryGetTool(server);
+    registerInjectLearningTool(server);
+  }
+
+  // Workflows capability - DAG-based automation workflows
+  if (hasCapability("workflows")) {
+    registerCreateWorkflowTool(server);
+    registerListWorkflowsTool(server);
+    registerGetWorkflowTool(server);
+    registerUpdateWorkflowTool(server);
+    registerDeleteWorkflowTool(server);
+    registerTriggerWorkflowTool(server);
+    registerListWorkflowRunsTool(server);
+    registerGetWorkflowRunTool(server);
+    registerRetryWorkflowRunTool(server);
   }
 
   return server;

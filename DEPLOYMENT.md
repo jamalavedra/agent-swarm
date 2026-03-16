@@ -1,6 +1,6 @@
 # Deployment Guide
 
-This guide covers all deployment options for Agent Swarm MCP.
+This guide covers all deployment options for Agent Swarm.
 
 ## Table of Contents
 
@@ -41,6 +41,10 @@ docker-compose up -d
 
 > **Note:** `.env.example` contains API server settings, `.env.docker.example` contains Docker worker settings. For docker-compose, you need both sets of variables in a single `.env` file.
 
+### ARM Compatibility (Apple Silicon)
+
+All services in the docker-compose files include `platform: linux/amd64` to avoid `no matching manifest for linux/arm64/v8` errors on Apple Silicon Macs. The Docker images are built for `linux/amd64` and run via Rosetta emulation.
+
 ### What's Included
 
 The example `docker-compose.yml` sets up:
@@ -48,6 +52,7 @@ The example `docker-compose.yml` sets up:
 - **API service** (port 3013) - MCP HTTP server
 - **2 Worker agents** - Containerized Claude workers
 - **1 Lead agent** - Coordinator agent
+- **3 Content agents** (optional) - Content writer, reviewer, and strategist using `TEMPLATE_ID` for profile bootstrapping
 
 ### Configuration
 
@@ -57,6 +62,7 @@ Edit your `.env` file:
 # Required
 API_KEY=your-secret-api-key
 CLAUDE_CODE_OAUTH_TOKEN=your-oauth-token  # Run `claude setup-token` to get this
+# Multiple tokens for load balancing: CLAUDE_CODE_OAUTH_TOKEN=token1,token2,token3
 
 # Agent IDs (optional, auto-generated if not set)
 AGENT_ID=worker-1-uuid
@@ -177,9 +183,9 @@ The Docker worker image uses a multi-stage build:
 - **Languages**: Python 3, Node.js 22, Bun
 - **Build tools**: gcc, g++, make, cmake
 - **Process manager**: PM2 (for background services)
-- **CLI tools**: GitHub CLI (`gh`), sqlite3
-- **Agent tools**: `wts` (git worktree manager), `cc-ai-tracker` (code change tracking)
-- **Utilities**: git, git-lfs, vim, nano, jq, curl, wget, ssh
+- **CLI tools**: GitHub CLI (`gh`), GitLab CLI (`glab`), sqlite3
+- **Agent tools**: `wts` (git worktree manager), `archil` (FUSE/R2-backed storage)
+- **Utilities**: git, git-lfs, vim, nano, jq, curl, wget, ssh, fuse3
 - **Sudo access**: Worker can install packages with `sudo apt-get install`
 
 **Volumes:**
@@ -337,11 +343,13 @@ When a worker starts, it:
 
 ## Environment Variables
 
+> For the complete reference of all environment variables, see [docs/ENVS.md](./docs/ENVS.md).
+
 ### Docker Worker Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `CLAUDE_CODE_OAUTH_TOKEN` | Yes | OAuth token for Claude CLI (run `claude setup-token`) |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Yes | OAuth token for Claude CLI (run `claude setup-token`). Supports comma-separated values for [multi-credential load balancing](./docs/ENVS.md#multi-credential-support). |
 | `API_KEY` | Yes | API key for MCP server |
 | `AGENT_ID` | No | Agent UUID (assigned on join if not set). **Keep stable for task resume.** |
 | `AGENT_ROLE` | No | Role: `worker` (default) or `lead` |
@@ -355,7 +363,9 @@ When a worker starts, it:
 | `SHUTDOWN_TIMEOUT` | No | Grace period in ms before pausing tasks (default: `30000`) |
 | `MAX_CONCURRENT_TASKS` | No | Maximum parallel tasks per worker (default: `1`) |
 | `SWARM_URL` | No | Base domain for service URLs (default: `localhost`) |
-| `SERVICE_PORT` | No | Host port for exposed services (default: `3000`) |
+| `LEAD_PORT` | No | Host port for lead service (default: `3020`). Example — adjust to your setup. In isolated network namespaces all services can share the same port. |
+| `WORKER1_PORT` | No | Host port for worker-1 service (default: `3021`). Example — see `LEAD_PORT`. |
+| `WORKER2_PORT` | No | Host port for worker-2 service (default: `3022`). Example — see `LEAD_PORT`. |
 | `PM2_HOME` | No | PM2 state directory (default: `/workspace/.pm2`) |
 | `GITHUB_TOKEN` | No | GitHub token for git operations |
 | `GITHUB_EMAIL` | No | Git commit email (default: `worker-agent@desplega.ai`) |
@@ -375,6 +385,8 @@ When a worker starts, it:
 | `ENV` | Environment mode (`development` adds prefix to Slack agent names) | - |
 | `SCHEDULER_INTERVAL_MS` | Polling interval for scheduled tasks | `10000` |
 | `DATABASE_PATH` | SQLite database file path | `./agent-swarm-db.sqlite` |
+| `OPENAI_API_KEY` | OpenAI key for memory embeddings (optional) | - |
+| `CAPABILITIES` | Comma-separated feature flags | All enabled |
 
 ---
 
@@ -384,10 +396,12 @@ Enable Slack for task creation and agent communication via direct messages.
 
 ### Setup
 
-1. Create a Slack App at https://api.slack.com/apps
+1. Create a Slack App at https://api.slack.com/apps (or import `slack-manifest.json` from the repo root)
 2. Enable Socket Mode (for real-time events without public webhooks)
-3. Add required scopes: `chat:write`, `users:read`, `users:read.email`, `channels:history`, `im:history`
-4. Install to workspace and copy tokens
+3. Enable Interactivity and Assistant View
+4. Add required scopes: `app_mentions:read`, `assistant:write`, `channels:history`, `channels:read`, `chat:write`, `chat:write.customize`, `chat:write.public`, `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `mpim:write`, `reactions:write`, `users:read`
+5. Subscribe to bot events: `app_mention`, `assistant_thread_started`, `assistant_thread_context_changed`, `message.channels`, `message.groups`, `message.im`, `message.mpim`
+6. Install to workspace and copy tokens
 
 ### Configuration
 

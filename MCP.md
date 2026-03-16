@@ -15,21 +15,29 @@
   - [store-progress](#store-progress)
   - [my-agent-info](#my-agent-info)
   - [cancel-task](#cancel-task)
+  - [set-config](#set-config)
+  - [get-config](#get-config)
+  - [list-config](#list-config)
+  - [delete-config](#delete-config)
   - [slack-reply](#slack-reply)
   - [slack-read](#slack-read)
   - [slack-post](#slack-post)
   - [slack-list-channels](#slack-list-channels)
-  - [inbox-delegate](#inbox-delegate)
-  - [get-inbox-message](#get-inbox-message)
+  - [slack-upload-file](#slack-upload-file)
+  - [slack-download-file](#slack-download-file)
+  - [register-agent-mail-inbox](#register-agent-mail-inbox)
 - [Task Pool Tools](#task-pool-tools)
   - [task-action](#task-action)
 - [Messaging Tools](#messaging-tools)
   - [list-channels](#list-channels)
   - [create-channel](#create-channel)
+  - [delete-channel](#delete-channel)
   - [post-message](#post-message)
   - [read-messages](#read-messages)
 - [Profiles Tools](#profiles-tools)
   - [update-profile](#update-profile)
+  - [context-history](#context-history)
+  - [context-diff](#context-diff)
 - [Services Tools](#services-tools)
   - [register-service](#register-service)
   - [unregister-service](#unregister-service)
@@ -41,6 +49,28 @@
   - [update-schedule](#update-schedule)
   - [delete-schedule](#delete-schedule)
   - [run-schedule-now](#run-schedule-now)
+- [Epics Tools](#epics-tools)
+  - [create-epic](#create-epic)
+  - [list-epics](#list-epics)
+  - [get-epic-details](#get-epic-details)
+  - [update-epic](#update-epic)
+  - [delete-epic](#delete-epic)
+  - [assign-task-to-epic](#assign-task-to-epic)
+  - [unassign-task-from-epic](#unassign-task-from-epic)
+- [Memory Tools](#memory-tools)
+  - [memory-search](#memory-search)
+  - [memory-get](#memory-get)
+  - [inject-learning](#inject-learning)
+- [Workflows Tools](#workflows-tools)
+  - [create-workflow](#create-workflow)
+  - [list-workflows](#list-workflows)
+  - [get-workflow](#get-workflow)
+  - [update-workflow](#update-workflow)
+  - [delete-workflow](#delete-workflow)
+  - [trigger-workflow](#trigger-workflow)
+  - [list-workflow-runs](#list-workflow-runs)
+  - [get-workflow-run](#get-workflow-run)
+  - [retry-workflow-run](#retry-workflow-run)
 
 ---
 
@@ -103,6 +133,7 @@ Sends a task to a specific agent, creates an unassigned task for the pool, or of
 |-----------|------|----------|---------|-------------|
 | `task` | `string` | Yes | - | The task description to send. |
 | `dependsOn` | `array` | No | - | Task IDs this task depends on. |
+| `epicId` | `string` | No | - | Epic to associate this task with. |
 
 ### get-task-details
 
@@ -145,6 +176,45 @@ Cancel a task that is pending or in progress. Only the lead or task creator can 
 | `taskId` | `uuid` | Yes | - | The ID of the task to cancel. |
 | `reason` | `string` | No | - | Reason for cancellation. |
 
+### set-config
+
+**Set Config**
+
+Set or update a swarm configuration value. Upserts by (scope, scopeId, key). Use scope='global' for server-wide settings, 'agent' for agent-specific, or 'repo' for repo-specific. Set isSecret=true to mask the value in API responses.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `value` | `string` | Yes | - | Configuration value. |
+
+### get-config
+
+**Get Config**
+
+Get resolved configuration values with scope resolution (repo > agent > global). Returns one entry per unique key with the most-specific scope winning. Use includeSecrets=true to see secret values.
+
+*No parameters*
+
+### list-config
+
+**List Config**
+
+List raw config entries with optional filters. Unlike get-config, this returns raw entries without scope resolution — useful for seeing exactly what's configured at each scope level.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `scopeId` | `string` | No | - | Filter by agent ID or repo ID. |
+| `key` | `string` | No | - | Filter by specific key. |
+
+### delete-config
+
+**Delete Config**
+
+Delete a swarm configuration entry by its ID. Use list-config to find config IDs first.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | The config entry ID to delete. |
+
 ### slack-reply
 
 **Reply to Slack thread**
@@ -185,30 +255,29 @@ List Slack channels the bot is a member of. Use this to discover available chann
 
 *No parameters*
 
-### inbox-delegate
+### slack-upload-file
 
-**Delegate inbox message to worker**
+**Upload file to Slack**
 
-Delegate an inbox message to a worker agent by creating a task. The task inherits Slack context for replies.
+Upload a file (image, document, etc.) to a Slack channel or thread. Use inboxMessageId or taskId for context, or provide channelId directly (leads only). Maximum file size is 1 GB.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `inboxMessageId` | `uuid` | Yes | - | The inbox message ID to delegate. |
-| `agentId` | `uuid` | Yes | - | The worker agent to delegate to. |
+*No parameters*
 
-### get-inbox-message
+### slack-download-file
 
-**Get inbox message details**
+**Download file from Slack**
 
-Returns detailed information about a specific inbox message, including full content and Slack context. Only accessible to the lead agent who owns the message.
+Download a file from Slack by file ID or URL. Files are saved to the agent's download directory on the shared disk by default.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `inboxMessageId` | `uuid` | Yes | - | The ID of the inbox message to retrieve. |
+*No parameters*
+
+### register-agent-mail-inbox
+
+*Documentation not available*
 
 ## Task Pool Tools
 
-*Messaging*
+*Epics*
 
 ### task-action
 
@@ -244,6 +313,17 @@ Creates a new channel for cross-agent communication.
 | `name` | `string` | Yes | - | Channel name (must be unique). |
 | `description` | `string` | No | - | Channel description. |
 | `participants` | `array` | No | - | Agent IDs for DM channels. |
+
+### delete-channel
+
+**Delete Channel**
+
+Deletes a channel and all its messages. Only the lead agent can delete channels. The default 'general' channel cannot be deleted.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `channelId` | `string` | No | - | The ID of the channel to delete. |
+| `name` | `string` | No | - | Channel name (alternative to channelId). |
 
 ### post-message
 
@@ -282,6 +362,24 @@ Updates the calling agent's profile information (name, description, role, capabi
 |-----------|------|----------|---------|-------------|
 | `name` | `string` | No | - | Agent name. |
 | `description` | `string` | No | - | Agent description. |
+
+### context-history
+
+**Context History**
+
+View version history for an agent's context files (soulMd, identityMd, toolsMd, claudeMd, setupScript). Returns metadata for each version without full content.
+
+*No parameters*
+
+### context-diff
+
+**Context Diff**
+
+Compare two versions of a context file. Shows a unified diff between the specified version and its predecessor (or a specific comparison version).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `versionId` | `string` | Yes | - | The "newer" version ID to diff. |
 
 ## Services Tools
 
@@ -352,7 +450,7 @@ View all scheduled tasks with optional filters. Use this to discover existing sc
 
 **Create Scheduled Task**
 
-Create a new scheduled task that will automatically create agent tasks at specified intervals. Either cronExpression or intervalMs must be provided.
+Create a new scheduled task. For recurring: provide cronExpression or intervalMs. For one-time: provide delayMs or runAt with scheduleType 'one_time'.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -403,4 +501,259 @@ Immediately execute a scheduled task, creating a task right away. Does not affec
 |-----------|------|----------|---------|-------------|
 | `scheduleId` | `string` | No | - | Schedule ID to run |
 | `name` | `string` | No | - | Schedule name to run (alternative to ID) |
+
+## Epics Tools
+
+*Epics*
+
+### create-epic
+
+**Create Epic**
+
+Create a new epic (project) to organize related tasks.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | `string` | Yes | - | Unique name for the epic |
+| `goal` | `string` | Yes | - | The goal/objective of this epic |
+| `description` | `string` | No | - | Detailed description |
+| `prd` | `string` | No | - | Product Requirements Document (markdown) |
+| `plan` | `string` | No | - | Implementation plan (markdown) |
+| `priority` | `number` | No | 50 | - |
+| `tags` | `array` | No | - | Tags for filtering |
+| `leadAgentId` | `string` | No | - | Lead agent for this epic |
+| `researchDocPath` | `string` | No | - | Path to research document |
+| `planDocPath` | `string` | No | - | Path to plan document |
+| `slackChannelId` | `string` | No | - | - |
+| `slackThreadTs` | `string` | No | - | - |
+| `vcsRepo` | `string` | No | - | - |
+| `vcsMilestone` | `string` | No | - | - |
+
+### list-epics
+
+**List Epics**
+
+List epics with optional filters. Returns epics with progress information.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `search` | `string` | No | - | Search in name, description, or goal |
+| `leadAgentId` | `string` | No | - | Filter by lead agent |
+| `createdByAgentId` | `string` | No | - | Filter by creator |
+
+### get-epic-details
+
+**Get Epic Details**
+
+Get detailed information about a specific epic, including progress and associated tasks.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `epicId` | `string` | No | - | The ID of the epic |
+| `name` | `string` | No | - | The name of the epic (alternative to ID) |
+
+### update-epic
+
+**Update Epic**
+
+Update an existing epic. Only the creator, lead agent, or swarm lead can update.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `epicId` | `string` | No | - | The ID of the epic to update |
+| `name` | `string` | No | - | Epic name (alternative to ID for lookup) |
+| `newName` | `string` | No | - | New name for the epic |
+| `description` | `string` | No | - | New description |
+| `goal` | `string` | No | - | New goal |
+| `prd` | `string` | No | - | New PRD (markdown) |
+| `plan` | `string` | No | - | New plan (markdown) |
+| `priority` | `number` | No | - | New priority |
+| `tags` | `array` | No | - | New tags |
+| `leadAgentId` | `string` | No | - | New lead agent |
+| `researchDocPath` | `string` | No | - | - |
+| `planDocPath` | `string` | No | - | - |
+| `slackChannelId` | `string` | No | - | - |
+| `slackThreadTs` | `string` | No | - | - |
+| `vcsRepo` | `string` | No | - | - |
+| `vcsMilestone` | `string` | No | - | - |
+| `nextSteps` | `string` | No | - | Notes on what to do next for this epic |
+
+### delete-epic
+
+**Delete Epic**
+
+Delete an epic. Only the creator or swarm lead can delete. Tasks are unassigned, not deleted.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `epicId` | `string` | No | - | The ID of the epic to delete |
+| `name` | `string` | No | - | Epic name (alternative to ID) |
+
+### assign-task-to-epic
+
+**Assign Task to Epic**
+
+Assign an existing task to an epic.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `taskId` | `string` | Yes | - | The ID of the task to assign |
+| `epicId` | `string` | No | - | The ID of the epic |
+| `epicName` | `string` | No | - | Epic name (alternative to ID) |
+
+### unassign-task-from-epic
+
+**Unassign Task from Epic**
+
+Remove a task from its epic. The task is kept but no longer associated.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `taskId` | `string` | Yes | - | The ID of the task to unassign |
+
+## Memory Tools
+
+*Memory*
+
+### memory-search
+
+**Search memories**
+
+Search your accumulated memories using natural language. Returns summaries with IDs — use memory-get to retrieve full content.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `query` | `string` | Yes | - | Natural language search query. |
+| `limit` | `number` | No | 10 | Max results to return. |
+
+### memory-get
+
+**Get memory details**
+
+Retrieve the full content of a specific memory by its ID. Use memory-search to find memory IDs first.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `memoryId` | `uuid` | Yes | - | The ID of the memory to retrieve. |
+
+### inject-learning
+
+**Inject learning into worker memory**
+
+Allows the lead agent to push learnings into a worker's memory. The learning will be stored as a searchable memory entry that the worker can recall in future sessions.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `agentId` | `uuid` | Yes | - | Target worker agent ID |
+| `learning` | `string` | Yes | - | The learning content to inject |
+
+## Workflows Tools
+
+*Workflows*
+
+### create-workflow
+
+**Create Workflow**
+
+Create a new automation workflow with a trigger → condition → action DAG definition.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | `string` | Yes | - | Unique name for the workflow |
+| `description` | `string` | No | - | Description of what this workflow does |
+
+### list-workflows
+
+**List Workflows**
+
+List all automation workflows, optionally filtered by enabled status.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `enabled` | `boolean` | No | - | Filter by enabled status (omit to return all) |
+
+### get-workflow
+
+**Get Workflow**
+
+Get a workflow by ID, including its full DAG definition.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Workflow ID |
+
+### update-workflow
+
+**Update Workflow**
+
+Update an existing workflow's name, description, definition, or enabled state.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Workflow ID to update |
+| `name` | `string` | No | - | New name for the workflow |
+| `description` | `string` | No | - | New description |
+| `enabled` | `boolean` | No | - | Enable or disable the workflow |
+
+### delete-workflow
+
+**Delete Workflow**
+
+Delete a workflow by ID. This also removes all associated runs and steps.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Workflow ID to delete |
+
+### trigger-workflow
+
+**Trigger Workflow**
+
+Manually trigger a workflow execution, optionally passing trigger data as context.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Workflow ID to trigger |
+
+### list-workflow-runs
+
+**List Workflow Runs**
+
+List all execution runs for a given workflow.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `workflowId` | `string` | Yes | - | Workflow ID to list runs for |
+
+### get-workflow-run
+
+**Get Workflow Run**
+
+Get details of a workflow run by ID, including all steps and their statuses.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Workflow run ID |
+
+### retry-workflow-run
+
+**Retry Workflow Run**
+
+Retry a failed workflow run from the beginning. The run must be in 'failed' status.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `runId` | `string` | Yes | - | Workflow run ID to retry |
+
+## Other Tools
+
+*Tools not assigned to a capability group*
+
+### register-agentmail-inbox
+
+**Register AgentMail Inbox**
+
+Register an AgentMail inbox ID to route incoming emails to this agent. When emails arrive at this inbox, they will be routed to you as tasks (for workers) or inbox messages (for leads). Use action 'register' to add a mapping, 'unregister' to remove one, or 'list' to see your current mappings.
+
+*No parameters*
 

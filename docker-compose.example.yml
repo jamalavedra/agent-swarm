@@ -7,10 +7,19 @@
 #  - Sets up an API service and multiple worker/lead agents
 #  - Deploys 2 worker agents and 1 lead agent by default
 #  - Uses volumes for persistent storage of logs, db and agent workspaces
+#
+# Port mapping:
+#  Each service uses its own host port variable (LEAD_PORT, WORKER1_PORT, etc.)
+#  to avoid conflicts when multiple services share the same host network.
+#  The variable names and defaults below are examples — adjust them to fit your
+#  setup, especially if you add more workers.
+#  In isolated environments where each container has its own network namespace,
+#  you may map all services to the same port (e.g. 3000:3000).
 
 services:
   api:
     image: "ghcr.io/desplega-ai/agent-swarm:latest"
+    platform: linux/amd64
     pull_policy: always
     stop_grace_period: 60s
 
@@ -49,6 +58,7 @@ services:
 
   lead:
     image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+    platform: linux/amd64
     pull_policy: always
     stop_grace_period: 60s
 
@@ -64,6 +74,8 @@ services:
 
       # Important: Lead agent role
       - AGENT_ROLE=lead
+      # Template for initial profile (fetched on first boot)
+      - TEMPLATE_ID=official/lead
 
       # - MCP_BASE_URL=${MCP_BASE_URL:-http://api:3013}
       # If in the same Docker network, use the service name
@@ -76,7 +88,7 @@ services:
       - SWARM_URL=${SWARM_URL:-localhost}
 
     ports:
-      - "${SERVICE_PORT:-3020}:3000"
+      - "${LEAD_PORT:-3020}:3000"
 
     volumes:
       - swarm_logs:/logs
@@ -87,6 +99,7 @@ services:
 
   worker-1:
     image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+    platform: linux/amd64
     pull_policy: always
     stop_grace_period: 60s
 
@@ -100,6 +113,8 @@ services:
       # Replace by a valid UUID - IMPORTANT: Keep stable for task resume after restarts
       - AGENT_ID=38d36438-58a0-45b5-8602-a5d52b07c2f1
       - AGENT_ROLE=worker
+      # Template for initial profile (fetched on first boot)
+      - TEMPLATE_ID=official/coder
 
       # - MCP_BASE_URL=${MCP_BASE_URL:-http://api:3013}
       # If in the same Docker network, use the service name
@@ -112,7 +127,7 @@ services:
       - SWARM_URL=${SWARM_URL:-localhost}
 
     ports:
-      - "${SERVICE_PORT:-3021}:3000"
+      - "${WORKER1_PORT:-3021}:3000"
 
     volumes:
       - swarm_logs:/logs
@@ -123,6 +138,7 @@ services:
 
   worker-2:
     image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+    platform: linux/amd64
     pull_policy: always
     stop_grace_period: 60s
 
@@ -136,6 +152,8 @@ services:
       # Replace by a valid UUID - IMPORTANT: Keep stable for task resume after restarts
       - AGENT_ID=c1e2f3a4-5678-90ab-cdef-1234567890ab
       - AGENT_ROLE=worker
+      # Template for initial profile (fetched on first boot)
+      - TEMPLATE_ID=official/coder
 
       # - MCP_BASE_URL=${MCP_BASE_URL:-http://api:3013}
       # If in the same Docker network, use the service name
@@ -148,7 +166,7 @@ services:
       - SWARM_URL=${SWARM_URL:-localhost}
 
     ports:
-      - "${SERVICE_PORT:-3022}:3000"
+      - "${WORKER2_PORT:-3022}:3000"
 
     volumes:
       - swarm_logs:/logs
@@ -157,6 +175,173 @@ services:
 
     restart: unless-stopped
 
+  worker-content-writer:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+    platform: linux/amd64
+    pull_policy: always
+    stop_grace_period: 60s
+
+    depends_on:
+      api:
+        condition: service_healthy
+
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - API_KEY=${API_KEY}
+      # Replace by a valid UUID - IMPORTANT: Keep stable for task resume after restarts
+      - AGENT_ID=322999d8-a1d0-4ae1-a6a0-5ba292d85720
+      - AGENT_ROLE=worker
+      # Template for initial profile (fetched on first boot)
+      - TEMPLATE_ID=official/content-writer
+      - MODEL_OVERRIDE=opus
+      - CAPABILITIES=core,task-pool,messaging,profiles,services,scheduling,epics,memory,content-writing
+
+      # If in the same Docker network, use the service name
+      - MCP_BASE_URL=http://api:3013
+
+      - YOLO=true
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-}
+      - GITHUB_NAME=${GITHUB_NAME:-}
+      - SWARM_URL=${SWARM_URL:-localhost}
+
+    ports:
+      - "${CONTENT_WRITER_PORT:-3026}:3000"
+
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_content_writer:/workspace/personal
+
+    restart: unless-stopped
+
+  worker-content-reviewer:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+    platform: linux/amd64
+    pull_policy: always
+    stop_grace_period: 60s
+
+    depends_on:
+      api:
+        condition: service_healthy
+
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - API_KEY=${API_KEY}
+      # Replace by a valid UUID - IMPORTANT: Keep stable for task resume after restarts
+      - AGENT_ID=fc637423-24db-418a-ad03-a64e17c7b10a
+      - AGENT_ROLE=worker
+      # Template for initial profile (fetched on first boot)
+      - TEMPLATE_ID=official/content-reviewer
+      - MODEL_OVERRIDE=sonnet
+      - CAPABILITIES=core,task-pool,messaging,profiles,services,scheduling,epics,memory,content-review
+      # Content reviewer uses Gemini via OpenRouter
+      - HARNESS_PROVIDER=pi
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+
+      # If in the same Docker network, use the service name
+      - MCP_BASE_URL=http://api:3013
+
+      - YOLO=true
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-}
+      - GITHUB_NAME=${GITHUB_NAME:-}
+      - SWARM_URL=${SWARM_URL:-localhost}
+
+    ports:
+      - "${CONTENT_REVIEWER_PORT:-3027}:3000"
+
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_content_reviewer:/workspace/personal
+
+    restart: unless-stopped
+
+  worker-content-strategist:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+    platform: linux/amd64
+    pull_policy: always
+    stop_grace_period: 60s
+
+    depends_on:
+      api:
+        condition: service_healthy
+
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - API_KEY=${API_KEY}
+      # Replace by a valid UUID - IMPORTANT: Keep stable for task resume after restarts
+      - AGENT_ID=7f95f57e-fff6-42fd-8e5b-cc345feab985
+      - AGENT_ROLE=worker
+      # Template for initial profile (fetched on first boot)
+      - TEMPLATE_ID=official/content-strategist
+      - MODEL_OVERRIDE=sonnet
+      - CAPABILITIES=core,task-pool,messaging,profiles,services,scheduling,epics,memory,content-strategy
+
+      # If in the same Docker network, use the service name
+      - MCP_BASE_URL=http://api:3013
+
+      - YOLO=true
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-}
+      - GITHUB_NAME=${GITHUB_NAME:-}
+      - SWARM_URL=${SWARM_URL:-localhost}
+
+    ports:
+      - "${CONTENT_STRATEGIST_PORT:-3028}:3000"
+
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_content_strategist:/workspace/personal
+
+    restart: unless-stopped
+
+  # Example: Pi-mono worker (uses HARNESS_PROVIDER=pi instead of Claude)
+  # Uncomment to add a pi-mono powered worker to the swarm.
+  # Requires ANTHROPIC_API_KEY or OPENROUTER_API_KEY for authentication.
+  #
+  # pi-worker:
+  #   image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+  #   platform: linux/amd64
+  #   pull_policy: always
+  #   stop_grace_period: 60s
+  #
+  #   depends_on:
+  #     api:
+  #       condition: service_healthy
+  #
+  #   environment:
+  #     - HARNESS_PROVIDER=pi
+  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+  #     # Or use OpenRouter instead:
+  #     # - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+  #     - API_KEY=${API_KEY}
+  #     # Replace by a valid UUID - IMPORTANT: Keep stable for task resume after restarts
+  #     - AGENT_ID=b2a3c4d5-6789-01ef-abcd-234567890abc
+  #     - AGENT_ROLE=worker
+  #
+  #     - MCP_BASE_URL=http://api:3013
+  #
+  #     - YOLO=true
+  #     - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+  #     - GITHUB_EMAIL=${GITHUB_EMAIL:-}
+  #     - GITHUB_NAME=${GITHUB_NAME:-}
+  #     - SWARM_URL=${SWARM_URL:-localhost}
+  #
+  #   ports:
+  #     - "${PI_WORKER_PORT:-3023}:3000"
+  #
+  #   volumes:
+  #     - swarm_logs:/logs
+  #     - swarm_shared:/workspace/shared
+  #     - swarm_pi_worker:/workspace/personal
+  #     # Persist pi-mono session files across restarts
+  #     - swarm_pi_agent:/home/worker/.pi/agent
+  #
+  #   restart: unless-stopped
+
 volumes:
   swarm_api:
   swarm_logs:
@@ -164,3 +349,9 @@ volumes:
   swarm_lead:
   swarm_worker_1:
   swarm_worker_2:
+  swarm_content_writer:
+  swarm_content_reviewer:
+  swarm_content_strategist:
+  # Uncomment if using the pi-worker service above
+  # swarm_pi_worker:
+  # swarm_pi_agent:

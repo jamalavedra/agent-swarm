@@ -11,6 +11,8 @@ export const registerUpdateProfileTool = (server: McpServer) => {
       title: "Update Profile",
       description:
         "Updates the calling agent's profile information (name, description, role, capabilities).",
+      annotations: { idempotentHint: true },
+
       inputSchema: z.object({
         name: z.string().min(1).optional().describe("Agent name."),
         description: z.string().optional().describe("Agent description."),
@@ -30,6 +32,34 @@ export const registerUpdateProfileTool = (server: McpServer) => {
           .describe(
             "Personal CLAUDE.md content. Loaded on session start and synced back on session end. Use for persistent notes and instructions.",
           ),
+        soulMd: z
+          .string()
+          .max(65536)
+          .optional()
+          .describe(
+            "Soul content: persona and behavioral directives. Updates both DB and /workspace/SOUL.md.",
+          ),
+        identityMd: z
+          .string()
+          .max(65536)
+          .optional()
+          .describe(
+            "Identity content: expertise and working style. Updates both DB and /workspace/IDENTITY.md.",
+          ),
+        setupScript: z
+          .string()
+          .max(65536)
+          .optional()
+          .describe(
+            "Setup script content (bash). Runs at container start to install tools, configure environment. Persists across sessions. Also written to /workspace/start-up.sh.",
+          ),
+        toolsMd: z
+          .string()
+          .max(65536)
+          .optional()
+          .describe(
+            "Environment-specific operational knowledge. Repos, services, SSH hosts, APIs, device names — anything specific to your setup. Synced to /workspace/TOOLS.md.",
+          ),
       }),
       outputSchema: z.object({
         yourAgentId: z.string().uuid().optional(),
@@ -38,7 +68,11 @@ export const registerUpdateProfileTool = (server: McpServer) => {
         agent: AgentSchema.optional(),
       }),
     },
-    async ({ name, description, role, capabilities, claudeMd }, requestInfo, _meta) => {
+    async (
+      { name, description, role, capabilities, claudeMd, soulMd, identityMd, setupScript, toolsMd },
+      requestInfo,
+      _meta,
+    ) => {
       if (!requestInfo.agentId) {
         return {
           content: [{ type: "text", text: 'Agent ID not found. Set the "X-Agent-ID" header.' }],
@@ -55,20 +89,24 @@ export const registerUpdateProfileTool = (server: McpServer) => {
         description === undefined &&
         role === undefined &&
         capabilities === undefined &&
-        claudeMd === undefined
+        claudeMd === undefined &&
+        soulMd === undefined &&
+        identityMd === undefined &&
+        setupScript === undefined &&
+        toolsMd === undefined
       ) {
         return {
           content: [
             {
               type: "text",
-              text: "At least one field (name, description, role, capabilities, or claudeMd) must be provided.",
+              text: "At least one field (name, description, role, capabilities, claudeMd, soulMd, identityMd, setupScript, or toolsMd) must be provided.",
             },
           ],
           structuredContent: {
             yourAgentId: requestInfo.agentId,
             success: false,
             message:
-              "At least one field (name, description, role, capabilities, or claudeMd) must be provided.",
+              "At least one field (name, description, role, capabilities, claudeMd, soulMd, identityMd, setupScript, or toolsMd) must be provided.",
           },
         };
       }
@@ -92,12 +130,53 @@ export const registerUpdateProfileTool = (server: McpServer) => {
         }
 
         // Update profile fields if provided
-        agent = updateAgentProfile(requestInfo.agentId, {
-          description,
-          role,
-          capabilities,
-          claudeMd,
-        });
+        agent = updateAgentProfile(
+          requestInfo.agentId,
+          {
+            description,
+            role,
+            capabilities,
+            claudeMd,
+            soulMd,
+            identityMd,
+            setupScript,
+            toolsMd,
+          },
+          {
+            changeSource: "self_edit",
+            changedByAgentId: requestInfo.agentId,
+          },
+        );
+
+        // Write updated files to workspace so changes are visible immediately
+        if (soulMd !== undefined) {
+          try {
+            await Bun.write("/workspace/SOUL.md", soulMd);
+          } catch {
+            /* ignore */
+          }
+        }
+        if (identityMd !== undefined) {
+          try {
+            await Bun.write("/workspace/IDENTITY.md", identityMd);
+          } catch {
+            /* ignore */
+          }
+        }
+        if (setupScript !== undefined) {
+          try {
+            await Bun.write("/workspace/start-up.sh", `#!/bin/bash\n${setupScript}\n`);
+          } catch {
+            /* ignore */
+          }
+        }
+        if (toolsMd !== undefined) {
+          try {
+            await Bun.write("/workspace/TOOLS.md", toolsMd);
+          } catch {
+            /* ignore */
+          }
+        }
 
         if (!agent) {
           return {
@@ -116,6 +195,10 @@ export const registerUpdateProfileTool = (server: McpServer) => {
         if (role !== undefined) updatedFields.push("role");
         if (capabilities !== undefined) updatedFields.push("capabilities");
         if (claudeMd !== undefined) updatedFields.push("claudeMd");
+        if (soulMd !== undefined) updatedFields.push("soulMd");
+        if (identityMd !== undefined) updatedFields.push("identityMd");
+        if (setupScript !== undefined) updatedFields.push("setupScript");
+        if (toolsMd !== undefined) updatedFields.push("toolsMd");
 
         return {
           content: [{ type: "text", text: `Updated profile: ${updatedFields.join(", ")}.` }],

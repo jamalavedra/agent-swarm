@@ -2,14 +2,21 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import {
   completeTask,
+  createMemory,
   createSessionCost,
+  createTaskExtended,
   failTask,
   getAgentById,
   getDb,
+  getEpicWithProgress,
+  getLeadAgent,
   getTaskById,
+  markEpicsProgressNotified,
   updateAgentStatusFromCapacity,
+  updateMemoryEmbedding,
   updateTaskProgress,
 } from "@/be/db";
+import { getEmbedding, serializeEmbedding } from "@/be/embedding";
 import { createToolRegistrar } from "@/tools/utils";
 import { AgentTaskSchema } from "@/types";
 
@@ -34,6 +41,8 @@ export const registerStoreProgressTool = (server: McpServer) => {
       title: "Store task progress",
       description:
         "Stores the progress of a specific task. Can also mark task as completed or failed, which will set the agent back to idle.",
+      annotations: { idempotentHint: true },
+
       inputSchema: z.object({
         taskId: z.uuid().describe("The ID of the task to update progress for."),
         progress: z.string().optional().describe("The progress update to store."),
@@ -93,11 +102,21 @@ export const registerStoreProgressTool = (server: McpServer) => {
         }
 
         let updatedTask = existingTask;
+        const isTerminal = ["completed", "failed", "cancelled"].includes(existingTask.status);
 
-        // Update progress if provided
-        if (progress) {
-          const result = updateTaskProgress(taskId, progress);
-          if (result) updatedTask = result;
+        // Update progress if provided (with deduplication)
+        // Skip for tasks already in a terminal state to prevent zombie revival
+        if (progress && !isTerminal) {
+          // Skip if same progress text was set within the last 5 minutes
+          const isDuplicate =
+            existingTask.progress === progress &&
+            existingTask.lastUpdatedAt &&
+            Date.now() - new Date(existingTask.lastUpdatedAt).getTime() < 5 * 60 * 1000;
+
+          if (!isDuplicate) {
+            const result = updateTaskProgress(taskId, progress);
+            if (result) updatedTask = result;
+          }
         }
 
         // Handle status change
@@ -154,6 +173,136 @@ export const registerStoreProgressTool = (server: McpServer) => {
       });
 
       const result = txn();
+
+      // Index completed and failed tasks as memory (async, non-blocking)
+      if ((status === "completed" || status === "failed") && result.success && result.task) {
+        (async () => {
+          try {
+            const taskContent =
+              status === "completed"
+                ? `Task: ${result.task!.task}\n\nOutput:\n${output || "(no output)"}`
+                : `Task: ${result.task!.task}\n\nFailure reason:\n${failureReason || "No reason provided"}\n\nThis task failed. Learn from this to avoid repeating the mistake.`;
+
+            // Skip indexing if there's truly no content
+            if (taskContent.length < 30) return;
+
+            const memory = createMemory({
+              agentId: requestInfo.agentId,
+              content: taskContent,
+              name: `Task: ${result.task!.task.slice(0, 80)}`,
+              scope: "agent",
+              source: "task_completion",
+              sourceTaskId: taskId,
+            });
+            const embedding = await getEmbedding(taskContent);
+            if (embedding) {
+              updateMemoryEmbedding(memory.id, serializeEmbedding(embedding));
+            }
+
+            // Auto-promote high-value completions to swarm memory (P3)
+            // Epic-linked tasks are also promoted so workers on the same epic can see each other's learnings
+            const shouldShareWithSwarm =
+              status === "completed" &&
+              (result.task!.taskType === "research" ||
+                result.task!.tags?.includes("knowledge") ||
+                result.task!.tags?.includes("shared") ||
+                result.task!.epicId != null);
+
+            if (shouldShareWithSwarm) {
+              try {
+                const swarmMemory = createMemory({
+                  agentId: requestInfo.agentId,
+                  scope: "swarm",
+                  name: `Shared: ${result.task!.task.slice(0, 80)}`,
+                  content: `Task completed by agent ${requestInfo.agentId}:\n\n${taskContent}`,
+                  source: "task_completion",
+                  sourceTaskId: taskId,
+                });
+                const swarmEmbedding = await getEmbedding(taskContent);
+                if (swarmEmbedding) {
+                  updateMemoryEmbedding(swarmMemory.id, serializeEmbedding(swarmEmbedding));
+                }
+              } catch {
+                // Non-blocking — swarm memory promotion failure is not critical
+              }
+            }
+          } catch {
+            // Non-blocking — task completion memory failure should not affect task status
+          }
+        })();
+      }
+
+      // Create follow-up task for the lead when a worker task finishes.
+      // This replaces the old poll-based tasks_finished trigger which was unreliable.
+      if (status && result.success && result.task) {
+        try {
+          const taskAgent = getAgentById(result.task.agentId ?? "");
+          // Only create follow-ups for worker tasks (not lead's own tasks)
+          if (taskAgent && !taskAgent.isLead) {
+            const leadAgent = getLeadAgent();
+            if (leadAgent) {
+              const agentName = taskAgent.name || result.task.agentId?.slice(0, 8) || "Unknown";
+              const taskDesc = result.task.task.slice(0, 200);
+
+              let followUpDescription: string;
+              if (status === "completed") {
+                const outputSummary = output ? output.slice(0, 500) : "(no output)";
+                followUpDescription = `Worker task completed — review needed.\n\nAgent: ${agentName}\nTask: "${taskDesc}"\n\nOutput:\n${outputSummary}${output && output.length > 500 ? "..." : ""}\n\nUse \`get-task-details\` with taskId "${taskId}" for full details.`;
+              } else {
+                const reason = failureReason || "(no reason given)";
+                followUpDescription = `Worker task failed — action needed.\n\nAgent: ${agentName}\nTask: "${taskDesc}"\n\nFailure reason: ${reason}\n\nDecide whether to reassign, retry, or handle the failure. Use \`get-task-details\` with taskId "${taskId}" for full details.`;
+              }
+
+              // Enrich follow-up with epic context if task belongs to an epic
+              let epicContext = "";
+              if (result.task.epicId) {
+                const epic = getEpicWithProgress(result.task.epicId);
+                if (epic) {
+                  epicContext = `\n\n## Epic Context\n`;
+                  epicContext += `**Epic:** ${epic.name}\n`;
+                  epicContext += `**Goal:** ${epic.goal}\n`;
+                  epicContext += `**Progress:** ${epic.progress}% (${epic.taskStats.completed}/${epic.taskStats.total} tasks)\n`;
+                  if (epic.plan) {
+                    epicContext += `**Plan:**\n${epic.plan.slice(0, 1000)}\n`;
+                  }
+                  if (epic.nextSteps) {
+                    epicContext += `**Next Steps:**\n${epic.nextSteps}\n`;
+                  }
+                  epicContext += `\n**Action Required:** Review the output above in the context of this epic. `;
+                  epicContext += `If the epic goal is not yet met, create the next task(s) with epicId="${result.task.epicId}". `;
+                  epicContext += `If blocked or unclear, notify the stakeholder. `;
+                  epicContext += `If the goal is met, update the epic status to completed.`;
+                }
+              }
+
+              // If the original task came from Slack, forward context so lead can reply
+              createTaskExtended(followUpDescription + epicContext, {
+                agentId: leadAgent.id,
+                source: "system",
+                taskType: "follow-up",
+                parentTaskId: taskId,
+                epicId: result.task.epicId || undefined,
+                slackChannelId: result.task.slackChannelId,
+                slackThreadTs: result.task.slackThreadTs,
+                slackUserId: result.task.slackUserId,
+              });
+
+              // Deduplicate: mark epic progress as notified so epic_progress_changed
+              // doesn't re-fire for this same task completion
+              if (result.task.epicId) {
+                markEpicsProgressNotified([result.task.epicId]);
+              }
+
+              console.log(
+                `[store-progress] Created follow-up task for lead (${leadAgent.name}) — ${status} task ${taskId.slice(0, 8)} by ${agentName}`,
+              );
+            }
+          }
+        } catch (err) {
+          // Non-blocking — follow-up task creation failure should not affect the store-progress response
+          console.warn(`[store-progress] Failed to create follow-up task: ${err}`);
+        }
+      }
 
       return {
         content: [{ type: "text", text: result.message }],

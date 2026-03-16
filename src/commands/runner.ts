@@ -1,34 +1,24 @@
-import { mkdir, unlink, writeFile } from "node:fs/promises";
-import { getBasePrompt } from "../prompts/base-prompt.ts";
+import { existsSync, statSync } from "node:fs";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import type { TemplateResponse } from "../../templates/schema.ts";
+import {
+  generateDefaultClaudeMd,
+  generateDefaultIdentityMd,
+  generateDefaultSoulMd,
+  generateDefaultToolsMd,
+} from "../be/db.ts";
+import { type BasePromptArgs, getBasePrompt } from "../prompts/base-prompt.ts";
+import {
+  type CostData,
+  createProviderAdapter,
+  type ProviderResult,
+  type ProviderSession,
+  type ProviderSessionConfig,
+} from "../providers/index.ts";
+import { resolveCredentialPools } from "../utils/credentials.ts";
 import { prettyPrintLine, prettyPrintStderr } from "../utils/pretty-print.ts";
-
-/** Task file data written to /tmp for hook to read */
-interface TaskFileData {
-  taskId: string;
-  agentId: string;
-  startedAt: string;
-}
-
-/** Get the task file path for a given PID */
-function getTaskFilePath(pid: number): string {
-  return `/tmp/agent-swarm-task-${pid}.json`;
-}
-
-/** Write task file before spawning Claude process */
-async function writeTaskFile(pid: number, data: TaskFileData): Promise<string> {
-  const filePath = getTaskFilePath(pid);
-  await writeFile(filePath, JSON.stringify(data, null, 2));
-  return filePath;
-}
-
-/** Clean up task file after process exits */
-async function cleanupTaskFile(pid: number): Promise<void> {
-  try {
-    await unlink(getTaskFilePath(pid));
-  } catch {
-    // File might already be deleted or never created - ignore
-  }
-}
+import { detectVcsProvider } from "../vcs/index.ts";
+import { interpolate } from "../workflows/template.ts";
 
 /** Save PM2 process list for persistence across container restarts */
 async function savePm2State(role: string): Promise<void> {
@@ -38,6 +28,90 @@ async function savePm2State(role: string): Promise<void> {
     console.log(`[${role}] PM2 state saved`);
   } catch {
     // PM2 not available or no processes - silently ignore
+  }
+}
+
+/** Fetch repo config for a task's vcsRepo (e.g., "desplega-ai/agent-swarm") */
+async function fetchRepoConfig(
+  apiUrl: string,
+  apiKey: string,
+  vcsRepo: string,
+): Promise<{ url: string; name: string; clonePath: string; defaultBranch: string } | null> {
+  try {
+    const repoName = vcsRepo.split("/").pop() || vcsRepo;
+    const resp = await fetch(`${apiUrl}/api/repos?name=${encodeURIComponent(repoName)}`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as {
+      repos: Array<{ url: string; name: string; clonePath: string; defaultBranch: string }>;
+    };
+    return data.repos.find((r) => r.url.includes(vcsRepo)) ?? data.repos[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read CLAUDE.md from a repo directory, returning null if not found */
+async function readClaudeMd(clonePath: string, role: string): Promise<string | null> {
+  const claudeMdFile = Bun.file(`${clonePath}/CLAUDE.md`);
+  if (await claudeMdFile.exists()) {
+    const content = await claudeMdFile.text();
+    console.log(`[${role}] Read CLAUDE.md from ${clonePath}/CLAUDE.md (${content.length} chars)`);
+    return content;
+  }
+  console.log(`[${role}] No CLAUDE.md found at ${clonePath}/CLAUDE.md`);
+  return null;
+}
+
+/**
+ * Ensure a repo is cloned and up-to-date for a task.
+ * Returns { clonePath, claudeMd, warning }.
+ */
+async function ensureRepoForTask(
+  repoConfig: { url: string; name: string; clonePath: string; defaultBranch: string },
+  role: string,
+): Promise<{ clonePath: string; claudeMd: string | null; warning: string | null }> {
+  const { url, name, clonePath, defaultBranch } = repoConfig;
+
+  try {
+    const gitHeadExists = await Bun.file(`${clonePath}/.git/HEAD`).exists();
+
+    let warning: string | null = null;
+
+    if (!gitHeadExists) {
+      console.log(`[${role}] Cloning ${name} to ${clonePath}...`);
+      const provider = detectVcsProvider(url);
+      if (provider === "github") {
+        await Bun.$`gh repo clone ${url} ${clonePath} -- --branch ${defaultBranch} --single-branch`.quiet();
+      } else if (provider === "gitlab") {
+        await Bun.$`glab repo clone ${url} ${clonePath} -- --branch ${defaultBranch} --single-branch`.quiet();
+      } else {
+        await Bun.$`git clone --branch ${defaultBranch} --single-branch ${url} ${clonePath}`.quiet();
+      }
+      console.log(`[${role}] Cloned ${name}`);
+    } else {
+      console.log(`[${role}] Repo ${name} already cloned at ${clonePath}`);
+      const statusResult = await Bun.$`cd ${clonePath} && git status --porcelain`.quiet();
+      const statusOutput = statusResult.text().trim();
+
+      if (statusOutput === "") {
+        console.log(`[${role}] Pulling ${name} (${defaultBranch})...`);
+        await Bun.$`cd ${clonePath} && git pull origin ${defaultBranch} --ff-only`.quiet();
+        console.log(`[${role}] Pulled ${name}`);
+      } else {
+        console.warn(`[${role}] Repo ${name} has uncommitted changes, skipping pull`);
+        warning = `The repo "${name}" at ${clonePath} has uncommitted changes. A git pull was skipped to avoid losing work. You may need to commit or stash changes before pulling updates.`;
+      }
+    }
+
+    const claudeMd = await readClaudeMd(clonePath, role);
+    return { clonePath, claudeMd, warning };
+  } catch (err) {
+    const errorMsg = (err as Error).message;
+    console.warn(`[${role}] Error setting up repo ${name}: ${errorMsg}`);
+    const warning = `Failed to clone/setup repo "${name}" at ${clonePath}: ${errorMsg}. The repo may not be available. You may need to clone it manually.`;
+    return { clonePath, claudeMd: null, warning };
   }
 }
 
@@ -89,6 +163,115 @@ async function closeAgent(config: ApiConfig, role: string): Promise<void> {
 }
 
 /**
+ * Fetch resolved config from the API and merge into a base env object.
+ * Falls back to baseEnv on any error (network, parse, etc).
+ * Credential env vars with comma-separated values get one randomly selected.
+ */
+async function fetchResolvedEnv(
+  apiUrl: string,
+  apiKey: string,
+  agentId: string,
+  baseEnv: Record<string, string | undefined> = process.env,
+): Promise<Record<string, string | undefined>> {
+  const env: Record<string, string | undefined> = { ...baseEnv };
+
+  if (apiUrl && agentId) {
+    try {
+      const headers: Record<string, string> = { "X-Agent-ID": agentId };
+      if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+      const url = `${apiUrl}/api/config/resolved?agentId=${encodeURIComponent(agentId)}&includeSecrets=true`;
+      const response = await fetch(url, { headers });
+
+      if (!response.ok) {
+        console.warn(`[env-reload] Failed to fetch config: ${response.status}`);
+      } else {
+        const data = (await response.json()) as {
+          configs: Array<{ key: string; value: string }>;
+        };
+
+        if (data.configs?.length) {
+          for (const config of data.configs) {
+            env[config.key] = config.value;
+          }
+          console.log(`[env-reload] Loaded ${data.configs.length} config entries from API`);
+        }
+      }
+    } catch (error) {
+      console.warn(`[env-reload] Could not fetch config, using current env: ${error}`);
+    }
+  }
+
+  resolveCredentialPools(env);
+  return env;
+}
+
+/**
+ * Convert a tool call into a human-readable progress description.
+ */
+function toolCallToProgress(toolName: string, args: unknown): string {
+  const a = args as Record<string, unknown>;
+  const shortPath = (p: unknown) => {
+    if (typeof p !== "string") return "";
+    // Show last 2 path segments for readability
+    const parts = p.split("/");
+    return parts.length > 2 ? parts.slice(-2).join("/") : p;
+  };
+
+  switch (toolName) {
+    case "Read":
+      return `Reading ${shortPath(a.file_path)}`;
+    case "Edit":
+    case "MultiEdit":
+      return `Editing ${shortPath(a.file_path)}`;
+    case "Write":
+      return `Writing ${shortPath(a.file_path)}`;
+    case "Bash":
+      return a.description ? `${a.description}` : "Running shell command";
+    case "Grep":
+      return `Searching for "${a.pattern}"`;
+    case "Glob":
+      return `Finding files matching ${a.pattern}`;
+    case "Agent":
+    case "Task":
+      return a.description ? `${a.description}` : "Delegating sub-task";
+    case "Skill":
+      return `Running /${a.skill}`;
+    default: {
+      // MCP tools: mcp__server__tool → "server:tool"
+      if (toolName.startsWith("mcp__")) {
+        const parts = toolName.split("__");
+        return parts.length >= 3 ? `Using ${parts[1]}:${parts[2]}` : `Using ${toolName}`;
+      }
+      return `Using ${toolName}`;
+    }
+  }
+}
+
+/**
+ * Report task progress via the API (fire-and-forget).
+ */
+async function updateProgressViaAPI(
+  apiUrl: string,
+  apiKey: string,
+  taskId: string,
+  progress: string,
+): Promise<void> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  try {
+    await fetch(`${apiUrl}/api/tasks/${taskId}/progress`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ progress }),
+    });
+  } catch {
+    // Non-blocking — progress update failure is not critical
+  }
+}
+
+/**
  * Ensure task is marked as completed or failed via the API.
  * This is called when a Claude process exits to ensure task status is updated,
  * regardless of whether the agent explicitly called store-progress.
@@ -101,6 +284,7 @@ async function ensureTaskFinished(
   role: string,
   taskId: string,
   exitCode: number,
+  failureReason?: string,
 ): Promise<void> {
   const headers: Record<string, string> = {
     "X-Agent-ID": config.agentId,
@@ -116,7 +300,7 @@ async function ensureTaskFinished(
   const body: Record<string, string> = { status };
 
   if (status === "failed") {
-    body.failureReason = `Claude process exited with code ${exitCode}`;
+    body.failureReason = failureReason || `Claude process exited with code ${exitCode}`;
   } else {
     body.output =
       "Process completed (runner wrapper fallback - agent may have provided explicit output)";
@@ -143,6 +327,8 @@ async function ensureTaskFinished(
           `[${role}] Runner marked task ${taskId.slice(0, 8)} as ${status} (exit code: ${exitCode})`,
         );
       }
+    } else if (response.status === 404) {
+      console.log(`[${role}] Task ${taskId.slice(0, 8)} already finalized (not found), skipping`);
     } else {
       const error = await response.text();
       console.warn(
@@ -190,9 +376,20 @@ async function pauseTaskViaAPI(config: ApiConfig, role: string, taskId: string):
 }
 
 /** Fetch paused tasks from API for this agent */
-async function getPausedTasksFromAPI(
-  config: ApiConfig,
-): Promise<Array<{ id: string; task: string; progress?: string }>> {
+async function getPausedTasksFromAPI(config: ApiConfig): Promise<
+  Array<{
+    id: string;
+    task: string;
+    progress?: string;
+    claudeSessionId?: string;
+    parentTaskId?: string;
+    dir?: string;
+    vcsRepo?: string;
+    finishedAt?: string;
+    output?: string;
+    status?: string;
+  }>
+> {
   const headers: Record<string, string> = {
     "X-Agent-ID": config.agentId,
   };
@@ -212,7 +409,18 @@ async function getPausedTasksFromAPI(
     }
 
     const data = (await response.json()) as {
-      tasks: Array<{ id: string; task: string; progress?: string }>;
+      tasks: Array<{
+        id: string;
+        task: string;
+        progress?: string;
+        claudeSessionId?: string;
+        parentTaskId?: string;
+        dir?: string;
+        vcsRepo?: string;
+        finishedAt?: string;
+        output?: string;
+        status?: string;
+      }>;
     };
     return data.tasks || [];
   } catch (error) {
@@ -303,7 +511,7 @@ function setupShutdownHandlers(
         );
         for (const [taskId, task] of state.activeTasks) {
           console.log(`[${role}] Pausing task ${taskId.slice(0, 8)}`);
-          task.process.kill("SIGTERM");
+          task.session.abort().catch(() => {});
           // Mark as paused for graceful resume (instead of failed)
           if (apiConfig) {
             const paused = await pauseTaskViaAPI(apiConfig, role, taskId);
@@ -352,28 +560,17 @@ export interface RunnerOptions {
   aiLoop?: boolean; // Use AI-based loop (old behavior)
 }
 
-interface RunClaudeIterationOptions {
-  prompt: string;
-  logFile: string;
-  systemPrompt?: string;
-  additionalArgs?: string[];
-  role: string;
-  // New fields for log streaming
-  apiUrl?: string;
-  apiKey?: string;
-  agentId?: string;
-  sessionId?: string;
-  iteration?: number;
-  taskId?: string;
-}
-
 /** Running task state for parallel execution */
 interface RunningTask {
   taskId: string;
-  process: ReturnType<typeof Bun.spawn>;
+  session: ProviderSession;
   logFile: string;
   startTime: Date;
-  promise: Promise<number>;
+  promise: Promise<ProviderResult>;
+  /** The trigger type that caused this task to be spawned */
+  triggerType?: string;
+  /** Set when the promise resolves, enabling non-blocking completion checks */
+  result: ProviderResult | null;
 }
 
 /** Runner state for tracking concurrent tasks */
@@ -408,6 +605,12 @@ async function flushLogBuffer(
 ): Promise<void> {
   if (buffer.lines.length === 0) return;
 
+  // Snapshot and clear buffer immediately to prevent duplicate flushes
+  // (fire-and-forget callers would otherwise race on the same buffer)
+  const lines = buffer.lines;
+  buffer.lines = [];
+  buffer.lastFlush = Date.now();
+
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Agent-ID": opts.agentId,
@@ -425,7 +628,7 @@ async function flushLogBuffer(
         iteration: opts.iteration,
         taskId: opts.taskId,
         cli: opts.cli || "claude",
-        lines: buffer.lines,
+        lines,
       }),
     });
 
@@ -435,26 +638,6 @@ async function flushLogBuffer(
   } catch (error) {
     console.warn(`[runner] Error pushing logs: ${error}`);
   }
-
-  // Clear buffer after flush
-  buffer.lines = [];
-  buffer.lastFlush = Date.now();
-}
-
-/** Data for session cost tracking */
-interface CostData {
-  sessionId: string;
-  taskId?: string;
-  agentId: string;
-  totalCostUsd: number;
-  inputTokens?: number;
-  outputTokens?: number;
-  cacheReadTokens?: number;
-  cacheWriteTokens?: number;
-  durationMs: number;
-  numTurns: number;
-  model: string;
-  isError: boolean;
 }
 
 /** Save session cost data to the API */
@@ -482,6 +665,102 @@ async function saveCostData(cost: CostData, apiUrl: string, apiKey: string): Pro
   }
 }
 
+/** Save Claude session ID for a task (fire-and-forget) */
+async function saveProviderSessionId(
+  apiUrl: string,
+  apiKey: string,
+  taskId: string,
+  claudeSessionId: string,
+): Promise<void> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  await fetch(`${apiUrl}/api/tasks/${taskId}/claude-session`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({ claudeSessionId }),
+  });
+}
+
+/** Fetch Claude session ID for a task (for --resume) */
+async function fetchProviderSessionId(
+  apiUrl: string,
+  apiKey: string,
+  taskId: string,
+): Promise<string | null> {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  try {
+    const response = await fetch(`${apiUrl}/api/tasks/${taskId}`, { headers });
+    if (!response.ok) return null;
+    const data = (await response.json()) as { claudeSessionId?: string };
+    return data.claudeSessionId || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Register an active session with the API (fire-and-forget) */
+async function registerActiveSession(
+  config: ApiConfig,
+  session: {
+    taskId: string;
+    triggerType: string;
+    taskDescription?: string;
+  },
+): Promise<void> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-Agent-ID": config.agentId,
+  };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  try {
+    await fetch(`${config.apiUrl}/api/active-sessions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        agentId: config.agentId,
+        taskId: session.taskId,
+        triggerType: session.triggerType,
+        taskDescription: session.taskDescription,
+      }),
+    });
+  } catch {
+    // Non-blocking — session tracking is best-effort
+  }
+}
+
+/** Remove an active session by taskId (fire-and-forget) */
+async function removeActiveSession(config: ApiConfig, taskId: string): Promise<void> {
+  const headers: Record<string, string> = { "X-Agent-ID": config.agentId };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  try {
+    await fetch(`${config.apiUrl}/api/active-sessions/by-task/${taskId}`, {
+      method: "DELETE",
+      headers,
+    });
+  } catch {
+    // Non-blocking
+  }
+}
+
+/** Clean up all active sessions for this agent (on startup) */
+async function cleanupActiveSessions(config: ApiConfig): Promise<void> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-Agent-ID": config.agentId,
+  };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  try {
+    await fetch(`${config.apiUrl}/api/active-sessions/cleanup`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ agentId: config.agentId }),
+    });
+  } catch {
+    // Non-blocking
+  }
+}
+
 /** Trigger types returned by the poll API */
 interface Trigger {
   type:
@@ -489,8 +768,6 @@ interface Trigger {
     | "task_offered"
     | "unread_mentions"
     | "pool_tasks_available"
-    | "tasks_finished"
-    | "slack_inbox_message"
     | "epic_progress_changed";
   taskId?: string;
   task?: unknown;
@@ -529,6 +806,7 @@ async function registerAgent(opts: {
   agentId: string;
   name: string;
   isLead: boolean;
+  role?: string;
   capabilities?: string[];
   maxTasks?: number;
 }): Promise<void> {
@@ -546,6 +824,7 @@ async function registerAgent(opts: {
     body: JSON.stringify({
       name: opts.name,
       isLead: opts.isLead,
+      role: opts.role,
       capabilities: opts.capabilities,
       maxTasks: opts.maxTasks,
     }),
@@ -649,49 +928,6 @@ function buildPromptForTrigger(trigger: Trigger, defaultPrompt: string): string 
 
 Note: Claims are first-come-first-serve. If claim fails, pick another.`;
 
-    case "tasks_finished": {
-      // Lead: notification about finished tasks with inline details
-      if (trigger.tasks && Array.isArray(trigger.tasks) && trigger.tasks.length > 0) {
-        const completed = trigger.tasks.filter((t) => t.status === "completed");
-        const failed = trigger.tasks.filter((t) => t.status === "failed");
-
-        let prompt = `${trigger.count} task(s) finished:\n`;
-
-        if (completed.length > 0) {
-          prompt += "\n### Completed:\n";
-          for (const t of completed) {
-            const agentName = t.agentId ? `Agent ${t.agentId.slice(0, 8)}` : "Unknown";
-            const output = t.output ? t.output.slice(0, 200) : "(no output)";
-            const hasSlack = t.slackChannelId ? " [Slack - user expects reply]" : "";
-            prompt += `- **Task ${t.id.slice(0, 8)}** by ${agentName}${hasSlack}\n`;
-            prompt += `  Description: "${t.task?.slice(0, 100)}"\n`;
-            prompt += `  Output: ${output}${t.output && t.output.length > 200 ? "..." : ""}\n`;
-          }
-        }
-
-        if (failed.length > 0) {
-          prompt += "\n### Failed:\n";
-          for (const t of failed) {
-            const agentName = t.agentId ? `Agent ${t.agentId.slice(0, 8)}` : "Unknown";
-            const reason = t.failureReason || "(no reason given)";
-            const hasSlack = t.slackChannelId ? " [Slack - user expects reply]" : "";
-            prompt += `- **Task ${t.id.slice(0, 8)}** by ${agentName}${hasSlack}\n`;
-            prompt += `  Description: "${t.task?.slice(0, 100)}"\n`;
-            prompt += `  Reason: ${reason}\n`;
-          }
-        }
-
-        prompt += `\nFor each task:
-1. Completed: Verify output meets requirements
-2. Failed: Reassign to another worker, or handle the issue
-3. If Slack context: Use \`slack-reply\` with taskId to update the user`;
-
-        return prompt;
-      }
-
-      return `Workers have finished ${trigger.count} task(s). Use \`get-tasks\` with status: "completed" or "failed" to review them.`;
-    }
-
     case "epic_progress_changed": {
       // Lead: Epic progress updated - tasks completed or failed for an active epic
       // This is similar to ralph loop - keep the epic progressing until done
@@ -700,6 +936,9 @@ Note: Claims are first-come-first-serve. If claim fails, pick another.`;
           id: string;
           name: string;
           goal: string;
+          plan?: string;
+          prd?: string;
+          nextSteps?: string;
           status: string;
           progress: number;
           taskStats: {
@@ -731,6 +970,13 @@ Note: Claims are first-come-first-serve. If claim fails, pick another.`;
         prompt += `**Goal:** ${epic.goal}\n`;
         prompt += `**Progress:** ${epic.progress}% complete (${epic.taskStats.completed}/${epic.taskStats.total} tasks)\n`;
         prompt += `**Status:** ${epic.status}\n\n`;
+
+        if (epic.plan) {
+          prompt += `**Plan:**\n${epic.plan.slice(0, 2000)}\n\n`;
+        }
+        if (epic.prd) {
+          prompt += `**PRD:**\n${epic.prd.slice(0, 1000)}\n\n`;
+        }
 
         // Show finished tasks
         const completed = finishedTasks.filter((t) => t.status === "completed");
@@ -781,424 +1027,231 @@ The epic should keep progressing until 100% complete and the goal is achieved.`;
       return prompt;
     }
 
-    case "slack_inbox_message": {
-      // Lead: Slack inbox messages from users
-      const inboxDetails = (trigger.messages || [])
-        .map((m: { id: string; content: string }, index: number) => {
-          // Parse structured content if present
-          const newMessageMatch = m.content.match(/<new_message>\n([\s\S]*?)\n<\/new_message>/);
-          const threadHistoryMatch = m.content.match(
-            /<thread_history>\n([\s\S]*?)\n<\/thread_history>/,
-          );
-
-          const newMessage = newMessageMatch ? newMessageMatch[1] : m.content;
-          const threadHistory = threadHistoryMatch ? threadHistoryMatch[1] : null;
-
-          let formatted = `### Message ${index + 1} (inboxMessageId: ${m.id})\n`;
-          formatted += `**New Message:**\n${newMessage}\n`;
-
-          if (threadHistory) {
-            formatted += `\n**Thread History:**\n${threadHistory}\n`;
-          }
-
-          return formatted;
-        })
-        .join("\n---\n\n");
-
-      return `${trigger.count} Slack inbox message(s):\n\n${inboxDetails}\n\nFor each message, choose one:
-- **Reply directly**: Use \`slack-reply\` with inboxMessageId if you can answer immediately
-- **Delegate to worker**: Use \`inbox-delegate\` with inboxMessageId and agentId if it requires work
-
-Do not leave messages unanswered.`;
-    }
-
     default:
       return defaultPrompt;
   }
 }
 
-async function runClaudeIteration(opts: RunClaudeIterationOptions): Promise<number> {
-  const { role } = opts;
-  const Cmd = [
-    "claude",
-    "--model",
-    "opus",
-    "--verbose",
-    "--output-format",
-    "stream-json",
-    "--dangerously-skip-permissions",
-    "--allow-dangerously-skip-permissions",
-    "--permission-mode",
-    "bypassPermissions",
-    "-p",
-    opts.prompt,
-  ];
+/** Search agent memories relevant to a task description via the API */
+async function fetchRelevantMemories(
+  apiUrl: string,
+  apiKey: string,
+  agentId: string,
+  taskDescription: string,
+): Promise<string | null> {
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-Agent-ID": agentId,
+    };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-  if (opts.additionalArgs && opts.additionalArgs.length > 0) {
-    Cmd.push(...opts.additionalArgs);
+    const response = await fetch(`${apiUrl}/api/memory/search`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ query: taskDescription, limit: 5 }),
+    });
+
+    if (!response.ok) return null;
+
+    const data = (await response.json()) as {
+      results: Array<{ id: string; name: string; content: string; similarity: number }>;
+    };
+
+    const useful = (data.results || []).filter((m) => m.similarity > 0.4);
+    if (useful.length === 0) return null;
+
+    const memoryContext = useful
+      .map((m) => `- **${m.name}** (id: ${m.id}): ${m.content.substring(0, 300)}`)
+      .join("\n");
+
+    return `\n\n### Relevant Past Knowledge\n\nThese memories from your previous sessions may be useful. Use \`memory-get\` with the memory ID to retrieve full details.\n\n${memoryContext}\n`;
+  } catch {
+    // Non-blocking — don't fail task start because of memory search
+    return null;
   }
-
-  if (opts.systemPrompt) {
-    Cmd.push("--append-system-prompt", opts.systemPrompt);
-  }
-
-  console.log(`\x1b[2m[${role}]\x1b[0m \x1b[36m▸\x1b[0m Starting Claude (PID will follow)`);
-
-  const logFileHandle = Bun.file(opts.logFile).writer();
-  let stderrOutput = "";
-
-  const proc = Bun.spawn(Cmd, {
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-
-  let stdoutChunks = 0;
-  let stderrChunks = 0;
-
-  const stdoutPromise = (async () => {
-    if (proc.stdout) {
-      // Initialize log buffer for API streaming
-      const logBuffer: LogBuffer = { lines: [], lastFlush: Date.now(), partialLine: "" };
-      const shouldStream = opts.apiUrl && opts.sessionId && opts.iteration;
-
-      for await (const chunk of proc.stdout) {
-        stdoutChunks++;
-        const text = new TextDecoder().decode(chunk);
-        logFileHandle.write(text);
-
-        // Prepend any partial line from previous chunk
-        const combined = logBuffer.partialLine + text;
-        const parts = combined.split("\n");
-
-        // Last element may be incomplete - save for next chunk
-        logBuffer.partialLine = parts.pop() || "";
-
-        // Process only complete lines (those that ended with \n)
-        for (const line of parts) {
-          prettyPrintLine(line, role);
-
-          // Buffer non-empty lines for API streaming
-          if (shouldStream && line.trim()) {
-            logBuffer.lines.push(line.trim());
-
-            // Check if we should flush (buffer full or time elapsed)
-            const shouldFlush =
-              logBuffer.lines.length >= LOG_BUFFER_SIZE ||
-              Date.now() - logBuffer.lastFlush >= LOG_FLUSH_INTERVAL_MS;
-
-            if (shouldFlush) {
-              await flushLogBuffer(logBuffer, {
-                apiUrl: opts.apiUrl!,
-                apiKey: opts.apiKey || "",
-                agentId: opts.agentId || "",
-                sessionId: opts.sessionId!,
-                iteration: opts.iteration!,
-                taskId: opts.taskId,
-                cli: "claude",
-              });
-            }
-          }
-        }
-      }
-
-      // Handle any remaining partial line at stream end
-      if (logBuffer.partialLine.trim()) {
-        prettyPrintLine(logBuffer.partialLine, role);
-        if (shouldStream) {
-          logBuffer.lines.push(logBuffer.partialLine.trim());
-        }
-        logBuffer.partialLine = "";
-      }
-
-      // Final flush for remaining buffered logs
-      if (shouldStream && logBuffer.lines.length > 0) {
-        await flushLogBuffer(logBuffer, {
-          apiUrl: opts.apiUrl!,
-          apiKey: opts.apiKey || "",
-          agentId: opts.agentId || "",
-          sessionId: opts.sessionId!,
-          iteration: opts.iteration!,
-          taskId: opts.taskId,
-          cli: "claude",
-        });
-      }
-    }
-  })();
-
-  const stderrPromise = (async () => {
-    if (proc.stderr) {
-      for await (const chunk of proc.stderr) {
-        stderrChunks++;
-        const text = new TextDecoder().decode(chunk);
-        stderrOutput += text;
-        prettyPrintStderr(text, role);
-        logFileHandle.write(
-          `${JSON.stringify({ type: "stderr", content: text, timestamp: new Date().toISOString() })}\n`,
-        );
-      }
-    }
-  })();
-
-  await Promise.all([stdoutPromise, stderrPromise]);
-  await logFileHandle.end();
-  const exitCode = await proc.exited;
-
-  if (exitCode !== 0 && stderrOutput) {
-    console.error(`\x1b[31m[${role}] Full stderr:\x1b[0m\n${stderrOutput}`);
-  }
-
-  if (stdoutChunks === 0 && stderrChunks === 0) {
-    console.warn(`\x1b[33m[${role}] WARNING: No output from Claude - check auth/startup\x1b[0m`);
-  }
-
-  return exitCode ?? 1;
 }
 
-/** Spawn a Claude process without blocking - returns immediately with tracking info */
-async function spawnClaudeProcess(
-  opts: RunClaudeIterationOptions,
+async function fetchEpicNameAndGoal(
+  apiUrl: string,
+  apiKey: string,
+  epicId: string,
+): Promise<{ name: string; goal: string } | null> {
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+    const response = await fetch(`${apiUrl}/api/epics/${epicId}`, { headers });
+    if (!response.ok) return null;
+
+    const data = (await response.json()) as { name: string; goal: string };
+    return { name: data.name, goal: data.goal };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchEpicTaskContext(
+  apiUrl: string,
+  apiKey: string,
+  epicId: string,
+  currentTaskId: string,
+): Promise<string | null> {
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+    const response = await fetch(`${apiUrl}/api/tasks?epicId=${epicId}&status=completed&limit=5`, {
+      headers,
+    });
+    if (!response.ok) return null;
+
+    const data = (await response.json()) as {
+      tasks: Array<{ id: string; task: string; output?: string }>;
+    };
+    const tasks = data.tasks || [];
+
+    const relevant = tasks.filter((t) => t.id !== currentTaskId);
+    if (relevant.length === 0) return null;
+
+    let context = "\n\n### Recent Epic Task Completions\n\n";
+    context += "These tasks were recently completed in the same epic:\n\n";
+    for (const t of relevant.slice(0, 5)) {
+      context += `- **${t.task.slice(0, 100)}**: ${(t.output || "no output").slice(0, 200)}\n`;
+    }
+    return context;
+  } catch {
+    return null;
+  }
+}
+
+/** Spawn a provider session without blocking - returns immediately with tracking info */
+async function spawnProviderProcess(
+  adapter: ReturnType<typeof createProviderAdapter>,
+  opts: {
+    prompt: string;
+    logFile: string;
+    systemPrompt?: string;
+    additionalArgs?: string[];
+    role: string;
+    apiUrl: string;
+    apiKey: string;
+    agentId: string;
+    runnerSessionId: string;
+    iteration: number;
+    taskId?: string;
+    model?: string;
+    cwd?: string;
+  },
   logDir: string,
-  _metadataType: string,
-  _sessionId: string,
   isYolo: boolean,
 ): Promise<RunningTask> {
-  const { role, taskId } = opts;
-  const Cmd = [
-    "claude",
-    "--model",
-    "opus",
-    "--verbose",
-    "--output-format",
-    "stream-json",
-    "--dangerously-skip-permissions",
-    "--allow-dangerously-skip-permissions",
-    "--permission-mode",
-    "bypassPermissions",
-    "-p",
-    opts.prompt,
-  ];
+  // Real task ID from DB (may be undefined for pool_tasks_available triggers)
+  const realTaskId = opts.taskId;
+  // Correlation ID for logs/display — always defined
+  const effectiveTaskId = realTaskId || crypto.randomUUID();
 
-  if (opts.additionalArgs && opts.additionalArgs.length > 0) {
-    Cmd.push(...opts.additionalArgs);
-  }
+  // Resolve env first so we can use MODEL_OVERRIDE from config
+  const freshEnv = await fetchResolvedEnv(opts.apiUrl, opts.apiKey, opts.agentId);
+  const model = opts.model || (freshEnv.MODEL_OVERRIDE as string) || "";
 
-  if (opts.systemPrompt) {
-    Cmd.push("--append-system-prompt", opts.systemPrompt);
-  }
-
-  const effectiveTaskId = taskId || crypto.randomUUID();
-
-  console.log(
-    `\x1b[2m[${role}]\x1b[0m \x1b[36m▸\x1b[0m Spawning Claude for task ${effectiveTaskId.slice(0, 8)}`,
-  );
-
-  const logFileHandle = Bun.file(opts.logFile).writer();
-
-  // Write task file before spawning so hook can read the current taskId
-  // We use the parent process PID since we need to write before spawn
-  const taskFilePid = process.pid;
-  const taskFilePath = await writeTaskFile(taskFilePid, {
+  const config: ProviderSessionConfig = {
+    prompt: opts.prompt,
+    systemPrompt: opts.systemPrompt || "",
+    model,
+    role: opts.role,
+    agentId: opts.agentId,
     taskId: effectiveTaskId,
-    agentId: opts.agentId || "",
-    startedAt: new Date().toISOString(),
-  });
+    apiUrl: opts.apiUrl,
+    apiKey: opts.apiKey,
+    cwd: opts.cwd || process.cwd(),
+    logFile: opts.logFile,
+    additionalArgs: opts.additionalArgs,
+    iteration: opts.iteration,
+    env: freshEnv as Record<string, string>,
+  };
 
-  console.log(`\x1b[2m[${role}]\x1b[0m Task file written: ${taskFilePath}`);
+  const session = await adapter.createSession(config);
 
-  const proc = Bun.spawn(Cmd, {
-    env: {
-      ...process.env,
-      TASK_FILE: taskFilePath,
-    },
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  // Set up log streaming
+  const logBuffer: LogBuffer = { lines: [], lastFlush: Date.now(), partialLine: "" };
+  const shouldStream = opts.apiUrl && opts.runnerSessionId && opts.iteration;
 
-  // Create promise that resolves when process completes
-  const promise = (async () => {
-    let stderrOutput = "";
-    let stdoutChunks = 0;
-    let stderrChunks = 0;
+  // Auto-progress throttle: don't update more than once per 3 seconds
+  let lastProgressTime = 0;
+  const PROGRESS_THROTTLE_MS = 3000;
 
-    // Initialize log buffer for API streaming
-    const logBuffer: LogBuffer = { lines: [], lastFlush: Date.now(), partialLine: "" };
-    const shouldStream = opts.apiUrl && opts.sessionId && opts.iteration;
-
-    const stdoutPromise = (async () => {
-      if (proc.stdout) {
-        for await (const chunk of proc.stdout) {
-          stdoutChunks++;
-          const text = new TextDecoder().decode(chunk);
-          logFileHandle.write(text);
-
-          // Prepend any partial line from previous chunk
-          const combined = logBuffer.partialLine + text;
-          const parts = combined.split("\n");
-
-          // Last element may be incomplete - save for next chunk
-          logBuffer.partialLine = parts.pop() || "";
-
-          // Process only complete lines (those that ended with \n)
-          for (const line of parts) {
-            prettyPrintLine(line, role);
-
-            // Extract cost data from result messages
-            if (shouldStream && line.trim()) {
-              try {
-                const json = JSON.parse(line.trim());
-                if (json.type === "result" && json.total_cost_usd !== undefined) {
-                  // Extract token data from the usage object
-                  // Claude's result JSON has: usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens
-                  const usage = json.usage as
-                    | {
-                        input_tokens?: number;
-                        output_tokens?: number;
-                        cache_read_input_tokens?: number;
-                        cache_creation_input_tokens?: number;
-                      }
-                    | undefined;
-
-                  // Fire and forget - don't block the stream
-                  saveCostData(
-                    {
-                      sessionId: opts.sessionId!,
-                      taskId: opts.taskId,
-                      agentId: opts.agentId || "",
-                      totalCostUsd: json.total_cost_usd || 0,
-                      inputTokens: usage?.input_tokens ?? 0,
-                      outputTokens: usage?.output_tokens ?? 0,
-                      cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
-                      cacheWriteTokens: usage?.cache_creation_input_tokens ?? 0,
-                      durationMs: json.duration_ms || 0,
-                      numTurns: json.num_turns || 1,
-                      model: "opus",
-                      isError: json.is_error || false,
-                    },
-                    opts.apiUrl!,
-                    opts.apiKey || "",
-                  ).catch((err) => console.warn(`[runner] Failed to save cost: ${err}`));
-                }
-              } catch {
-                // Ignore parse errors - not all lines are JSON
-              }
-
-              // Buffer for log streaming
-              logBuffer.lines.push(line.trim());
-
-              const shouldFlush =
-                logBuffer.lines.length >= LOG_BUFFER_SIZE ||
-                Date.now() - logBuffer.lastFlush >= LOG_FLUSH_INTERVAL_MS;
-
-              if (shouldFlush) {
-                await flushLogBuffer(logBuffer, {
-                  apiUrl: opts.apiUrl!,
-                  apiKey: opts.apiKey || "",
-                  agentId: opts.agentId || "",
-                  sessionId: opts.sessionId!,
-                  iteration: opts.iteration!,
-                  taskId: opts.taskId,
-                  cli: "claude",
-                });
-              }
-            }
-          }
-        }
-
-        // Handle any remaining partial line at stream end
-        if (logBuffer.partialLine.trim()) {
-          prettyPrintLine(logBuffer.partialLine, role);
-          if (shouldStream) {
-            // Try to extract cost data from final partial line
-            try {
-              const json = JSON.parse(logBuffer.partialLine.trim());
-              if (json.type === "result" && json.total_cost_usd !== undefined) {
-                const usage = json.usage as
-                  | {
-                      input_tokens?: number;
-                      output_tokens?: number;
-                      cache_read_input_tokens?: number;
-                      cache_creation_input_tokens?: number;
-                    }
-                  | undefined;
-                saveCostData(
-                  {
-                    sessionId: opts.sessionId!,
-                    taskId: opts.taskId,
-                    agentId: opts.agentId || "",
-                    totalCostUsd: json.total_cost_usd || 0,
-                    inputTokens: usage?.input_tokens ?? 0,
-                    outputTokens: usage?.output_tokens ?? 0,
-                    cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
-                    cacheWriteTokens: usage?.cache_creation_input_tokens ?? 0,
-                    durationMs: json.duration_ms || 0,
-                    numTurns: json.num_turns || 1,
-                    model: "opus",
-                    isError: json.is_error || false,
-                  },
-                  opts.apiUrl!,
-                  opts.apiKey || "",
-                ).catch((err) => console.warn(`[runner] Failed to save cost: ${err}`));
-              }
-            } catch {
-              // Ignore parse errors
-            }
-            logBuffer.lines.push(logBuffer.partialLine.trim());
-          }
-          logBuffer.partialLine = "";
-        }
-
-        // Final flush for remaining buffered logs
-        if (shouldStream && logBuffer.lines.length > 0) {
-          await flushLogBuffer(logBuffer, {
-            apiUrl: opts.apiUrl!,
-            apiKey: opts.apiKey || "",
-            agentId: opts.agentId || "",
-            sessionId: opts.sessionId!,
-            iteration: opts.iteration!,
-            taskId: opts.taskId,
-            cli: "claude",
-          });
-        }
-      }
-    })();
-
-    const stderrPromise = (async () => {
-      if (proc.stderr) {
-        for await (const chunk of proc.stderr) {
-          stderrChunks++;
-          const text = new TextDecoder().decode(chunk);
-          stderrOutput += text;
-          prettyPrintStderr(text, role);
-          logFileHandle.write(
-            `${JSON.stringify({ type: "stderr", content: text, timestamp: new Date().toISOString() })}\n`,
+  session.onEvent((event) => {
+    switch (event.type) {
+      case "session_init":
+        if (realTaskId) {
+          saveProviderSessionId(opts.apiUrl, opts.apiKey, realTaskId, event.sessionId).catch(
+            (err) => console.warn(`[runner] Failed to save session ID: ${err}`),
           );
         }
+        break;
+      case "tool_start": {
+        // Auto-progress: report tool activity as task progress (throttled)
+        const now = Date.now();
+        if (effectiveTaskId && opts.apiUrl && now - lastProgressTime >= PROGRESS_THROTTLE_MS) {
+          lastProgressTime = now;
+          const progress = toolCallToProgress(event.toolName, event.args);
+          updateProgressViaAPI(opts.apiUrl, opts.apiKey, effectiveTaskId, progress).catch(() => {});
+        }
+        break;
       }
-    })();
+      case "result":
+        // Cost save is handled in waitForCompletion().then() to ensure
+        // it completes before the process exits (fire-and-forget here
+        // races with container shutdown).
+        break;
+      case "raw_log":
+        prettyPrintLine(event.content, opts.role);
+        if (shouldStream) {
+          logBuffer.lines.push(event.content);
+          const shouldFlush =
+            logBuffer.lines.length >= LOG_BUFFER_SIZE ||
+            Date.now() - logBuffer.lastFlush >= LOG_FLUSH_INTERVAL_MS;
+          if (shouldFlush) {
+            flushLogBuffer(logBuffer, {
+              apiUrl: opts.apiUrl,
+              apiKey: opts.apiKey,
+              agentId: opts.agentId,
+              sessionId: opts.runnerSessionId,
+              iteration: opts.iteration,
+              taskId: effectiveTaskId,
+              cli: adapter.name,
+            }).catch(() => {});
+          }
+        }
+        break;
+      case "raw_stderr":
+        prettyPrintStderr(event.content, opts.role);
+        break;
+    }
+  });
 
-    await Promise.all([stdoutPromise, stderrPromise]);
-    await logFileHandle.end();
-    const exitCode = await proc.exited;
-
-    if (exitCode !== 0 && stderrOutput) {
-      console.error(
-        `\x1b[31m[${role}] Full stderr for task ${effectiveTaskId.slice(0, 8)}:\x1b[0m\n${stderrOutput}`,
-      );
+  // Create promise that handles completion
+  const promise: Promise<ProviderResult> = session.waitForCompletion().then(async (result) => {
+    // Final log flush
+    if (shouldStream && logBuffer.lines.length > 0) {
+      await flushLogBuffer(logBuffer, {
+        apiUrl: opts.apiUrl,
+        apiKey: opts.apiKey,
+        agentId: opts.agentId,
+        sessionId: opts.runnerSessionId,
+        iteration: opts.iteration,
+        taskId: effectiveTaskId,
+        cli: adapter.name,
+      });
     }
 
-    if (stdoutChunks === 0 && stderrChunks === 0) {
-      console.warn(
-        `\x1b[33m[${role}] WARNING: No output from Claude for task ${effectiveTaskId.slice(0, 8)} - check auth/startup\x1b[0m`,
-      );
-    }
-
-    // Log errors if non-zero exit code
-    if (exitCode !== 0) {
+    // Error logging for non-zero exit
+    if (result.exitCode !== 0) {
       const errorLog = {
         timestamp: new Date().toISOString(),
         iteration: opts.iteration,
-        exitCode,
+        exitCode: result.exitCode,
         taskId: effectiveTaskId,
         error: true,
       };
@@ -1210,29 +1263,99 @@ async function spawnClaudeProcess(
 
       if (!isYolo) {
         console.error(
-          `[${role}] Task ${effectiveTaskId.slice(0, 8)} exited with code ${exitCode}.`,
+          `[${opts.role}] Task ${effectiveTaskId.slice(0, 8)} exited with code ${result.exitCode}.`,
         );
       } else {
         console.warn(
-          `[${role}] Task ${effectiveTaskId.slice(0, 8)} exited with code ${exitCode}. YOLO mode - continuing...`,
+          `[${opts.role}] Task ${effectiveTaskId.slice(0, 8)} exited with code ${result.exitCode}. YOLO mode - continuing...`,
         );
       }
     }
 
-    // Clean up task file after process exits
-    await cleanupTaskFile(taskFilePid);
-    console.log(`\x1b[2m[${role}]\x1b[0m Task file cleaned up: ${taskFilePath}`);
+    // Save cost data (awaited to ensure it completes before container exits)
+    if (result.cost) {
+      try {
+        await saveCostData(
+          { ...result.cost, taskId: realTaskId, sessionId: opts.runnerSessionId },
+          opts.apiUrl,
+          opts.apiKey,
+        );
+      } catch (err) {
+        console.warn(`[runner] Failed to save cost: ${err}`);
+      }
+    }
 
-    return exitCode ?? 1;
-  })();
+    return result;
+  });
 
-  return {
+  const runningTask: RunningTask = {
     taskId: effectiveTaskId,
-    process: proc,
+    session,
     logFile: opts.logFile,
     startTime: new Date(),
     promise,
+    result: null,
   };
+
+  // Non-blocking completion tracking
+  promise
+    .then((r) => {
+      runningTask.result = r;
+    })
+    .catch(() => {
+      runningTask.result = { exitCode: 1, isError: true };
+    });
+
+  return runningTask;
+}
+
+/** Run a single provider iteration (blocking) - used for AI-loop mode */
+async function runProviderIteration(
+  adapter: ReturnType<typeof createProviderAdapter>,
+  opts: {
+    prompt: string;
+    logFile: string;
+    systemPrompt?: string;
+    additionalArgs?: string[];
+    role: string;
+    apiUrl: string;
+    apiKey: string;
+    agentId: string;
+    taskId?: string;
+    cwd?: string;
+  },
+): Promise<ProviderResult> {
+  const freshEnv = await fetchResolvedEnv(opts.apiUrl, opts.apiKey, opts.agentId);
+  const model = (freshEnv.MODEL_OVERRIDE as string) || "";
+
+  const config: ProviderSessionConfig = {
+    prompt: opts.prompt,
+    systemPrompt: opts.systemPrompt || "",
+    model,
+    role: opts.role,
+    agentId: opts.agentId,
+    taskId: opts.taskId || crypto.randomUUID(),
+    apiUrl: opts.apiUrl,
+    apiKey: opts.apiKey,
+    cwd: opts.cwd || process.cwd(),
+    logFile: opts.logFile,
+    additionalArgs: opts.additionalArgs,
+    env: freshEnv as Record<string, string>,
+  };
+
+  const session = await adapter.createSession(config);
+
+  session.onEvent((event) => {
+    if (event.type === "raw_log") prettyPrintLine(event.content, opts.role);
+    if (event.type === "raw_stderr") prettyPrintStderr(event.content, opts.role);
+    if (event.type === "session_init" && opts.taskId) {
+      saveProviderSessionId(opts.apiUrl, opts.apiKey, opts.taskId, event.sessionId).catch((err) =>
+        console.warn(`[runner] Failed to save session ID: ${err}`),
+      );
+    }
+  });
+
+  return session.waitForCompletion();
 }
 
 /** Check for completed processes and remove them from active tasks */
@@ -1241,32 +1364,113 @@ async function checkCompletedProcesses(
   role: string,
   apiConfig?: ApiConfig,
 ): Promise<void> {
-  const completedTasks: Array<{ taskId: string; exitCode: number }> = [];
+  const completedTasks: Array<{
+    taskId: string;
+    result: ProviderResult;
+    triggerType?: string;
+  }> = [];
 
   for (const [taskId, task] of state.activeTasks) {
-    // Check if the Bun subprocess has exited (non-blocking)
-    if (task.process.exitCode !== null) {
+    // Non-blocking check: result is set by a .then() callback when the promise resolves
+    if (task.result !== null) {
       console.log(
-        `[${role}] Task ${taskId.slice(0, 8)} completed with exit code ${task.process.exitCode}`,
+        `[${role}] Task ${taskId.slice(0, 8)} completed with exit code ${task.result.exitCode} (trigger: ${task.triggerType || "unknown"})`,
       );
-      completedTasks.push({ taskId, exitCode: task.process.exitCode });
+      completedTasks.push({
+        taskId,
+        result: task.result,
+        triggerType: task.triggerType,
+      });
     }
   }
 
   // Remove completed tasks from the map and ensure they're marked as finished
-  for (const { taskId, exitCode } of completedTasks) {
+  for (const { taskId, result } of completedTasks) {
     state.activeTasks.delete(taskId);
+
+    if (apiConfig) {
+      removeActiveSession(apiConfig, taskId);
+    }
 
     // Call the finish API to ensure task status is updated
     // This is idempotent - if the agent already marked it, this is a no-op
     if (apiConfig) {
-      await ensureTaskFinished(apiConfig, role, taskId, exitCode);
+      let failureReason: string | undefined;
+      if (result.exitCode !== 0 && result.failureReason) {
+        failureReason = result.failureReason;
+        console.log(`[${role}] Detected error for task ${taskId.slice(0, 8)}: ${failureReason}`);
+      }
+      await ensureTaskFinished(apiConfig, role, taskId, result.exitCode, failureReason);
+    }
+  }
+}
+
+const TEMPLATE_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+async function fetchTemplate(
+  templateId: string,
+  registryUrl: string,
+  cacheDir: string,
+): Promise<TemplateResponse | null> {
+  const safeId = templateId.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const cachePath = `${cacheDir}/${safeId}.json`;
+
+  // Check local cache
+  try {
+    const info = await stat(cachePath);
+    if (Date.now() - info.mtimeMs < TEMPLATE_CACHE_TTL_MS) {
+      const cached = await readFile(cachePath, "utf-8");
+      return JSON.parse(cached) as TemplateResponse;
+    }
+  } catch {
+    // No cache or expired, continue to fetch
+  }
+
+  // Fetch from registry
+  try {
+    const resp = await fetch(`${registryUrl}/api/templates/${templateId}`);
+    if (!resp.ok) {
+      console.warn(`[template] Registry returned ${resp.status} for ${templateId}`);
+      // Fall back to expired cache if available
+      try {
+        const cached = await readFile(cachePath, "utf-8");
+        console.log(`[template] Using expired cache for ${templateId}`);
+        return JSON.parse(cached) as TemplateResponse;
+      } catch {
+        return null;
+      }
+    }
+
+    const template = (await resp.json()) as TemplateResponse;
+
+    // Cache the response
+    try {
+      await mkdir(cacheDir, { recursive: true });
+      await writeFile(cachePath, JSON.stringify(template), "utf-8");
+    } catch {
+      console.warn(`[template] Could not cache template to ${cachePath}`);
+    }
+
+    return template;
+  } catch (err) {
+    console.warn(`[template] Failed to fetch from registry: ${err}`);
+    // Fall back to expired cache
+    try {
+      const cached = await readFile(cachePath, "utf-8");
+      console.log(`[template] Using expired cache for ${templateId}`);
+      return JSON.parse(cached) as TemplateResponse;
+    } catch {
+      return null;
     }
   }
 }
 
 export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
-  const { role, defaultPrompt, metadataType } = config;
+  const { defaultPrompt, metadataType } = config;
+  let role = config.role;
+
+  // Create provider adapter based on HARNESS_PROVIDER env var (default: claude)
+  const adapter = createProviderAdapter(process.env.HARNESS_PROVIDER || "claude");
 
   const sessionId = process.env.SESSION_ID || crypto.randomUUID().slice(0, 8);
   const baseLogDir = opts.logsDir || process.env.LOG_DIR || "/logs";
@@ -1283,10 +1487,38 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   const apiUrl = process.env.MCP_BASE_URL || "http://localhost:3013";
   const swarmUrl = process.env.SWARM_URL || "localhost";
 
-  const capabilities = config.capabilities;
+  let capabilities = config.capabilities;
 
-  // Generate base prompt that's always included
-  const basePrompt = getBasePrompt({ role, agentId, swarmUrl, capabilities });
+  // Agent identity fields — populated after registration by fetching full profile
+  let agentSoulMd: string | undefined;
+  let agentIdentityMd: string | undefined;
+  let agentSetupScript: string | undefined;
+  let agentToolsMd: string | undefined;
+  let agentClaudeMd: string | undefined;
+  let agentProfileName: string | undefined;
+  let agentDescription: string | undefined;
+
+  // Per-task repo context — set when processing a task with githubRepo
+  let currentRepoContext: BasePromptArgs["repoContext"] | undefined;
+
+  // Generate base prompt (identity fields injected after profile fetch below)
+  const buildSystemPrompt = () => {
+    return getBasePrompt({
+      role,
+      agentId,
+      swarmUrl,
+      capabilities,
+      name: agentProfileName,
+      description: agentDescription,
+      soulMd: agentSoulMd,
+      identityMd: agentIdentityMd,
+      toolsMd: agentToolsMd,
+      claudeMd: agentClaudeMd,
+      repoContext: currentRepoContext,
+    });
+  };
+
+  let basePrompt = buildSystemPrompt();
 
   // Resolve additional system prompt: CLI flag > env var
   let additionalSystemPrompt: string | undefined;
@@ -1318,7 +1550,8 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   }
 
   // Combine base prompt with any additional system prompt
-  const resolvedSystemPrompt = additionalSystemPrompt
+  // Note: resolvedSystemPrompt is rebuilt after profile fetch when identity is available
+  let resolvedSystemPrompt = additionalSystemPrompt
     ? `${basePrompt}\n\n${additionalSystemPrompt}`
     : basePrompt;
 
@@ -1346,8 +1579,38 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   let iteration = 0;
 
   if (!isAiLoop) {
+    // Fetch template early (before registration) so defaults can be applied
+    const templateId = process.env.TEMPLATE_ID;
+    const registryUrl = process.env.TEMPLATE_REGISTRY_URL || "https://templates.agent-swarm.dev";
+    let cachedTemplate: TemplateResponse | null = null;
+
+    if (templateId) {
+      try {
+        cachedTemplate = await fetchTemplate(templateId, registryUrl, "/workspace/.template-cache");
+        if (cachedTemplate) {
+          console.log(`[${role}] Fetched template: ${templateId}`);
+
+          // Apply agentDefaults as fallbacks (env/config takes precedence)
+          const defaults = cachedTemplate.config.agentDefaults;
+          if (config.role === "worker" && defaults.role) {
+            role = defaults.role;
+          }
+          if (!capabilities?.length && defaults.capabilities?.length) {
+            capabilities = defaults.capabilities;
+          }
+        }
+      } catch (err) {
+        console.warn(`[${role}] Failed to fetch template ${templateId}: ${err}`);
+      }
+    }
+
     // Runner-level polling mode with parallel execution support
-    const maxConcurrent = parseInt(process.env.MAX_CONCURRENT_TASKS || "1", 10);
+    const isLeadFromConfig = config.role === "lead";
+    const isLead = isLeadFromConfig || (cachedTemplate?.config.agentDefaults?.isLead ?? false);
+    const defaultMaxTasks = isLead ? 2 : 1;
+    const maxConcurrent = process.env.MAX_CONCURRENT_TASKS
+      ? parseInt(process.env.MAX_CONCURRENT_TASKS, 10)
+      : (cachedTemplate?.config.agentDefaults?.maxTasks ?? defaultMaxTasks);
     console.log(`[${role}] Mode: runner-level polling (use --ai-loop for AI-based polling)`);
     console.log(`[${role}] Max concurrent tasks: ${maxConcurrent}`);
 
@@ -1357,6 +1620,9 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       maxConcurrent,
     };
 
+    // Track tasks already signaled for cancellation to avoid repeated SIGTERM
+    const cancelledSignaled = new Set<string>();
+
     // Create API config for ping/close
     const apiConfig: ApiConfig = { apiUrl, apiKey, agentId };
 
@@ -1364,21 +1630,183 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     setupShutdownHandlers(role, apiConfig, () => state);
 
     // Register agent before starting
-    const agentName = process.env.AGENT_NAME || `${role}-${agentId.slice(0, 8)}`;
+    const agentName =
+      process.env.AGENT_NAME ||
+      cachedTemplate?.config.displayName ||
+      `${role}-${agentId.slice(0, 8)}`;
     try {
       await registerAgent({
         apiUrl,
         apiKey,
         agentId,
         name: agentName,
-        isLead: role === "lead",
-        capabilities: config.capabilities,
+        role,
+        isLead,
+        capabilities,
         maxTasks: maxConcurrent,
       });
       console.log(`[${role}] Registered as "${agentName}" (ID: ${agentId})`);
     } catch (error) {
       console.error(`[${role}] Failed to register: ${error}`);
       process.exit(1);
+    }
+
+    // Clean up any stale active sessions from previous runs (crash recovery)
+    await cleanupActiveSessions(apiConfig);
+    console.log(`[${role}] Cleaned up stale active sessions`);
+
+    // Fetch full agent profile to get soul/identity content
+    try {
+      const resp = await fetch(`${apiUrl}/me`, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "X-Agent-ID": agentId,
+        },
+      });
+      if (resp.ok) {
+        const profile = (await resp.json()) as {
+          soulMd?: string;
+          identityMd?: string;
+          claudeMd?: string;
+          setupScript?: string;
+          toolsMd?: string;
+          name?: string;
+          description?: string;
+        };
+        agentSoulMd = profile.soulMd;
+        agentIdentityMd = profile.identityMd;
+        agentSetupScript = profile.setupScript;
+        agentToolsMd = profile.toolsMd;
+        agentClaudeMd = profile.claudeMd;
+        agentProfileName = profile.name;
+        agentDescription = profile.description;
+
+        // Generate default templates if missing (runner registers via POST /api/agents
+        // which doesn't generate templates like join-swarm does)
+        if (!agentSoulMd || !agentIdentityMd || !agentToolsMd || !agentClaudeMd) {
+          // Use already-fetched template (from pre-registration step)
+          if (cachedTemplate) {
+            const ctx = {
+              agent: {
+                name: agentProfileName || agentName,
+                role: role,
+                description: agentDescription || "",
+                capabilities: (capabilities || []).join(", "),
+              },
+            };
+            if (!agentSoulMd) agentSoulMd = interpolate(cachedTemplate.files.soulMd, ctx);
+            if (!agentIdentityMd)
+              agentIdentityMd = interpolate(cachedTemplate.files.identityMd, ctx);
+            if (!agentToolsMd) agentToolsMd = interpolate(cachedTemplate.files.toolsMd, ctx);
+            if (!agentClaudeMd) agentClaudeMd = interpolate(cachedTemplate.files.claudeMd, ctx);
+            if (!agentSetupScript)
+              agentSetupScript = interpolate(cachedTemplate.files.setupScript, ctx);
+            console.log(`[${role}] Applied template: ${templateId}`);
+          }
+
+          // Fallback to generic defaults for any still-missing fields
+          const agentInfo = {
+            name: agentProfileName || agentName,
+            role: role,
+            description: agentDescription,
+            capabilities: config.capabilities,
+          };
+          if (!agentSoulMd) agentSoulMd = generateDefaultSoulMd(agentInfo);
+          if (!agentIdentityMd) agentIdentityMd = generateDefaultIdentityMd(agentInfo);
+          if (!agentToolsMd) agentToolsMd = generateDefaultToolsMd(agentInfo);
+          if (!agentClaudeMd) agentClaudeMd = generateDefaultClaudeMd(agentInfo);
+
+          // Push generated templates to server
+          try {
+            const profileUpdate: Record<string, string> = {};
+            if (!profile.soulMd) profileUpdate.soulMd = agentSoulMd;
+            if (!profile.identityMd) profileUpdate.identityMd = agentIdentityMd;
+            if (!profile.toolsMd) profileUpdate.toolsMd = agentToolsMd;
+            if (!profile.claudeMd && agentClaudeMd) profileUpdate.claudeMd = agentClaudeMd;
+            if (!profile.setupScript && agentSetupScript)
+              profileUpdate.setupScript = agentSetupScript;
+
+            await fetch(`${apiUrl}/api/agents/${agentId}/profile`, {
+              method: "PUT",
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                "X-Agent-ID": agentId,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(profileUpdate),
+            });
+            console.log(`[${role}] Generated and saved default identity templates`);
+          } catch {
+            console.warn(`[${role}] Could not save generated templates to server`);
+          }
+        }
+
+        // Rebuild system prompt with identity
+        basePrompt = buildSystemPrompt();
+        resolvedSystemPrompt = additionalSystemPrompt
+          ? `${basePrompt}\n\n${additionalSystemPrompt}`
+          : basePrompt;
+        console.log(
+          `[${role}] Loaded agent identity (soul: ${agentSoulMd ? "yes" : "no"}, identity: ${agentIdentityMd ? "yes" : "no"}, tools: ${agentToolsMd ? "yes" : "no"}, claude: ${agentClaudeMd ? "yes" : "no"})`,
+        );
+        console.log(`[${role}] Updated system prompt length: ${resolvedSystemPrompt.length} chars`);
+      }
+    } catch {
+      console.warn(`[${role}] Could not fetch agent profile for identity — proceeding without`);
+    }
+
+    // Write SOUL.md and IDENTITY.md to workspace before spawning Claude
+    const SOUL_MD_PATH = "/workspace/SOUL.md";
+    const IDENTITY_MD_PATH = "/workspace/IDENTITY.md";
+
+    if (agentSoulMd) {
+      try {
+        await Bun.write(SOUL_MD_PATH, agentSoulMd);
+        console.log(`[${role}] Wrote SOUL.md to workspace`);
+      } catch (err) {
+        console.warn(`[${role}] Could not write SOUL.md: ${(err as Error).message}`);
+      }
+    }
+    if (agentIdentityMd) {
+      try {
+        await Bun.write(IDENTITY_MD_PATH, agentIdentityMd);
+        console.log(`[${role}] Wrote IDENTITY.md to workspace`);
+      } catch (err) {
+        console.warn(`[${role}] Could not write IDENTITY.md: ${(err as Error).message}`);
+      }
+    }
+
+    // Write setup script to workspace (agent can edit during session)
+    // Only create if it doesn't exist — the entrypoint already composed/prepended it at container start
+    if (agentSetupScript) {
+      try {
+        if (!(await Bun.file("/workspace/start-up.sh").exists())) {
+          await Bun.write("/workspace/start-up.sh", `#!/bin/bash\n${agentSetupScript}\n`);
+          console.log(`[${role}] Wrote start-up.sh to workspace`);
+        }
+      } catch (err) {
+        console.warn(`[${role}] Could not write start-up.sh: ${(err as Error).message}`);
+      }
+    }
+
+    // Write TOOLS.md to workspace (agent can edit during session)
+    if (agentToolsMd) {
+      try {
+        await Bun.write("/workspace/TOOLS.md", agentToolsMd);
+        console.log(`[${role}] Wrote TOOLS.md to workspace`);
+      } catch (err) {
+        console.warn(`[${role}] Could not write TOOLS.md: ${(err as Error).message}`);
+      }
+    }
+
+    // Write CLAUDE.md to workspace (agent-level instructions)
+    if (agentClaudeMd) {
+      try {
+        await Bun.write("/workspace/CLAUDE.md", agentClaudeMd);
+        console.log(`[${role}] Wrote CLAUDE.md to workspace`);
+      } catch (err) {
+        console.warn(`[${role}] Could not write CLAUDE.md: ${(err as Error).message}`);
+      }
     }
 
     // ========== Resume paused tasks with PRIORITY ==========
@@ -1391,6 +1819,14 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         console.log(`[${role}] Found ${pausedTasks.length} paused task(s) to resume`);
 
         for (const task of pausedTasks) {
+          // Defensive: skip tasks that already have completion data (zombie prevention)
+          if (task.finishedAt || task.output) {
+            console.warn(
+              `[${role}] Skipping zombie task ${task.id.slice(0, 8)} — already has completion data (finishedAt: ${!!task.finishedAt}, output: ${!!task.output})`,
+            );
+            continue;
+          }
+
           // Wait if at capacity (though unlikely on fresh startup)
           while (state.activeTasks.size >= state.maxConcurrent) {
             await checkCompletedProcesses(state, role, apiConfig);
@@ -1410,8 +1846,35 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             continue;
           }
 
-          // Build prompt with resume context
-          const resumePrompt = buildResumePrompt(task);
+          // Build prompt with resume context + memory injection
+          let resumePrompt = buildResumePrompt(task);
+
+          // Inject relevant memories for resumed tasks
+          const resumeMemoryContext = await fetchRelevantMemories(
+            apiUrl,
+            apiKey,
+            agentId,
+            task.task,
+          );
+          if (resumeMemoryContext) {
+            resumePrompt += resumeMemoryContext;
+            console.log(`[${role}] Injected relevant memories into resumed task prompt`);
+          }
+
+          // Resolve --resume: prefer own session ID, then parent's
+          let resumeAdditionalArgs = opts.additionalArgs || [];
+          if (task.claudeSessionId) {
+            resumeAdditionalArgs = [...resumeAdditionalArgs, "--resume", task.claudeSessionId];
+            console.log(
+              `[${role}] Resuming task's own session ${task.claudeSessionId.slice(0, 8)}`,
+            );
+          } else if (task.parentTaskId) {
+            const parentSessionId = await fetchProviderSessionId(apiUrl, apiKey, task.parentTaskId);
+            if (parentSessionId) {
+              resumeAdditionalArgs = [...resumeAdditionalArgs, "--resume", parentSessionId];
+              console.log(`[${role}] Resuming parent session ${parentSessionId.slice(0, 8)}`);
+            }
+          }
 
           // Spawn Claude process for resumed task
           iteration++;
@@ -1434,27 +1897,65 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           };
           await Bun.write(logFile, `${JSON.stringify(metadata)}\n`);
 
-          const runningTask = await spawnClaudeProcess(
+          // Resolve cwd for resumed task (mirrors normal task path: task.dir > vcsRepo clonePath)
+          let resumeCwd: string | undefined;
+          if (task.dir) {
+            try {
+              if (existsSync(task.dir) && statSync(task.dir).isDirectory()) {
+                resumeCwd = task.dir;
+              } else {
+                console.warn(
+                  `[${role}] Resume task dir "${task.dir}" does not exist or is not a directory, falling back to default cwd`,
+                );
+              }
+            } catch {
+              console.warn(
+                `[${role}] Failed to check resume task dir "${task.dir}", falling back to default cwd`,
+              );
+            }
+          }
+
+          if (!resumeCwd && task.vcsRepo && apiUrl) {
+            const repoConfig = await fetchRepoConfig(apiUrl, apiKey, task.vcsRepo);
+            const effectiveConfig = repoConfig ?? {
+              url: task.vcsRepo,
+              name: task.vcsRepo.split("/").pop() || task.vcsRepo,
+              clonePath: `/workspace/repos/${task.vcsRepo.split("/").pop() || task.vcsRepo}`,
+              defaultBranch: "main",
+            };
+            const repoContext = await ensureRepoForTask(effectiveConfig, role);
+            if (repoContext?.clonePath) {
+              resumeCwd = repoContext.clonePath;
+            }
+          }
+
+          const runningTask = await spawnProviderProcess(
+            adapter,
             {
               prompt: resumePrompt,
               logFile,
               systemPrompt: resolvedSystemPrompt,
-              additionalArgs: opts.additionalArgs,
+              additionalArgs: resumeAdditionalArgs,
               role,
               apiUrl,
               apiKey,
               agentId,
-              sessionId,
+              runnerSessionId: sessionId,
               iteration,
               taskId: task.id,
+              model: (task as { model?: string }).model,
+              cwd: resumeCwd,
             },
             logDir,
-            metadataType,
-            sessionId,
             isYolo,
           );
 
           state.activeTasks.set(task.id, runningTask);
+          registerActiveSession(apiConfig, {
+            taskId: task.id,
+            triggerType: "task_resumed",
+            taskDescription: task.task?.slice(0, 200),
+          });
           console.log(
             `[${role}] Resumed task ${task.id.slice(0, 8)} (${state.activeTasks.size}/${state.maxConcurrent} active)`,
           );
@@ -1471,14 +1972,44 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     // ========== END: Resume paused tasks ==========
 
     // Track last finished task check for leads (to avoid re-processing)
-    let lastFinishedTaskCheck: string | undefined;
-
     while (true) {
       // Ping server on each iteration to keep status updated
       await pingServer(apiConfig, role);
 
       // Check for completed processes first and ensure tasks are marked as finished
       await checkCompletedProcesses(state, role, apiConfig);
+
+      // Check for cancelled tasks and signal their subprocesses
+      if (state.activeTasks.size > 0) {
+        for (const [taskId, task] of state.activeTasks) {
+          if (cancelledSignaled.has(taskId)) continue; // Already sent SIGTERM
+          try {
+            const cancelResp = await fetch(
+              `${apiUrl}/cancelled-tasks?taskId=${encodeURIComponent(taskId)}`,
+              {
+                headers: {
+                  Authorization: `Bearer ${apiKey}`,
+                  "X-Agent-ID": agentId,
+                },
+              },
+            );
+            if (cancelResp.ok) {
+              const cancelData = (await cancelResp.json()) as {
+                cancelled: Array<{ id: string }>;
+              };
+              if (cancelData.cancelled?.some((t) => t.id === taskId)) {
+                console.log(
+                  `[${role}] Task ${taskId.slice(0, 8)} was cancelled — sending SIGTERM to subprocess`,
+                );
+                task.session.abort().catch(() => {});
+                cancelledSignaled.add(taskId);
+              }
+            }
+          } catch {
+            // Non-blocking — cancellation check is best-effort
+          }
+        }
+      }
 
       // Only poll if we have capacity
       if (state.activeTasks.size < state.maxConcurrent) {
@@ -1495,19 +2026,156 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           agentId,
           pollInterval: PollIntervalMs,
           pollTimeout: effectiveTimeout,
-          since: lastFinishedTaskCheck,
         });
 
         if (trigger) {
-          // After getting a tasks_finished trigger, update the timestamp
-          if (trigger.type === "tasks_finished") {
-            lastFinishedTaskCheck = new Date().toISOString();
-          }
-
           console.log(`[${role}] Trigger received: ${trigger.type}`);
 
           // Build prompt based on trigger
-          const triggerPrompt = buildPromptForTrigger(trigger, prompt);
+          let triggerPrompt = buildPromptForTrigger(trigger, prompt);
+
+          // Enrich prompt with relevant memories from past sessions
+          if (trigger.type === "task_assigned" || trigger.type === "task_offered") {
+            const task =
+              trigger.task && typeof trigger.task === "object" && "task" in trigger.task
+                ? (trigger.task as { task: string; epicId?: string; id?: string })
+                : null;
+            if (task?.task) {
+              // Enrich search query with epic context for better memory retrieval
+              let searchQuery = task.task;
+              if (task.epicId) {
+                const epicContext = await fetchEpicNameAndGoal(apiUrl, apiKey, task.epicId);
+                if (epicContext) {
+                  searchQuery = `[Epic: ${epicContext.name}] ${epicContext.goal}\n\n${task.task}`;
+                }
+              }
+
+              const memoryContext = await fetchRelevantMemories(
+                apiUrl,
+                apiKey,
+                agentId,
+                searchQuery,
+              );
+              if (memoryContext) {
+                triggerPrompt += memoryContext;
+                console.log(`[${role}] Injected relevant memories into task prompt`);
+              }
+
+              // Inject recent completed task summaries from the same epic
+              if (task.epicId && task.id) {
+                const epicTaskContext = await fetchEpicTaskContext(
+                  apiUrl,
+                  apiKey,
+                  task.epicId,
+                  task.id,
+                );
+                if (epicTaskContext) {
+                  triggerPrompt += epicTaskContext;
+                  console.log(`[${role}] Injected epic task context into prompt`);
+                }
+              }
+            }
+          }
+
+          // For epic progress triggers, search memories related to the epic goals
+          if (trigger.type === "epic_progress_changed" && trigger.epics) {
+            const epics = trigger.epics as Array<{
+              epic: { name: string; goal: string };
+            }>;
+            const epicQueries = epics.map((e) => `${e.epic.name}: ${e.epic.goal}`).join("\n");
+            const memoryContext = await fetchRelevantMemories(apiUrl, apiKey, agentId, epicQueries);
+            if (memoryContext) {
+              triggerPrompt += memoryContext;
+              console.log(`[${role}] Injected memories into epic progress prompt`);
+            }
+          }
+
+          // Resolve --resume for child tasks with parentTaskId
+          let effectiveAdditionalArgs = opts.additionalArgs || [];
+          const taskObj = trigger.task as { parentTaskId?: string } | undefined;
+          if (taskObj?.parentTaskId) {
+            const parentSessionId = await fetchProviderSessionId(
+              apiUrl,
+              apiKey,
+              taskObj.parentTaskId,
+            );
+            if (parentSessionId) {
+              effectiveAdditionalArgs = [...effectiveAdditionalArgs, "--resume", parentSessionId];
+              console.log(
+                `[${role}] Child task — resuming parent session ${parentSessionId.slice(0, 8)}`,
+              );
+            } else {
+              console.log(`[${role}] Child task — parent session ID not found, starting fresh`);
+            }
+          }
+
+          // Extract model from task data for per-task model selection
+          const taskModel = (trigger.task as { model?: string } | undefined)?.model;
+
+          // Handle repo context for tasks with vcsRepo (GitHub/GitLab)
+          const taskVcsRepo = (trigger.task as { vcsRepo?: string } | undefined)?.vcsRepo;
+          if (taskVcsRepo && apiUrl) {
+            const repoConfig = await fetchRepoConfig(apiUrl, apiKey, taskVcsRepo);
+            // Fall back to convention-based config if repo is not registered
+            const effectiveConfig = repoConfig ?? {
+              url: taskVcsRepo,
+              name: taskVcsRepo.split("/").pop() || taskVcsRepo,
+              clonePath: `/workspace/repos/${taskVcsRepo.split("/").pop() || taskVcsRepo}`,
+              defaultBranch: "main",
+            };
+            currentRepoContext = await ensureRepoForTask(effectiveConfig, role);
+          } else {
+            currentRepoContext = undefined;
+          }
+
+          // Resolve effective working directory (priority: task.dir > repoContext.clonePath > process.cwd())
+          const taskDir = (trigger.task as { dir?: string } | undefined)?.dir;
+          let effectiveCwd: string | undefined;
+
+          if (taskDir) {
+            try {
+              if (existsSync(taskDir) && statSync(taskDir).isDirectory()) {
+                effectiveCwd = taskDir;
+              } else {
+                console.warn(
+                  `[${role}] Task dir "${taskDir}" does not exist or is not a directory, falling back to default cwd`,
+                );
+              }
+            } catch {
+              console.warn(
+                `[${role}] Failed to check task dir "${taskDir}", falling back to default cwd`,
+              );
+            }
+          }
+
+          if (!effectiveCwd && currentRepoContext?.clonePath) {
+            effectiveCwd = currentRepoContext.clonePath;
+          }
+
+          // Annotate prompt with working directory context
+          if (effectiveCwd && effectiveCwd !== process.cwd()) {
+            triggerPrompt += `\n\n---\n**Working Directory**: You are starting in \`${effectiveCwd}\`. `;
+            if (taskDir) {
+              triggerPrompt += "This was explicitly set on the task.";
+            } else if (currentRepoContext?.clonePath) {
+              triggerPrompt += "This is the repository clone path for this task's VCS repo.";
+            }
+            triggerPrompt +=
+              " You can still access any path on the filesystem — this is just your starting directory.";
+          }
+
+          // Warn in system prompt when task dir was specified but doesn't exist
+          let cwdWarning = "";
+          if (taskDir && !effectiveCwd) {
+            cwdWarning = `\n\nNote: The task requested working directory "${taskDir}" but it does not exist. Falling back to default directory.`;
+          }
+
+          // Rebuild system prompt with per-task repo context
+          const taskBasePrompt = buildSystemPrompt();
+          const taskSystemPrompt =
+            (additionalSystemPrompt
+              ? `${taskBasePrompt}\n\n${additionalSystemPrompt}`
+              : taskBasePrompt) + cwdWarning;
 
           iteration++;
           const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -1517,6 +2185,9 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           console.log(`\n[${role}] === Iteration ${iteration} ===`);
           console.log(`[${role}] Logging to: ${logFile}`);
           console.log(`[${role}] Prompt: ${triggerPrompt.slice(0, 100)}...`);
+          if (effectiveCwd) {
+            console.log(`[${role}] Working directory: ${effectiveCwd}`);
+          }
 
           const metadata = {
             type: metadataType,
@@ -1529,30 +2200,46 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           };
           await Bun.write(logFile, `${JSON.stringify(metadata)}\n`);
 
-          // Spawn without blocking (await to write task file, but process runs async)
-          const runningTask = await spawnClaudeProcess(
+          // Spawn without blocking (await to set up session, but process runs async)
+          const runningTask = await spawnProviderProcess(
+            adapter,
             {
               prompt: triggerPrompt,
               logFile,
-              systemPrompt: resolvedSystemPrompt,
-              additionalArgs: opts.additionalArgs,
+              systemPrompt: taskSystemPrompt,
+              additionalArgs: effectiveAdditionalArgs,
               role,
               apiUrl,
               apiKey,
               agentId,
-              sessionId,
+              runnerSessionId: sessionId,
               iteration,
               taskId: trigger.taskId,
+              model: taskModel,
+              cwd: effectiveCwd,
             },
             logDir,
-            metadataType,
-            sessionId,
             isYolo,
           );
 
+          // Attach trigger metadata for logging
+          runningTask.triggerType = trigger.type;
+
           state.activeTasks.set(runningTask.taskId, runningTask);
+
+          // Register active session for concurrency awareness
+          const taskDesc =
+            trigger.task && typeof trigger.task === "object" && "task" in trigger.task
+              ? String((trigger.task as { task: string }).task).slice(0, 200)
+              : undefined;
+          registerActiveSession(apiConfig, {
+            taskId: runningTask.taskId,
+            triggerType: trigger.type,
+            taskDescription: taskDesc,
+          });
+
           console.log(
-            `[${role}] Started task ${runningTask.taskId.slice(0, 8)} (${state.activeTasks.size}/${state.maxConcurrent} active)`,
+            `[${role}] Started task ${runningTask.taskId.slice(0, 8)} (${state.activeTasks.size}/${state.maxConcurrent} active, trigger: ${trigger.type})`,
           );
         }
       } else {
@@ -1593,19 +2280,26 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       };
       await Bun.write(logFile, `${JSON.stringify(metadata)}\n`);
 
-      const exitCode = await runClaudeIteration({
+      const iterationResult = await runProviderIteration(adapter, {
         prompt,
         logFile,
         systemPrompt: resolvedSystemPrompt,
         additionalArgs: opts.additionalArgs,
         role,
+        apiUrl,
+        apiKey,
+        agentId,
       });
 
-      if (exitCode !== 0) {
+      if (iterationResult.exitCode !== 0) {
+        const failureReason =
+          iterationResult.failureReason || `Process exited with code ${iterationResult.exitCode}`;
+
         const errorLog = {
           timestamp: new Date().toISOString(),
           iteration,
-          exitCode,
+          exitCode: iterationResult.exitCode,
+          failureReason,
           error: true,
         };
 
@@ -1615,12 +2309,12 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         await Bun.write(errorsFile, `${existingErrors}${JSON.stringify(errorLog)}\n`);
 
         if (!isYolo) {
-          console.error(`[${role}] Claude exited with code ${exitCode}. Stopping.`);
+          console.error(`[${role}] ${failureReason}. Stopping.`);
           console.error(`[${role}] Error logged to: ${errorsFile}`);
-          process.exit(exitCode);
+          process.exit(iterationResult.exitCode);
         }
 
-        console.warn(`[${role}] Claude exited with code ${exitCode}. YOLO mode - continuing...`);
+        console.warn(`[${role}] ${failureReason}. YOLO mode - continuing...`);
       }
 
       console.log(`[${role}] Iteration ${iteration} complete. Starting next iteration...`);

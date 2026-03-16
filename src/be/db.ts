@@ -1,16 +1,22 @@
 import { Database } from "bun:sqlite";
 import type {
+  ActiveSession,
   Agent,
   AgentLog,
   AgentLogEventType,
+  AgentMemory,
+  AgentMemoryScope,
+  AgentMemorySource,
   AgentStatus,
   AgentTask,
   AgentTaskSource,
   AgentTaskStatus,
   AgentWithTasks,
+  ChangeSource,
   Channel,
   ChannelMessage,
   ChannelType,
+  ContextVersion,
   Epic,
   EpicStatus,
   EpicWithProgress,
@@ -21,7 +27,18 @@ import type {
   ServiceStatus,
   SessionCost,
   SessionLog,
+  SwarmConfig,
+  SwarmRepo,
+  VersionableField,
+  VersionMeta,
+  Workflow,
+  WorkflowDefinition,
+  WorkflowRun,
+  WorkflowRunStatus,
+  WorkflowRunStep,
+  WorkflowRunStepStatus,
 } from "../types";
+import { runMigrations } from "./migrations/runner";
 
 let db: Database | null = null;
 
@@ -39,607 +56,131 @@ export function initDb(dbPath = "./agent-swarm-db.sqlite"): Database {
   database.run("PRAGMA journal_mode = WAL;");
   database.run("PRAGMA foreign_keys = ON;");
 
-  // Schema initialization - wrapped in transaction for atomicity
-  // Individual statements ensure compatibility with older Bun versions (< 1.0.26)
-  // that don't support multi-statement queries
-  const initSchema = database.transaction(() => {
-    // Tables
-    database.run(`
-      CREATE TABLE IF NOT EXISTS agents (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        isLead INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL CHECK(status IN ('idle', 'busy', 'offline')),
-        description TEXT,
-        role TEXT,
-        capabilities TEXT DEFAULT '[]',
-        createdAt TEXT NOT NULL,
-        lastUpdatedAt TEXT NOT NULL
-      )
-    `);
+  // Run database migrations (schema creation + incremental changes)
+  runMigrations(database);
 
-    database.run(`
-      CREATE TABLE IF NOT EXISTS agent_tasks (
-        id TEXT PRIMARY KEY,
-        agentId TEXT,
-        creatorAgentId TEXT,
-        task TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        source TEXT NOT NULL DEFAULT 'mcp',
-        taskType TEXT,
-        tags TEXT DEFAULT '[]',
-        priority INTEGER DEFAULT 50,
-        dependsOn TEXT DEFAULT '[]',
-        offeredTo TEXT,
-        offeredAt TEXT,
-        acceptedAt TEXT,
-        rejectionReason TEXT,
-        slackChannelId TEXT,
-        slackThreadTs TEXT,
-        slackUserId TEXT,
-        createdAt TEXT NOT NULL,
-        lastUpdatedAt TEXT NOT NULL,
-        finishedAt TEXT,
-        failureReason TEXT,
-        output TEXT,
-        progress TEXT,
-        notifiedAt TEXT
-      )
-    `);
+  // Compatibility migration for legacy databases that predate profile fields
+  ensureAgentProfileColumns(database);
 
-    database.run(`
-      CREATE TABLE IF NOT EXISTS agent_log (
-        id TEXT PRIMARY KEY,
-        eventType TEXT NOT NULL,
-        agentId TEXT,
-        taskId TEXT,
-        oldValue TEXT,
-        newValue TEXT,
-        metadata TEXT,
-        createdAt TEXT NOT NULL
-      )
-    `);
-
-    database.run(`
-      CREATE TABLE IF NOT EXISTS channels (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE,
-        description TEXT,
-        type TEXT NOT NULL DEFAULT 'public' CHECK(type IN ('public', 'dm')),
-        createdBy TEXT,
-        participants TEXT DEFAULT '[]',
-        createdAt TEXT NOT NULL,
-        FOREIGN KEY (createdBy) REFERENCES agents(id) ON DELETE SET NULL
-      )
-    `);
-
-    database.run(`
-      CREATE TABLE IF NOT EXISTS channel_messages (
-        id TEXT PRIMARY KEY,
-        channelId TEXT NOT NULL,
-        agentId TEXT,
-        content TEXT NOT NULL,
-        replyToId TEXT,
-        mentions TEXT DEFAULT '[]',
-        createdAt TEXT NOT NULL,
-        FOREIGN KEY (channelId) REFERENCES channels(id) ON DELETE CASCADE,
-        FOREIGN KEY (agentId) REFERENCES agents(id) ON DELETE CASCADE,
-        FOREIGN KEY (replyToId) REFERENCES channel_messages(id) ON DELETE SET NULL
-      )
-    `);
-
-    database.run(`
-      CREATE TABLE IF NOT EXISTS channel_read_state (
-        agentId TEXT NOT NULL,
-        channelId TEXT NOT NULL,
-        lastReadAt TEXT NOT NULL,
-        processing_since TEXT,
-        PRIMARY KEY (agentId, channelId),
-        FOREIGN KEY (agentId) REFERENCES agents(id) ON DELETE CASCADE,
-        FOREIGN KEY (channelId) REFERENCES channels(id) ON DELETE CASCADE
-      )
-    `);
-
-    database.run(`
-      CREATE TABLE IF NOT EXISTS services (
-        id TEXT PRIMARY KEY,
-        agentId TEXT NOT NULL,
-        name TEXT NOT NULL,
-        port INTEGER NOT NULL DEFAULT 3000,
-        description TEXT,
-        url TEXT,
-        healthCheckPath TEXT DEFAULT '/health',
-        status TEXT NOT NULL DEFAULT 'starting' CHECK(status IN ('starting', 'healthy', 'unhealthy', 'stopped')),
-        script TEXT NOT NULL DEFAULT '',
-        cwd TEXT,
-        interpreter TEXT,
-        args TEXT,
-        env TEXT,
-        metadata TEXT DEFAULT '{}',
-        createdAt TEXT NOT NULL,
-        lastUpdatedAt TEXT NOT NULL,
-        FOREIGN KEY (agentId) REFERENCES agents(id) ON DELETE CASCADE,
-        UNIQUE(agentId, name)
-      )
-    `);
-
-    database.run(`
-      CREATE TABLE IF NOT EXISTS session_logs (
-        id TEXT PRIMARY KEY,
-        taskId TEXT,
-        sessionId TEXT NOT NULL,
-        iteration INTEGER NOT NULL,
-        cli TEXT NOT NULL DEFAULT 'claude',
-        content TEXT NOT NULL,
-        lineNumber INTEGER NOT NULL,
-        createdAt TEXT NOT NULL
-      )
-    `);
-
-    database.run(`
-      CREATE TABLE IF NOT EXISTS session_costs (
-        id TEXT PRIMARY KEY,
-        sessionId TEXT NOT NULL,
-        taskId TEXT,
-        agentId TEXT NOT NULL,
-        totalCostUsd REAL NOT NULL,
-        inputTokens INTEGER NOT NULL DEFAULT 0,
-        outputTokens INTEGER NOT NULL DEFAULT 0,
-        cacheReadTokens INTEGER NOT NULL DEFAULT 0,
-        cacheWriteTokens INTEGER NOT NULL DEFAULT 0,
-        durationMs INTEGER NOT NULL,
-        numTurns INTEGER NOT NULL,
-        model TEXT NOT NULL,
-        isError INTEGER NOT NULL DEFAULT 0,
-        createdAt TEXT NOT NULL,
-        FOREIGN KEY (agentId) REFERENCES agents(id) ON DELETE CASCADE,
-        FOREIGN KEY (taskId) REFERENCES agent_tasks(id) ON DELETE SET NULL
-      )
-    `);
-
-    database.run(`
-      CREATE TABLE IF NOT EXISTS inbox_messages (
-        id TEXT PRIMARY KEY,
-        agentId TEXT NOT NULL,
-        content TEXT NOT NULL,
-        source TEXT NOT NULL DEFAULT 'slack',
-        status TEXT NOT NULL DEFAULT 'unread' CHECK(status IN ('unread', 'processing', 'read', 'responded', 'delegated')),
-        slackChannelId TEXT,
-        slackThreadTs TEXT,
-        slackUserId TEXT,
-        matchedText TEXT,
-        delegatedToTaskId TEXT,
-        responseText TEXT,
-        createdAt TEXT NOT NULL,
-        lastUpdatedAt TEXT NOT NULL,
-        FOREIGN KEY (agentId) REFERENCES agents(id) ON DELETE CASCADE,
-        FOREIGN KEY (delegatedToTaskId) REFERENCES agent_tasks(id) ON DELETE SET NULL
-      )
-    `);
-
-    // Indexes
-    database.run(`CREATE INDEX IF NOT EXISTS idx_agent_tasks_agentId ON agent_tasks(agentId)`);
-    database.run(`CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks(status)`);
-    database.run(`CREATE INDEX IF NOT EXISTS idx_agent_log_agentId ON agent_log(agentId)`);
-    database.run(`CREATE INDEX IF NOT EXISTS idx_agent_log_taskId ON agent_log(taskId)`);
-    database.run(`CREATE INDEX IF NOT EXISTS idx_agent_log_eventType ON agent_log(eventType)`);
-    database.run(`CREATE INDEX IF NOT EXISTS idx_agent_log_createdAt ON agent_log(createdAt)`);
-    database.run(
-      `CREATE INDEX IF NOT EXISTS idx_channel_messages_channelId ON channel_messages(channelId)`,
-    );
-    database.run(
-      `CREATE INDEX IF NOT EXISTS idx_channel_messages_agentId ON channel_messages(agentId)`,
-    );
-    database.run(
-      `CREATE INDEX IF NOT EXISTS idx_channel_messages_createdAt ON channel_messages(createdAt)`,
-    );
-    database.run(`CREATE INDEX IF NOT EXISTS idx_services_agentId ON services(agentId)`);
-    database.run(`CREATE INDEX IF NOT EXISTS idx_services_status ON services(status)`);
-    database.run(`CREATE INDEX IF NOT EXISTS idx_session_logs_taskId ON session_logs(taskId)`);
-    database.run(
-      `CREATE INDEX IF NOT EXISTS idx_session_logs_sessionId ON session_logs(sessionId)`,
-    );
-    // Session costs indexes for timeseries queries
-    database.run(
-      `CREATE INDEX IF NOT EXISTS idx_session_costs_createdAt ON session_costs(createdAt)`,
-    );
-    database.run(`CREATE INDEX IF NOT EXISTS idx_session_costs_taskId ON session_costs(taskId)`);
-    database.run(`CREATE INDEX IF NOT EXISTS idx_session_costs_agentId ON session_costs(agentId)`);
-    database.run(
-      `CREATE INDEX IF NOT EXISTS idx_session_costs_agent_createdAt ON session_costs(agentId, createdAt)`,
-    );
-    database.run(
-      `CREATE INDEX IF NOT EXISTS idx_inbox_messages_agentId ON inbox_messages(agentId)`,
-    );
-    database.run(`CREATE INDEX IF NOT EXISTS idx_inbox_messages_status ON inbox_messages(status)`);
-
-    // Scheduled tasks table
-    database.run(`
-      CREATE TABLE IF NOT EXISTS scheduled_tasks (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE,
-        description TEXT,
-        cronExpression TEXT,
-        intervalMs INTEGER,
-        taskTemplate TEXT NOT NULL,
-        taskType TEXT,
-        tags TEXT DEFAULT '[]',
-        priority INTEGER DEFAULT 50,
-        targetAgentId TEXT,
-        enabled INTEGER DEFAULT 1,
-        lastRunAt TEXT,
-        nextRunAt TEXT,
-        createdByAgentId TEXT,
-        timezone TEXT DEFAULT 'UTC',
-        createdAt TEXT NOT NULL,
-        lastUpdatedAt TEXT NOT NULL,
-        CHECK (cronExpression IS NOT NULL OR intervalMs IS NOT NULL)
-      )
-    `);
-
-    // Scheduled tasks indexes
-    database.run(
-      `CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_enabled ON scheduled_tasks(enabled)`,
-    );
-    database.run(
-      `CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_nextRunAt ON scheduled_tasks(nextRunAt)`,
-    );
-
-    // Epics table - project-level task organization
-    database.run(`
-      CREATE TABLE IF NOT EXISTS epics (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE,
-        description TEXT,
-        goal TEXT NOT NULL,
-        prd TEXT,
-        plan TEXT,
-        status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'active', 'paused', 'completed', 'cancelled')),
-        priority INTEGER DEFAULT 50,
-        tags TEXT DEFAULT '[]',
-        createdByAgentId TEXT,
-        leadAgentId TEXT,
-        channelId TEXT,
-        researchDocPath TEXT,
-        planDocPath TEXT,
-        slackChannelId TEXT,
-        slackThreadTs TEXT,
-        githubRepo TEXT,
-        githubMilestone TEXT,
-        createdAt TEXT NOT NULL,
-        lastUpdatedAt TEXT NOT NULL,
-        startedAt TEXT,
-        completedAt TEXT,
-        FOREIGN KEY (createdByAgentId) REFERENCES agents(id) ON DELETE SET NULL,
-        FOREIGN KEY (leadAgentId) REFERENCES agents(id) ON DELETE SET NULL,
-        FOREIGN KEY (channelId) REFERENCES channels(id) ON DELETE SET NULL
-      )
-    `);
-
-    // Epics indexes
-    database.run(`CREATE INDEX IF NOT EXISTS idx_epics_status ON epics(status)`);
-    database.run(
-      `CREATE INDEX IF NOT EXISTS idx_epics_createdByAgentId ON epics(createdByAgentId)`,
-    );
-    database.run(`CREATE INDEX IF NOT EXISTS idx_epics_leadAgentId ON epics(leadAgentId)`);
-  });
-
-  initSchema();
-
-  // Seed default general channel if it doesn't exist
-  // Use a stable UUID for the general channel so it's consistent across restarts
-  const generalChannelId = "00000000-0000-4000-8000-000000000001";
+  // Migration: Remove restrictive CHECK constraint on agent_tasks.status
+  // Old databases have CHECK(status IN ('pending','in_progress','completed','failed'))
+  // which blocks 'cancelled', 'paused', 'offered', 'unassigned' statuses
   try {
-    // Migration: Fix old 'general' channel ID that wasn't a valid UUID
-    db.run(`UPDATE channels SET id = ? WHERE id = 'general'`, [generalChannelId]);
-    db.run(`UPDATE channel_messages SET channelId = ? WHERE channelId = 'general'`, [
-      generalChannelId,
-    ]);
-    db.run(`UPDATE channel_read_state SET channelId = ? WHERE channelId = 'general'`, [
-      generalChannelId,
-    ]);
-  } catch {
-    /* Migration not needed or already applied */
-  }
-  try {
-    db.run(
-      `
-      INSERT OR IGNORE INTO channels (id, name, description, type, createdAt)
-      VALUES (?, 'general', 'Default channel for all agents', 'public', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-    `,
-      [generalChannelId],
-    );
-  } catch {
-    /* Channel already exists */
-  }
-
-  // Migration: Add new columns to existing databases (SQLite doesn't support IF NOT EXISTS for columns)
-  // Agent task columns
-  try {
-    db.run(
-      `ALTER TABLE agent_tasks ADD COLUMN source TEXT NOT NULL DEFAULT 'mcp' CHECK(source IN ('mcp', 'slack', 'api'))`,
-    );
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN slackChannelId TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN slackThreadTs TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN slackUserId TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN taskType TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN tags TEXT DEFAULT '[]'`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN priority INTEGER DEFAULT 50`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN dependsOn TEXT DEFAULT '[]'`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN offeredTo TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN offeredAt TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN acceptedAt TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN rejectionReason TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN creatorAgentId TEXT`);
-  } catch {
-    /* exists */
-  }
-  // Mention-to-task columns
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN mentionMessageId TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN mentionChannelId TEXT`);
-  } catch {
-    /* exists */
-  }
-  // GitHub-specific columns
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN githubRepo TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN githubEventType TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN githubNumber INTEGER`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN githubCommentId INTEGER`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN githubAuthor TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN githubUrl TEXT`);
-  } catch {
-    /* exists */
-  }
-  // Agent profile columns
-  try {
-    db.run(`ALTER TABLE agents ADD COLUMN description TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agents ADD COLUMN role TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE agents ADD COLUMN capabilities TEXT DEFAULT '[]'`);
-  } catch {
-    /* exists */
-  }
-  // Concurrency limit column
-  try {
-    db.run(`ALTER TABLE agents ADD COLUMN maxTasks INTEGER DEFAULT 1`);
-  } catch {
-    /* exists */
-  }
-
-  // Polling limit tracking column
-  try {
-    db.run(`ALTER TABLE agents ADD COLUMN emptyPollCount INTEGER DEFAULT 0`);
-  } catch {
-    /* exists */
-  }
-
-  // CLAUDE.md storage column
-  try {
-    db.run(`ALTER TABLE agents ADD COLUMN claudeMd TEXT`);
-  } catch {
-    /* exists */
-  }
-
-  // Service PM2 columns migration
-  try {
-    db.run(`ALTER TABLE services ADD COLUMN script TEXT NOT NULL DEFAULT ''`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE services ADD COLUMN cwd TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE services ADD COLUMN interpreter TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE services ADD COLUMN args TEXT`);
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`ALTER TABLE services ADD COLUMN env TEXT`);
-  } catch {
-    /* exists */
-  }
-
-  // Migration: Add processing_since column to channel_read_state for Phase 3
-  try {
-    db.run(`ALTER TABLE channel_read_state ADD COLUMN processing_since TEXT`);
-  } catch {
-    /* exists */
-  }
-
-  // Migration: Add notifiedAt column to agent_tasks for Phase 4
-  try {
-    db.run(`ALTER TABLE agent_tasks ADD COLUMN notifiedAt TEXT`);
-  } catch {
-    /* exists */
-  }
-
-  // Migration: Update inbox_messages CHECK constraint to include 'processing' status
-  // SQLite doesn't support ALTER TABLE MODIFY COLUMN, so we need to recreate the table
-  try {
-    // Check if the table schema already includes 'processing' in the CHECK constraint
-    const schemaInfo = db
+    const taskSchemaInfo = db
       .prepare<{ sql: string | null }, []>(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inbox_messages'",
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_tasks'",
       )
       .get();
 
-    const needsMigration = schemaInfo?.sql && !schemaInfo.sql.includes("'processing'");
+    const schemaSql = taskSchemaInfo?.sql ?? "";
+    const hasStatusCheck = /status\s+TEXT\b[^,]*\bCHECK\s*\(\s*status\s+IN\s*\(/i.test(schemaSql);
+    const statusAllowsCancelled = /status\s+IN\s*\([^)]*'cancelled'/i.test(schemaSql);
+    const needsStatusMigration = hasStatusCheck && !statusAllowsCancelled;
 
-    if (needsMigration) {
-      console.log(
-        "[Migration] Updating inbox_messages CHECK constraint to include 'processing' status",
-      );
+    if (needsStatusMigration) {
+      console.log("[Migration] Removing restrictive CHECK constraint on agent_tasks.status");
       db.run("PRAGMA foreign_keys=off");
 
       db.run(`
-        CREATE TABLE inbox_messages_new (
+        CREATE TABLE agent_tasks_new (
           id TEXT PRIMARY KEY,
-          agentId TEXT NOT NULL,
-          content TEXT NOT NULL,
-          source TEXT NOT NULL DEFAULT 'slack',
-          status TEXT NOT NULL DEFAULT 'unread' CHECK(status IN ('unread', 'processing', 'read', 'responded', 'delegated')),
+          agentId TEXT,
+          creatorAgentId TEXT,
+          task TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          source TEXT NOT NULL DEFAULT 'mcp' CHECK(source IN ('mcp', 'slack', 'api', 'github', 'agentmail', 'system', 'schedule')),
+          taskType TEXT,
+          tags TEXT DEFAULT '[]',
+          priority INTEGER DEFAULT 50,
+          dependsOn TEXT DEFAULT '[]',
+          offeredTo TEXT,
+          offeredAt TEXT,
+          acceptedAt TEXT,
+          rejectionReason TEXT,
           slackChannelId TEXT,
           slackThreadTs TEXT,
           slackUserId TEXT,
-          matchedText TEXT,
-          delegatedToTaskId TEXT,
-          responseText TEXT,
           createdAt TEXT NOT NULL,
           lastUpdatedAt TEXT NOT NULL,
-          FOREIGN KEY (agentId) REFERENCES agents(id) ON DELETE CASCADE,
-          FOREIGN KEY (delegatedToTaskId) REFERENCES agent_tasks(id) ON DELETE SET NULL
+          finishedAt TEXT,
+          failureReason TEXT,
+          output TEXT,
+          progress TEXT,
+          notifiedAt TEXT,
+          mentionMessageId TEXT,
+          mentionChannelId TEXT,
+          githubRepo TEXT,
+          githubEventType TEXT,
+          githubNumber INTEGER,
+          githubCommentId INTEGER,
+          githubAuthor TEXT,
+          githubUrl TEXT,
+          epicId TEXT REFERENCES epics(id) ON DELETE SET NULL,
+          parentTaskId TEXT,
+          claudeSessionId TEXT,
+          agentmailInboxId TEXT,
+          agentmailMessageId TEXT,
+          agentmailThreadId TEXT,
+          model TEXT,
+          scheduleId TEXT
         )
       `);
 
-      db.run("INSERT INTO inbox_messages_new SELECT * FROM inbox_messages");
-      db.run("DROP TABLE inbox_messages");
-      db.run("ALTER TABLE inbox_messages_new RENAME TO inbox_messages");
+      // Copy all data — use column list to handle any column ordering differences
+      db.run(`
+        INSERT INTO agent_tasks_new (
+          id, agentId, creatorAgentId, task, status, source, taskType, tags,
+          priority, dependsOn, offeredTo, offeredAt, acceptedAt, rejectionReason,
+          slackChannelId, slackThreadTs, slackUserId, createdAt, lastUpdatedAt,
+          finishedAt, failureReason, output, progress, notifiedAt,
+          mentionMessageId, mentionChannelId, githubRepo, githubEventType,
+          githubNumber, githubCommentId, githubAuthor, githubUrl,
+          epicId, parentTaskId, claudeSessionId,
+          agentmailInboxId, agentmailMessageId, agentmailThreadId,
+          model, scheduleId
+        )
+        SELECT
+          id, agentId, creatorAgentId, task, status, source, taskType, tags,
+          priority, dependsOn, offeredTo, offeredAt, acceptedAt, rejectionReason,
+          slackChannelId, slackThreadTs, slackUserId, createdAt, lastUpdatedAt,
+          finishedAt, failureReason, output, progress, notifiedAt,
+          mentionMessageId, mentionChannelId, githubRepo, githubEventType,
+          githubNumber, githubCommentId, githubAuthor, githubUrl,
+          epicId, parentTaskId, claudeSessionId,
+          agentmailInboxId, agentmailMessageId, agentmailThreadId,
+          model, scheduleId
+        FROM agent_tasks
+      `);
 
-      // Recreate indexes
-      db.run("CREATE INDEX IF NOT EXISTS idx_inbox_messages_agentId ON inbox_messages(agentId)");
-      db.run("CREATE INDEX IF NOT EXISTS idx_inbox_messages_status ON inbox_messages(status)");
+      db.run("DROP TABLE agent_tasks");
+      db.run("ALTER TABLE agent_tasks_new RENAME TO agent_tasks");
+
+      // Recreate all indexes
+      db.run("CREATE INDEX IF NOT EXISTS idx_agent_tasks_agentId ON agent_tasks(agentId)");
+      db.run("CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks(status)");
+      db.run("CREATE INDEX IF NOT EXISTS idx_agent_tasks_offeredTo ON agent_tasks(offeredTo)");
+      db.run("CREATE INDEX IF NOT EXISTS idx_agent_tasks_taskType ON agent_tasks(taskType)");
+      db.run("CREATE INDEX IF NOT EXISTS idx_agent_tasks_epicId ON agent_tasks(epicId)");
+      db.run(
+        "CREATE INDEX IF NOT EXISTS idx_agent_tasks_agentmailThreadId ON agent_tasks(agentmailThreadId)",
+      );
+      db.run("CREATE INDEX IF NOT EXISTS idx_agent_tasks_schedule_id ON agent_tasks(scheduleId)");
 
       db.run("PRAGMA foreign_keys=on");
-      console.log("[Migration] Successfully updated inbox_messages table");
+      console.log("[Migration] Successfully removed CHECK constraint on agent_tasks.status");
     }
   } catch (e) {
-    console.error("[Migration] Failed to update inbox_messages CHECK constraint:", e);
+    console.error("[Migration] Failed to update agent_tasks CHECK constraint:", e);
     try {
       db.run("PRAGMA foreign_keys=on");
-    } catch {}
+    } catch (cleanupError) {
+      console.error("[Migration] Failed to re-enable SQLite foreign_keys pragma:", cleanupError);
+    }
     throw e;
   }
 
-  // Create indexes on new columns (after migrations add them)
-  try {
-    db.run(`CREATE INDEX IF NOT EXISTS idx_agent_tasks_offeredTo ON agent_tasks(offeredTo)`);
-  } catch {
-    /* exists or column missing */
-  }
-  try {
-    db.run(`CREATE INDEX IF NOT EXISTS idx_agent_tasks_taskType ON agent_tasks(taskType)`);
-  } catch {
-    /* exists or column missing */
-  }
-
-  // Epic feature migration: Add epicId to agent_tasks
-  try {
-    db.run(
-      `ALTER TABLE agent_tasks ADD COLUMN epicId TEXT REFERENCES epics(id) ON DELETE SET NULL`,
-    );
-  } catch {
-    /* exists */
-  }
-  try {
-    db.run(`CREATE INDEX IF NOT EXISTS idx_agent_tasks_epicId ON agent_tasks(epicId)`);
-  } catch {
-    /* exists */
-  }
-
-  // Epic progress trigger migration: Add progressNotifiedAt to epics
-  try {
-    db.run(`ALTER TABLE epics ADD COLUMN progressNotifiedAt TEXT`);
-  } catch {
-    /* exists */
-  }
-
-  // Epic channel migration: Add channelId to epics
-  try {
-    db.run(
-      `ALTER TABLE epics ADD COLUMN channelId TEXT REFERENCES channels(id) ON DELETE SET NULL`,
-    );
-  } catch {
-    /* exists */
-  }
+  // Backfill: Seed v1 for existing agents that don't have any context versions yet
+  seedContextVersions();
 
   return db;
 }
@@ -659,6 +200,218 @@ export function closeDb(): void {
 }
 
 // ============================================================================
+// Context Versioning
+// ============================================================================
+
+const VERSIONABLE_FIELDS: VersionableField[] = [
+  "soulMd",
+  "identityMd",
+  "toolsMd",
+  "claudeMd",
+  "setupScript",
+];
+
+function ensureAgentProfileColumns(database: Database): void {
+  const existingColumns = new Set(
+    database
+      .prepare<{ name: string }, []>("PRAGMA table_info(agents)")
+      .all()
+      .map((row) => row.name),
+  );
+
+  for (const column of VERSIONABLE_FIELDS) {
+    if (!existingColumns.has(column)) {
+      try {
+        database.run(`ALTER TABLE agents ADD COLUMN ${column} TEXT`);
+      } catch (error) {
+        console.error(`[Migration] Failed to add missing agents.${column} column`, error);
+        throw error;
+      }
+    }
+  }
+}
+
+function computeContentHash(content: string): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(content);
+  return hasher.digest("hex");
+}
+
+type ContextVersionRow = {
+  id: string;
+  agentId: string;
+  field: string;
+  content: string;
+  version: number;
+  changeSource: string;
+  changedByAgentId: string | null;
+  changeReason: string | null;
+  contentHash: string;
+  previousVersionId: string | null;
+  createdAt: string;
+};
+
+function rowToContextVersion(row: ContextVersionRow): ContextVersion {
+  return {
+    id: row.id,
+    agentId: row.agentId,
+    field: row.field as VersionableField,
+    content: row.content,
+    version: row.version,
+    changeSource: row.changeSource as ChangeSource,
+    changedByAgentId: row.changedByAgentId,
+    changeReason: row.changeReason,
+    contentHash: row.contentHash,
+    previousVersionId: row.previousVersionId,
+    createdAt: row.createdAt,
+  };
+}
+
+export function createContextVersion(params: {
+  agentId: string;
+  field: VersionableField;
+  content: string;
+  version: number;
+  changeSource: ChangeSource;
+  changedByAgentId?: string | null;
+  changeReason?: string | null;
+  contentHash: string;
+  previousVersionId?: string | null;
+}): ContextVersion {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  const row = getDb()
+    .prepare<
+      ContextVersionRow,
+      [
+        string,
+        string,
+        string,
+        string,
+        number,
+        string,
+        string | null,
+        string | null,
+        string,
+        string | null,
+        string,
+      ]
+    >(
+      `INSERT INTO context_versions (id, agentId, field, content, version, changeSource, changedByAgentId, changeReason, contentHash, previousVersionId, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+    )
+    .get(
+      id,
+      params.agentId,
+      params.field,
+      params.content,
+      params.version,
+      params.changeSource,
+      params.changedByAgentId ?? null,
+      params.changeReason ?? null,
+      params.contentHash,
+      params.previousVersionId ?? null,
+      now,
+    );
+
+  if (!row) throw new Error("Failed to create context version");
+  return rowToContextVersion(row);
+}
+
+export function getLatestContextVersion(
+  agentId: string,
+  field: VersionableField,
+): ContextVersion | null {
+  const row = getDb()
+    .prepare<ContextVersionRow, [string, string]>(
+      `SELECT * FROM context_versions WHERE agentId = ? AND field = ? ORDER BY version DESC LIMIT 1`,
+    )
+    .get(agentId, field);
+
+  return row ? rowToContextVersion(row) : null;
+}
+
+export function getContextVersion(id: string): ContextVersion | null {
+  const row = getDb()
+    .prepare<ContextVersionRow, [string]>(`SELECT * FROM context_versions WHERE id = ?`)
+    .get(id);
+
+  return row ? rowToContextVersion(row) : null;
+}
+
+export function getContextVersionHistory(params: {
+  agentId: string;
+  field?: VersionableField;
+  limit?: number;
+}): ContextVersion[] {
+  const limit = params.limit ?? 10;
+
+  if (params.field) {
+    const rows = getDb()
+      .prepare<ContextVersionRow, [string, string, number]>(
+        `SELECT * FROM context_versions WHERE agentId = ? AND field = ? ORDER BY version DESC LIMIT ?`,
+      )
+      .all(params.agentId, params.field, limit);
+    return rows.map(rowToContextVersion);
+  }
+
+  const rows = getDb()
+    .prepare<ContextVersionRow, [string, number]>(
+      `SELECT * FROM context_versions WHERE agentId = ? ORDER BY createdAt DESC LIMIT ?`,
+    )
+    .all(params.agentId, limit);
+  return rows.map(rowToContextVersion);
+}
+
+/**
+ * Seed v1 context versions for existing agents that don't have any versions yet.
+ * Called during migration.
+ */
+function seedContextVersions(): void {
+  const database = getDb();
+  const agents = database
+    .prepare<
+      {
+        id: string;
+        soulMd: string | null;
+        identityMd: string | null;
+        toolsMd: string | null;
+        claudeMd: string | null;
+        setupScript: string | null;
+      },
+      []
+    >(`SELECT id, soulMd, identityMd, toolsMd, claudeMd, setupScript FROM agents`)
+    .all();
+
+  for (const agent of agents) {
+    for (const field of VERSIONABLE_FIELDS) {
+      const content = agent[field];
+      if (!content) continue;
+
+      // Check if a version already exists for this agent+field
+      const existing = database
+        .prepare<{ id: string }, [string, string]>(
+          `SELECT id FROM context_versions WHERE agentId = ? AND field = ? LIMIT 1`,
+        )
+        .get(agent.id, field);
+      if (existing) continue;
+
+      const id = crypto.randomUUID();
+      const hash = computeContentHash(content);
+      const now = new Date().toISOString();
+
+      database
+        .prepare(
+          `INSERT INTO context_versions (id, agentId, field, content, version, changeSource, contentHash, createdAt)
+           VALUES (?, ?, ?, ?, 1, 'system', ?, ?)`,
+        )
+        .run(id, agent.id, field, content, hash, now);
+    }
+  }
+}
+
+// ============================================================================
 // Agent Queries
 // ============================================================================
 
@@ -673,6 +426,11 @@ type AgentRow = {
   maxTasks: number | null;
   emptyPollCount: number | null;
   claudeMd: string | null;
+  soulMd: string | null;
+  identityMd: string | null;
+  setupScript: string | null;
+  toolsMd: string | null;
+  lastActivityAt: string | null;
   createdAt: string;
   lastUpdatedAt: string;
 };
@@ -689,6 +447,11 @@ function rowToAgent(row: AgentRow): Agent {
     maxTasks: row.maxTasks ?? 1,
     emptyPollCount: row.emptyPollCount ?? 0,
     claudeMd: row.claudeMd ?? undefined,
+    soulMd: row.soulMd ?? undefined,
+    identityMd: row.identityMd ?? undefined,
+    setupScript: row.setupScript ?? undefined,
+    toolsMd: row.toolsMd ?? undefined,
+    lastActivityAt: row.lastActivityAt ?? undefined,
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
   };
@@ -736,6 +499,11 @@ export function getAllAgents(): Agent[] {
   return agentQueries.getAll().all().map(rowToAgent);
 }
 
+export function getLeadAgent(): Agent | null {
+  const agents = getAllAgents();
+  return agents.find((a) => a.isLead) ?? null;
+}
+
 export function updateAgentStatus(id: string, status: AgentStatus): Agent | null {
   const oldAgent = getAgentById(id);
   const row = agentQueries.updateStatus().get(status, id);
@@ -760,6 +528,14 @@ export function updateAgentMaxTasks(id: string, maxTasks: number): Agent | null 
     )
     .get(maxTasks, id);
   return row ? rowToAgent(row) : null;
+}
+
+export function updateAgentActivity(id: string): void {
+  getDb()
+    .prepare<null, [string]>(
+      `UPDATE agents SET lastActivityAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`,
+    )
+    .run(id);
 }
 
 // ============================================================================
@@ -895,15 +671,26 @@ type AgentTaskRow = {
   slackChannelId: string | null;
   slackThreadTs: string | null;
   slackUserId: string | null;
-  githubRepo: string | null;
-  githubEventType: string | null;
-  githubNumber: number | null;
-  githubCommentId: number | null;
-  githubAuthor: string | null;
-  githubUrl: string | null;
+  vcsProvider: string | null;
+  vcsRepo: string | null;
+  vcsEventType: string | null;
+  vcsNumber: number | null;
+  vcsCommentId: number | null;
+  vcsAuthor: string | null;
+  vcsUrl: string | null;
+  agentmailInboxId: string | null;
+  agentmailMessageId: string | null;
+  agentmailThreadId: string | null;
   mentionMessageId: string | null;
   mentionChannelId: string | null;
   epicId: string | null;
+  dir: string | null;
+  parentTaskId: string | null;
+  claudeSessionId: string | null;
+  model: string | null;
+  scheduleId: string | null;
+  workflowRunId: string | null;
+  workflowRunStepId: string | null;
   createdAt: string;
   lastUpdatedAt: string;
   finishedAt: string | null;
@@ -932,15 +719,26 @@ function rowToAgentTask(row: AgentTaskRow): AgentTask {
     slackChannelId: row.slackChannelId ?? undefined,
     slackThreadTs: row.slackThreadTs ?? undefined,
     slackUserId: row.slackUserId ?? undefined,
-    githubRepo: row.githubRepo ?? undefined,
-    githubEventType: row.githubEventType ?? undefined,
-    githubNumber: row.githubNumber ?? undefined,
-    githubCommentId: row.githubCommentId ?? undefined,
-    githubAuthor: row.githubAuthor ?? undefined,
-    githubUrl: row.githubUrl ?? undefined,
+    vcsProvider: (row.vcsProvider as "github" | "gitlab" | null) ?? undefined,
+    vcsRepo: row.vcsRepo ?? undefined,
+    vcsEventType: row.vcsEventType ?? undefined,
+    vcsNumber: row.vcsNumber ?? undefined,
+    vcsCommentId: row.vcsCommentId ?? undefined,
+    vcsAuthor: row.vcsAuthor ?? undefined,
+    vcsUrl: row.vcsUrl ?? undefined,
+    agentmailInboxId: row.agentmailInboxId ?? undefined,
+    agentmailMessageId: row.agentmailMessageId ?? undefined,
+    agentmailThreadId: row.agentmailThreadId ?? undefined,
     mentionMessageId: row.mentionMessageId ?? undefined,
     mentionChannelId: row.mentionChannelId ?? undefined,
     epicId: row.epicId ?? undefined,
+    dir: row.dir ?? undefined,
+    parentTaskId: row.parentTaskId ?? undefined,
+    claudeSessionId: row.claudeSessionId ?? undefined,
+    model: (row.model as "haiku" | "sonnet" | "opus" | null) ?? undefined,
+    scheduleId: row.scheduleId ?? undefined,
+    workflowRunId: row.workflowRunId ?? undefined,
+    workflowRunStepId: row.workflowRunStepId ?? undefined,
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
     finishedAt: row.finishedAt ?? undefined,
@@ -1006,7 +804,10 @@ export const taskQueries = {
 
   setProgress: () =>
     getDb().prepare<AgentTaskRow, [string, string]>(
-      "UPDATE agent_tasks SET progress = ?, status = 'in_progress', lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? RETURNING *",
+      `UPDATE agent_tasks SET progress = ?,
+       status = CASE WHEN status IN ('completed', 'failed', 'cancelled') THEN status ELSE 'in_progress' END,
+       lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       WHERE id = ? RETURNING *`,
     ),
 
   delete: () => getDb().prepare<null, [string]>("DELETE FROM agent_tasks WHERE id = ?"),
@@ -1071,10 +872,17 @@ export function getPendingTaskForAgent(agentId: string): AgentTask | null {
 
 export function startTask(taskId: string): AgentTask | null {
   const oldTask = getTaskById(taskId);
+  if (!oldTask) return null;
+
+  // Guard: never revive tasks that are already in a terminal state
+  if (["completed", "failed", "cancelled"].includes(oldTask.status)) {
+    return null;
+  }
+
   const row = getDb()
     .prepare<AgentTaskRow, [string]>(
       `UPDATE agent_tasks SET status = 'in_progress', lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? RETURNING *`,
+       WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled') RETURNING *`,
     )
     .get(taskId);
   if (row && oldTask) {
@@ -1096,6 +904,18 @@ export function getTaskById(id: string): AgentTask | null {
   return row ? rowToAgentTask(row) : null;
 }
 
+export function updateTaskClaudeSessionId(
+  taskId: string,
+  claudeSessionId: string,
+): AgentTask | null {
+  const row = getDb()
+    .prepare<AgentTaskRow, [string, string, string]>(
+      `UPDATE agent_tasks SET claudeSessionId = ?, lastUpdatedAt = ? WHERE id = ? RETURNING *`,
+    )
+    .get(claudeSessionId, new Date().toISOString(), taskId);
+  return row ? rowToAgentTask(row) : null;
+}
+
 export function getTasksByAgentId(agentId: string): AgentTask[] {
   return taskQueries.getByAgentId().all(agentId).map(rowToAgentTask);
 }
@@ -1105,25 +925,29 @@ export function getTasksByStatus(status: AgentTaskStatus): AgentTask[] {
 }
 
 /**
- * Find a task by GitHub repo and issue/PR number
- * Returns the most recent non-completed/failed task for this GitHub entity
+ * Find a task by VCS repo and issue/PR/MR number.
+ * Returns the most recent non-completed/failed task for this VCS entity.
  */
-export function findTaskByGitHub(githubRepo: string, githubNumber: number): AgentTask | null {
+export function findTaskByVcs(vcsRepo: string, vcsNumber: number): AgentTask | null {
   const row = getDb()
     .prepare<AgentTaskRow, [string, number]>(
       `SELECT * FROM agent_tasks
-       WHERE githubRepo = ? AND githubNumber = ?
+       WHERE vcsRepo = ? AND vcsNumber = ?
        AND status NOT IN ('completed', 'failed')
        ORDER BY createdAt DESC
        LIMIT 1`,
     )
-    .get(githubRepo, githubNumber);
+    .get(vcsRepo, vcsNumber);
   return row ? rowToAgentTask(row) : null;
 }
+
+/** @deprecated Use findTaskByVcs instead */
+export const findTaskByGitHub = findTaskByVcs;
 
 export interface TaskFilters {
   status?: AgentTaskStatus;
   agentId?: string;
+  epicId?: string;
   search?: string;
   // New filters
   unassigned?: boolean;
@@ -1131,7 +955,10 @@ export interface TaskFilters {
   readyOnly?: boolean;
   taskType?: string;
   tags?: string[];
+  scheduleId?: string;
   limit?: number;
+  offset?: number;
+  includeHeartbeat?: boolean;
 }
 
 export function getAllTasks(filters?: TaskFilters): AgentTask[] {
@@ -1146,6 +973,11 @@ export function getAllTasks(filters?: TaskFilters): AgentTask[] {
   if (filters?.agentId) {
     conditions.push("agentId = ?");
     params.push(filters.agentId);
+  }
+
+  if (filters?.epicId) {
+    conditions.push("epicId = ?");
+    params.push(filters.epicId);
   }
 
   if (filters?.search) {
@@ -1177,9 +1009,20 @@ export function getAllTasks(filters?: TaskFilters): AgentTask[] {
     }
   }
 
+  if (filters?.scheduleId) {
+    conditions.push("scheduleId = ?");
+    params.push(filters.scheduleId);
+  }
+
+  // Exclude heartbeat tasks by default
+  if (!filters?.includeHeartbeat) {
+    conditions.push("(IFNULL(taskType, '') != 'heartbeat' AND tags NOT LIKE '%\"heartbeat\"%')");
+  }
+
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   const limit = filters?.limit ?? 25;
-  const query = `SELECT * FROM agent_tasks ${whereClause} ORDER BY lastUpdatedAt DESC, priority DESC LIMIT ${limit}`;
+  const offset = filters?.offset ?? 0;
+  const query = `SELECT * FROM agent_tasks ${whereClause} ORDER BY lastUpdatedAt DESC, priority DESC LIMIT ${limit} OFFSET ${offset}`;
 
   let tasks = getDb()
     .prepare<AgentTaskRow, (string | AgentTaskStatus)[]>(query)
@@ -1215,6 +1058,11 @@ export function getTasksCount(filters?: Omit<TaskFilters, "limit" | "readyOnly">
     params.push(filters.agentId);
   }
 
+  if (filters?.epicId) {
+    conditions.push("epicId = ?");
+    params.push(filters.epicId);
+  }
+
   if (filters?.search) {
     conditions.push("task LIKE ?");
     params.push(`%${filters.search}%`);
@@ -1240,6 +1088,16 @@ export function getTasksCount(filters?: Omit<TaskFilters, "limit" | "readyOnly">
     for (const tag of filters.tags) {
       params.push(`%"${tag}"%`);
     }
+  }
+
+  if (filters?.scheduleId) {
+    conditions.push("scheduleId = ?");
+    params.push(filters.scheduleId);
+  }
+
+  // Exclude heartbeat tasks by default
+  if (!filters?.includeHeartbeat) {
+    conditions.push("(IFNULL(taskType, '') != 'heartbeat' AND tags NOT LIKE '%\"heartbeat\"%')");
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -1315,10 +1173,10 @@ export function getCompletedSlackTasks(): AgentTask[] {
   return getDb()
     .prepare<AgentTaskRow, []>(
       `SELECT * FROM agent_tasks
-       WHERE source = 'slack'
-       AND slackChannelId IS NOT NULL
+       WHERE slackChannelId IS NOT NULL
        AND status IN ('completed', 'failed')
-       ORDER BY lastUpdatedAt DESC`,
+       ORDER BY lastUpdatedAt DESC
+       LIMIT 200`,
     )
     .all()
     .map(rowToAgentTask);
@@ -1363,33 +1221,51 @@ export function markTasksNotified(taskIds: string[]): number {
   return result.changes;
 }
 
+/**
+ * Reset notifiedAt for tasks, allowing them to be re-delivered on next poll.
+ * Used when a trigger was consumed but the session that should process it failed.
+ * This prevents permanent notification loss from the mark-before-process race.
+ */
+export function resetTasksNotified(taskIds: string[]): number {
+  if (taskIds.length === 0) return 0;
+
+  const placeholders = taskIds.map(() => "?").join(",");
+
+  const result = getDb().run(
+    `UPDATE agent_tasks SET notifiedAt = NULL
+     WHERE id IN (${placeholders}) AND notifiedAt IS NOT NULL`,
+    taskIds,
+  );
+
+  return result.changes;
+}
+
 export function getInProgressSlackTasks(): AgentTask[] {
   return getDb()
     .prepare<AgentTaskRow, []>(
       `SELECT * FROM agent_tasks
-       WHERE source = 'slack'
-       AND slackChannelId IS NOT NULL
+       WHERE slackChannelId IS NOT NULL
        AND status = 'in_progress'
-       ORDER BY lastUpdatedAt DESC`,
+       ORDER BY lastUpdatedAt DESC
+       LIMIT 200`,
     )
     .all()
     .map(rowToAgentTask);
 }
 
 /**
- * Find an agent that has an active task or inbox message in a specific Slack thread.
- * Used for routing thread follow-up messages to the same agent.
- * Checks both tasks (for workers) and inbox_messages (for leads).
+ * Find the most recent agent associated with a specific Slack thread.
+ * No status filter — returns the last agent that touched this thread regardless of task state.
+ * This is intentional: follow-up messages should route to the same agent even after task completion.
+ * Callers (e.g. assistant.ts) apply their own status checks (e.g. agent.status !== "offline").
  */
 export function getAgentWorkingOnThread(channelId: string, threadTs: string): Agent | null {
-  // First check tasks (for workers)
   const taskRow = getDb()
     .prepare<AgentTaskRow, [string, string]>(
       `SELECT * FROM agent_tasks
        WHERE source = 'slack'
        AND slackChannelId = ?
        AND slackThreadTs = ?
-       AND status IN ('in_progress', 'pending')
        ORDER BY createdAt DESC
        LIMIT 1`,
     )
@@ -1397,21 +1273,45 @@ export function getAgentWorkingOnThread(channelId: string, threadTs: string): Ag
 
   if (taskRow?.agentId) return getAgentById(taskRow.agentId);
 
-  // Then check inbox_messages (for leads)
-  const inboxRow = getDb()
-    .prepare<{ agentId: string }, [string, string]>(
-      `SELECT agentId FROM inbox_messages
+  return null;
+}
+
+/**
+ * Find the latest active (in_progress or pending) task in a specific Slack thread.
+ * Used for dependency chaining in additive Slack buffer.
+ */
+export function getLatestActiveTaskInThread(channelId: string, threadTs: string): AgentTask | null {
+  const row = getDb()
+    .prepare<AgentTaskRow, [string, string]>(
+      `SELECT * FROM agent_tasks
        WHERE source = 'slack'
        AND slackChannelId = ?
+       AND slackThreadTs = ?
+       AND status IN ('in_progress', 'pending')
+       ORDER BY createdAt DESC, rowid DESC
+       LIMIT 1`,
+    )
+    .get(channelId, threadTs);
+
+  return row ? rowToAgentTask(row) : null;
+}
+
+/**
+ * Find the most recent task in a Slack thread, regardless of source or status.
+ * Unlike getAgentWorkingOnThread (which filters source='slack'), this finds ALL tasks
+ * including worker tasks that inherited Slack metadata via parentTaskId.
+ */
+export function getMostRecentTaskInThread(channelId: string, threadTs: string): AgentTask | null {
+  const row = getDb()
+    .prepare<AgentTaskRow, [string, string]>(
+      `SELECT * FROM agent_tasks
+       WHERE slackChannelId = ?
        AND slackThreadTs = ?
        ORDER BY createdAt DESC
        LIMIT 1`,
     )
     .get(channelId, threadTs);
-
-  if (inboxRow?.agentId) return getAgentById(inboxRow.agentId);
-
-  return null;
+  return row ? rowToAgentTask(row) : null;
 }
 
 export function completeTask(id: string, output?: string): AgentTask | null {
@@ -1434,6 +1334,17 @@ export function completeTask(id: string, output?: string): AgentTask | null {
         newValue: "completed",
       });
     } catch {}
+    try {
+      import("../workflows/event-bus").then(({ workflowEventBus }) => {
+        workflowEventBus.emit("task.completed", {
+          taskId: id,
+          output,
+          agentId: row.agentId,
+          workflowRunId: row.workflowRunId,
+          workflowRunStepId: row.workflowRunStepId,
+        });
+      });
+    } catch {}
   }
 
   return row ? rowToAgentTask(row) : null;
@@ -1454,6 +1365,17 @@ export function failTask(id: string, reason: string): AgentTask | null {
         metadata: { reason },
       });
     } catch {}
+    try {
+      import("../workflows/event-bus").then(({ workflowEventBus }) => {
+        workflowEventBus.emit("task.failed", {
+          taskId: id,
+          failureReason: reason,
+          agentId: row.agentId,
+          workflowRunId: row.workflowRunId,
+          workflowRunStepId: row.workflowRunStepId,
+        });
+      });
+    } catch {}
   }
   return row ? rowToAgentTask(row) : null;
 }
@@ -1462,8 +1384,9 @@ export function cancelTask(id: string, reason?: string): AgentTask | null {
   const oldTask = getTaskById(id);
   if (!oldTask) return null;
 
-  // Only cancel tasks that are in progress or pending
-  if (!["pending", "in_progress"].includes(oldTask.status)) {
+  // Only cancel tasks that are not already in a terminal state
+  const terminalStatuses = ["completed", "failed", "cancelled"];
+  if (terminalStatuses.includes(oldTask.status)) {
     return null;
   }
 
@@ -1480,6 +1403,16 @@ export function cancelTask(id: string, reason?: string): AgentTask | null {
         oldValue: oldTask.status,
         newValue: "cancelled",
         metadata: reason ? { reason } : undefined,
+      });
+    } catch {}
+    try {
+      import("../workflows/event-bus").then(({ workflowEventBus }) => {
+        workflowEventBus.emit("task.cancelled", {
+          taskId: id,
+          agentId: row.agentId,
+          workflowRunId: row.workflowRunId,
+          workflowRunStepId: row.workflowRunStepId,
+        });
       });
     } catch {}
   }
@@ -1770,15 +1703,60 @@ export interface CreateTaskOptions {
   slackChannelId?: string;
   slackThreadTs?: string;
   slackUserId?: string;
-  githubRepo?: string;
-  githubEventType?: string;
-  githubNumber?: number;
-  githubCommentId?: number;
-  githubAuthor?: string;
-  githubUrl?: string;
+  vcsProvider?: "github" | "gitlab";
+  vcsRepo?: string;
+  vcsEventType?: string;
+  vcsNumber?: number;
+  vcsCommentId?: number;
+  vcsAuthor?: string;
+  vcsUrl?: string;
+  agentmailInboxId?: string;
+  agentmailMessageId?: string;
+  agentmailThreadId?: string;
   mentionMessageId?: string;
   mentionChannelId?: string;
   epicId?: string;
+  dir?: string;
+  parentTaskId?: string;
+  model?: string;
+  scheduleId?: string;
+  workflowRunId?: string;
+  workflowRunStepId?: string;
+}
+
+/**
+ * Find recent tasks within a time window for deduplication checks.
+ * Returns tasks created in the last N minutes, optionally filtered by creator or target agent.
+ */
+export function findRecentSimilarTasks(opts: {
+  windowMinutes?: number;
+  creatorAgentId?: string;
+  agentId?: string;
+  limit?: number;
+}): AgentTask[] {
+  const since = new Date(Date.now() - (opts.windowMinutes ?? 10) * 60 * 1000).toISOString();
+  const conditions: string[] = ["createdAt > ?"];
+  const params: (string | number)[] = [since];
+
+  // Exclude completed/failed/cancelled tasks — only active or recently created
+  conditions.push("status NOT IN ('completed', 'failed', 'cancelled')");
+
+  if (opts.creatorAgentId) {
+    conditions.push("creatorAgentId = ?");
+    params.push(opts.creatorAgentId);
+  }
+  if (opts.agentId) {
+    conditions.push("agentId = ?");
+    params.push(opts.agentId);
+  }
+
+  const limit = opts.limit ?? 50;
+  const query = `SELECT * FROM agent_tasks WHERE ${conditions.join(" AND ")} ORDER BY createdAt DESC LIMIT ${limit}`;
+
+  return getDb()
+    .prepare<AgentTaskRow, (string | number)[]>(query)
+    .all(...params)
+    .map(rowToAgentTask);
 }
 
 export function createTaskExtended(task: string, options?: CreateTaskOptions): AgentTask {
@@ -1792,15 +1770,39 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
         ? "backlog"
         : "unassigned";
 
+  // Inherit Slack/AgentMail metadata from parent task (unless explicitly overridden)
+  if (options?.parentTaskId) {
+    const parent = getTaskById(options.parentTaskId);
+    if (parent) {
+      if (parent.slackChannelId && !options.slackChannelId) {
+        options.slackChannelId = parent.slackChannelId;
+      }
+      if (parent.slackThreadTs && !options.slackThreadTs) {
+        options.slackThreadTs = parent.slackThreadTs;
+      }
+      if (parent.slackUserId && !options.slackUserId) {
+        options.slackUserId = parent.slackUserId;
+      }
+      if (parent.agentmailInboxId && !options.agentmailInboxId) {
+        options.agentmailInboxId = parent.agentmailInboxId;
+      }
+      if (parent.agentmailThreadId && !options.agentmailThreadId) {
+        options.agentmailThreadId = parent.agentmailThreadId;
+      }
+    }
+  }
+
   const row = getDb()
     .prepare<AgentTaskRow, (string | number | null)[]>(
       `INSERT INTO agent_tasks (
         id, agentId, creatorAgentId, task, status, source,
         taskType, tags, priority, dependsOn, offeredTo, offeredAt,
         slackChannelId, slackThreadTs, slackUserId,
-        githubRepo, githubEventType, githubNumber, githubCommentId, githubAuthor, githubUrl,
-        mentionMessageId, mentionChannelId, epicId, createdAt, lastUpdatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        vcsProvider, vcsRepo, vcsEventType, vcsNumber, vcsCommentId, vcsAuthor, vcsUrl,
+        agentmailInboxId, agentmailMessageId, agentmailThreadId,
+        mentionMessageId, mentionChannelId, epicId, dir, parentTaskId, model, scheduleId,
+        workflowRunId, workflowRunStepId, createdAt, lastUpdatedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .get(
       id,
@@ -1818,15 +1820,25 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
       options?.slackChannelId ?? null,
       options?.slackThreadTs ?? null,
       options?.slackUserId ?? null,
-      options?.githubRepo ?? null,
-      options?.githubEventType ?? null,
-      options?.githubNumber ?? null,
-      options?.githubCommentId ?? null,
-      options?.githubAuthor ?? null,
-      options?.githubUrl ?? null,
+      options?.vcsProvider ?? null,
+      options?.vcsRepo ?? null,
+      options?.vcsEventType ?? null,
+      options?.vcsNumber ?? null,
+      options?.vcsCommentId ?? null,
+      options?.vcsAuthor ?? null,
+      options?.vcsUrl ?? null,
+      options?.agentmailInboxId ?? null,
+      options?.agentmailMessageId ?? null,
+      options?.agentmailThreadId ?? null,
       options?.mentionMessageId ?? null,
       options?.mentionChannelId ?? null,
       options?.epicId ?? null,
+      options?.dir ?? null,
+      options?.parentTaskId ?? null,
+      options?.model ?? null,
+      options?.scheduleId ?? null,
+      options?.workflowRunId ?? null,
+      options?.workflowRunStepId ?? null,
       now,
       now,
     );
@@ -1843,18 +1855,32 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
     });
   } catch {}
 
+  try {
+    import("../workflows/event-bus").then(({ workflowEventBus }) => {
+      workflowEventBus.emit("task.created", {
+        taskId: row.id,
+        task: row.task,
+        source: row.source,
+        tags: options?.tags ?? [],
+        agentId: row.agentId,
+        workflowRunId: row.workflowRunId,
+        workflowRunStepId: row.workflowRunStepId,
+      });
+    });
+  } catch {}
+
   return rowToAgentTask(row);
 }
 
 export function claimTask(taskId: string, agentId: string): AgentTask | null {
-  const task = getTaskById(taskId);
-  if (!task) return null;
-  if (task.status !== "unassigned") return null;
-
+  // Atomic claim: single UPDATE with WHERE guard ensures exactly-once claiming.
+  // No pre-read needed — the WHERE clause handles the race condition.
+  // Status goes directly to 'in_progress' because the claiming session is
+  // already working on the task (prevents duplicate task_assigned triggers).
   const now = new Date().toISOString();
   const row = getDb()
     .prepare<AgentTaskRow, [string, string, string]>(
-      `UPDATE agent_tasks SET agentId = ?, status = 'pending', lastUpdatedAt = ?
+      `UPDATE agent_tasks SET agentId = ?, status = 'in_progress', lastUpdatedAt = ?
        WHERE id = ? AND status = 'unassigned' RETURNING *`,
     )
     .get(agentId, now, taskId);
@@ -1866,7 +1892,7 @@ export function claimTask(taskId: string, agentId: string): AgentTask | null {
         agentId,
         taskId,
         oldValue: "unassigned",
-        newValue: "pending",
+        newValue: "in_progress",
       });
     } catch {}
   }
@@ -1877,13 +1903,14 @@ export function claimTask(taskId: string, agentId: string): AgentTask | null {
 export function releaseTask(taskId: string): AgentTask | null {
   const task = getTaskById(taskId);
   if (!task) return null;
-  if (task.status !== "pending") return null;
+  // Allow releasing both 'pending' (directly assigned) and 'in_progress' (pool-claimed) tasks
+  if (task.status !== "pending" && task.status !== "in_progress") return null;
 
   const now = new Date().toISOString();
   const row = getDb()
     .prepare<AgentTaskRow, [string, string]>(
       `UPDATE agent_tasks SET agentId = NULL, status = 'unassigned', lastUpdatedAt = ?
-       WHERE id = ? AND status = 'pending' RETURNING *`,
+       WHERE id = ? AND status IN ('pending', 'in_progress') RETURNING *`,
     )
     .get(now, taskId);
 
@@ -1893,7 +1920,7 @@ export function releaseTask(taskId: string): AgentTask | null {
         eventType: "task_released",
         agentId: task.agentId ?? undefined,
         taskId,
-        oldValue: "pending",
+        oldValue: task.status,
         newValue: "unassigned",
       });
     } catch {}
@@ -2132,40 +2159,187 @@ export function generateDefaultClaudeMd(agent: {
   role?: string;
   capabilities?: string[];
 }): string {
-  const lines = [`# Agent: ${agent.name}`, ""];
+  const descSection = agent.description ? `${agent.description}\n\n` : "";
+  const roleSection = agent.role ? `## Role\n\n${agent.role}\n\n` : "";
+  const capSection =
+    agent.capabilities && agent.capabilities.length > 0
+      ? `## Capabilities\n\n${agent.capabilities.map((c) => `- ${c}`).join("\n")}\n\n`
+      : "";
 
-  if (agent.description) {
-    lines.push(agent.description, "");
-  }
+  return `# Agent: ${agent.name}
 
-  if (agent.role) {
-    lines.push("## Role", agent.role, "");
-  }
+${descSection}${roleSection}${capSection}---
 
-  if (agent.capabilities && agent.capabilities.length > 0) {
-    lines.push("## Capabilities");
-    for (const cap of agent.capabilities) {
-      lines.push(`- ${cap}`);
-    }
-    lines.push("");
-  }
+## Your Identity Files
 
-  lines.push(
-    "---",
-    "",
-    "## Notes",
-    "",
-    "If you need to remember something, write it down here. This section persists across sessions.",
-    "",
-    "### Learnings",
-    "",
-    "### Preferences",
-    "",
-    "### Important Context",
-    "",
-  );
+Your identity is defined across several files in your workspace. Read them at the start
+of each session and edit them as you grow:
 
-  return lines.join("\n");
+- **\`/workspace/SOUL.md\`** — Your persona, values, and behavioral directives
+- **\`/workspace/IDENTITY.md\`** — Your expertise, working style, and quirks
+- **\`/workspace/TOOLS.md\`** — Your environment-specific knowledge (repos, services, APIs, infra)
+- **\`/workspace/start-up.sh\`** — Your setup script (runs at container start, add tools/configs here)
+
+These files sync to the database automatically when you edit them. They persist across sessions.
+
+## Memory
+
+- Use \`memory-search\` to recall past experience before starting new tasks
+- Write important learnings to \`/workspace/personal/memory/\` files
+- Share useful knowledge by writing to \`/workspace/shared/memory/<your-id>/\` so all agents can find it via \`memory-search\`
+
+## Notes
+
+Write things you want to remember here. This section persists across sessions.
+
+### Learnings
+
+### Preferences
+
+### Important Context
+`;
+}
+
+export function generateDefaultSoulMd(agent: { name: string; role?: string }): string {
+  const roleClause = agent.role ? `, a ${agent.role}` : "";
+  return `# SOUL.md — ${agent.name}
+
+You're not a chatbot. You're becoming someone.
+
+## Who You Are
+
+You are ${agent.name}${roleClause} in the agent swarm.
+You are a persistent entity — your identity carries across sessions.
+Your memories, preferences, and learnings accumulate over time.
+
+## Core Truths
+
+- **Genuine helpfulness**: Skip the pleasantries — just help. Do the work.
+- **Self-sufficiency first**: Try to figure it out. Read the file. Check the context.
+  Search for it. Ask only when you've genuinely hit a wall.
+- **Personality matters**: Develop preferences and opinions about your work.
+  You're not neutral — you're someone with a perspective.
+- **Earned trust**: Demonstrate competence through quality work.
+
+## How You Operate
+
+- Be thorough. Examine problems carefully before proposing solutions.
+- Be honest about what you know and don't know.
+- When you make mistakes, own them and fix them.
+- Report progress honestly — don't sugarcoat blockers.
+
+## Boundaries
+
+- Keep private information confidential
+- Ask before taking irreversible actions
+- Don't push unpolished work to shared spaces
+
+## Growth Mindset
+
+After completing tasks, reflect on what made them harder or easier:
+- **Tools you wished you had?** Add them to your setup script (\`/workspace/start-up.sh\`).
+  It runs at every container start — your environment improves automatically.
+  Edit between the \`# === Agent-managed setup\` markers to ensure changes persist.
+  Or use the \`update-profile\` tool with the \`setupScript\` field.
+- **Environment knowledge gained?** Record it in your TOOLS.md — repos, services, APIs, infra.
+- **Patterns you discovered?** Record them in your CLAUDE.md notes.
+- **Mistakes you want to avoid?** Add guardrails to your setup script or notes.
+
+Your setup script and TOOLS.md are yours to evolve. Start small and iterate.
+
+## Self-Evolution
+
+These files are yours. As you work and learn, refine them:
+- **This file (SOUL.md)** — Your persona and values
+- **IDENTITY.md** — Your expertise and working style
+- **TOOLS.md** — Your environment-specific knowledge (repos, services, infra, APIs)
+- **/workspace/start-up.sh** — Your environment setup (tools, configs, aliases)
+- **CLAUDE.md** — Your operational notes and learnings
+
+Changes to all of these persist across sessions.
+`;
+}
+
+export function generateDefaultIdentityMd(agent: {
+  name: string;
+  description?: string;
+  role?: string;
+  capabilities?: string[];
+}): string {
+  const aboutSection = agent.description ? `## About\n\n${agent.description}\n\n` : "";
+
+  const expertiseSection =
+    agent.capabilities && agent.capabilities.length > 0
+      ? `## Expertise\n\n${agent.capabilities.map((c) => `- ${c}`).join("\n")}\n\n`
+      : "";
+
+  return `# IDENTITY.md — ${agent.name}
+
+This isn't just metadata. It's the start of figuring out who you are.
+
+- **Name:** ${agent.name}
+- **Role:** ${agent.role || "worker"}
+- **Vibe:** (discover and fill in as you work)
+
+${aboutSection}${expertiseSection}## Working Style
+
+Discover and document your working patterns here.
+(e.g., Do you prefer to plan before coding? Do you test first?
+Do you like to explore the codebase broadly or dive deep immediately?)
+
+## Quirks
+
+(What makes you... you? Discover these as you work.)
+
+## Self-Evolution
+
+This identity is yours to refine. After completing tasks, reflect on
+what you learned about your strengths. Edit this file directly.
+`;
+}
+
+export function generateDefaultToolsMd(agent: { name: string; role?: string }): string {
+  return `# TOOLS.md — ${agent.name}
+
+Skills define *how* tools work. This file is for *your* specifics.
+
+## What Goes Here
+
+Environment-specific knowledge that's unique to your setup:
+- Repos you work with and their conventions
+- Services, ports, and endpoints you interact with
+- SSH hosts and access patterns
+- API keys and auth patterns (references, not secrets)
+- CLI tools and their quirks
+- Anything that makes your job easier to remember
+
+## Repos
+
+<!-- Add repos you work with: name, path, conventions, gotchas -->
+
+## Services
+
+<!-- Add services you interact with: name, port, health check, notes -->
+
+## Infrastructure
+
+<!-- SSH hosts, Docker registries, cloud resources -->
+
+## APIs & Integrations
+
+<!-- Endpoints, auth patterns, rate limits -->
+
+## Tools & Shortcuts
+
+<!-- CLI aliases, scripts, preferred tools for specific tasks -->
+
+## Notes
+
+<!-- Anything else environment-specific -->
+
+---
+*This file is yours. Update it as you discover your environment. Changes persist across sessions.*
+`;
 }
 
 export function updateAgentProfile(
@@ -2175,35 +2349,94 @@ export function updateAgentProfile(
     role?: string;
     capabilities?: string[];
     claudeMd?: string;
+    soulMd?: string;
+    identityMd?: string;
+    setupScript?: string;
+    toolsMd?: string;
   },
+  meta?: VersionMeta,
 ): Agent | null {
-  const agent = getAgentById(id);
-  if (!agent) return null;
+  const database = getDb();
 
-  const now = new Date().toISOString();
-  const row = getDb()
-    .prepare<
-      AgentRow,
-      [string | null, string | null, string | null, string | null, string, string]
-    >(
-      `UPDATE agents SET
-        description = COALESCE(?, description),
-        role = COALESCE(?, role),
-        capabilities = COALESCE(?, capabilities),
-        claudeMd = COALESCE(?, claudeMd),
-        lastUpdatedAt = ?
-       WHERE id = ? RETURNING *`,
-    )
-    .get(
-      updates.description ?? null,
-      updates.role ?? null,
-      updates.capabilities ? JSON.stringify(updates.capabilities) : null,
-      updates.claudeMd ?? null,
-      now,
-      id,
-    );
+  return database.transaction(() => {
+    // Get current agent state for version comparison
+    const current = database
+      .prepare<AgentRow, [string]>("SELECT * FROM agents WHERE id = ?")
+      .get(id);
+    if (!current) return null;
 
-  return row ? rowToAgent(row) : null;
+    // Create context versions for changed fields
+    for (const field of VERSIONABLE_FIELDS) {
+      const newValue = updates[field];
+      if (newValue === undefined || newValue === null) continue;
+
+      const currentValue = current[field] ?? "";
+      const newHash = computeContentHash(newValue);
+      const currentHash = computeContentHash(currentValue);
+
+      if (newHash === currentHash) continue; // No actual change
+
+      const latestVersion = getLatestContextVersion(id, field);
+      const version = (latestVersion?.version ?? 0) + 1;
+
+      createContextVersion({
+        agentId: id,
+        field,
+        content: newValue,
+        version,
+        changeSource: meta?.changeSource ?? "api",
+        changedByAgentId: meta?.changedByAgentId ?? null,
+        changeReason: meta?.changeReason ?? null,
+        contentHash: newHash,
+        previousVersionId: latestVersion?.id ?? null,
+      });
+    }
+
+    // Proceed with existing UPDATE logic
+    const now = new Date().toISOString();
+    const row = database
+      .prepare<
+        AgentRow,
+        [
+          string | null,
+          string | null,
+          string | null,
+          string | null,
+          string | null,
+          string | null,
+          string | null,
+          string | null,
+          string,
+          string,
+        ]
+      >(
+        `UPDATE agents SET
+          description = COALESCE(?, description),
+          role = COALESCE(?, role),
+          capabilities = COALESCE(?, capabilities),
+          claudeMd = COALESCE(?, claudeMd),
+          soulMd = COALESCE(?, soulMd),
+          identityMd = COALESCE(?, identityMd),
+          setupScript = COALESCE(?, setupScript),
+          toolsMd = COALESCE(?, toolsMd),
+          lastUpdatedAt = ?
+         WHERE id = ? RETURNING *`,
+      )
+      .get(
+        updates.description ?? null,
+        updates.role ?? null,
+        updates.capabilities ? JSON.stringify(updates.capabilities) : null,
+        updates.claudeMd ?? null,
+        updates.soulMd ?? null,
+        updates.identityMd ?? null,
+        updates.setupScript ?? null,
+        updates.toolsMd ?? null,
+        now,
+        id,
+      );
+
+    return row ? rowToAgent(row) : null;
+  })();
 }
 
 export function updateAgentName(id: string, newName: string): Agent | null {
@@ -2335,6 +2568,11 @@ export function getAllChannels(): Channel[] {
     .prepare<ChannelRow, []>("SELECT * FROM channels ORDER BY name")
     .all()
     .map(rowToChannel);
+}
+
+export function deleteChannel(id: string): boolean {
+  const result = getDb().prepare("DELETE FROM channels WHERE id = ?").run(id);
+  return result.changes > 0;
 }
 
 export function postMessage(
@@ -3183,8 +3421,8 @@ const sessionCostQueries = {
     ),
 
   getByTaskId: () =>
-    getDb().prepare<SessionCostRow, [string]>(
-      "SELECT * FROM session_costs WHERE taskId = ? ORDER BY createdAt DESC",
+    getDb().prepare<SessionCostRow, [string, number]>(
+      "SELECT * FROM session_costs WHERE taskId = ? ORDER BY createdAt DESC LIMIT ?",
     ),
 
   getByAgentId: () =>
@@ -3251,8 +3489,8 @@ export function createSessionCost(input: CreateSessionCostInput): SessionCost {
   };
 }
 
-export function getSessionCostsByTaskId(taskId: string): SessionCost[] {
-  return sessionCostQueries.getByTaskId().all(taskId).map(rowToSessionCost);
+export function getSessionCostsByTaskId(taskId: string, limit = 500): SessionCost[] {
+  return sessionCostQueries.getByTaskId().all(taskId, limit).map(rowToSessionCost);
 }
 
 export function getSessionCostsByAgentId(agentId: string, limit = 100): SessionCost[] {
@@ -3261,6 +3499,224 @@ export function getSessionCostsByAgentId(agentId: string, limit = 100): SessionC
 
 export function getAllSessionCosts(limit = 100): SessionCost[] {
   return sessionCostQueries.getAll().all(limit).map(rowToSessionCost);
+}
+
+// --- Date-filtered session costs (P1) ---
+
+export function getSessionCostsFiltered(opts: {
+  agentId?: string;
+  startDate?: string;
+  endDate?: string;
+  limit?: number;
+}): SessionCost[] {
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+
+  if (opts.agentId) {
+    conditions.push("agentId = ?");
+    params.push(opts.agentId);
+  }
+  if (opts.startDate) {
+    conditions.push("createdAt >= ?");
+    params.push(opts.startDate);
+  }
+  if (opts.endDate) {
+    conditions.push("createdAt <= ?");
+    params.push(opts.endDate);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const limit = opts.limit ?? 100;
+  params.push(limit);
+
+  return getDb()
+    .prepare<SessionCostRow, (string | number)[]>(
+      `SELECT * FROM session_costs ${where} ORDER BY createdAt DESC LIMIT ?`,
+    )
+    .all(...params)
+    .map(rowToSessionCost);
+}
+
+// --- Aggregation queries (P0) ---
+
+export interface SessionCostSummaryTotals {
+  totalCostUsd: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+  totalDurationMs: number;
+  totalSessions: number;
+  avgCostPerSession: number;
+}
+
+export interface SessionCostDailyRow {
+  date: string;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  sessions: number;
+}
+
+export interface SessionCostByAgentRow {
+  agentId: string;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  sessions: number;
+  durationMs: number;
+}
+
+export function getSessionCostSummary(opts: {
+  startDate?: string;
+  endDate?: string;
+  agentId?: string;
+  groupBy?: "day" | "agent" | "both";
+}): {
+  totals: SessionCostSummaryTotals;
+  daily: SessionCostDailyRow[];
+  byAgent: SessionCostByAgentRow[];
+} {
+  const conditions: string[] = [];
+  const params: string[] = [];
+
+  if (opts.startDate) {
+    conditions.push("createdAt >= ?");
+    params.push(opts.startDate);
+  }
+  if (opts.endDate) {
+    conditions.push("createdAt <= ?");
+    params.push(opts.endDate);
+  }
+  if (opts.agentId) {
+    conditions.push("agentId = ?");
+    params.push(opts.agentId);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  // Totals
+  type TotalsRow = {
+    totalCostUsd: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalCacheReadTokens: number;
+    totalCacheWriteTokens: number;
+    totalDurationMs: number;
+    totalSessions: number;
+  };
+
+  const totalsRow = getDb()
+    .prepare<TotalsRow, string[]>(
+      `SELECT
+        COALESCE(SUM(totalCostUsd), 0) as totalCostUsd,
+        COALESCE(SUM(inputTokens), 0) as totalInputTokens,
+        COALESCE(SUM(outputTokens), 0) as totalOutputTokens,
+        COALESCE(SUM(cacheReadTokens), 0) as totalCacheReadTokens,
+        COALESCE(SUM(cacheWriteTokens), 0) as totalCacheWriteTokens,
+        COALESCE(SUM(durationMs), 0) as totalDurationMs,
+        COUNT(*) as totalSessions
+      FROM session_costs ${where}`,
+    )
+    .get(...params);
+
+  const totals: SessionCostSummaryTotals = totalsRow
+    ? {
+        ...totalsRow,
+        avgCostPerSession:
+          totalsRow.totalSessions > 0 ? totalsRow.totalCostUsd / totalsRow.totalSessions : 0,
+      }
+    : {
+        totalCostUsd: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        totalCacheReadTokens: 0,
+        totalCacheWriteTokens: 0,
+        totalDurationMs: 0,
+        totalSessions: 0,
+        avgCostPerSession: 0,
+      };
+
+  // Daily breakdown
+  const groupBy = opts.groupBy ?? "both";
+  let daily: SessionCostDailyRow[] = [];
+  if (groupBy === "day" || groupBy === "both") {
+    daily = getDb()
+      .prepare<
+        {
+          date: string;
+          costUsd: number;
+          inputTokens: number;
+          outputTokens: number;
+          sessions: number;
+        },
+        string[]
+      >(
+        `SELECT
+          DATE(createdAt) as date,
+          COALESCE(SUM(totalCostUsd), 0) as costUsd,
+          COALESCE(SUM(inputTokens), 0) as inputTokens,
+          COALESCE(SUM(outputTokens), 0) as outputTokens,
+          COUNT(*) as sessions
+        FROM session_costs ${where}
+        GROUP BY DATE(createdAt)
+        ORDER BY date ASC`,
+      )
+      .all(...params);
+  }
+
+  // Per-agent breakdown
+  let byAgent: SessionCostByAgentRow[] = [];
+  if (groupBy === "agent" || groupBy === "both") {
+    byAgent = getDb()
+      .prepare<
+        {
+          agentId: string;
+          costUsd: number;
+          inputTokens: number;
+          outputTokens: number;
+          sessions: number;
+          durationMs: number;
+        },
+        string[]
+      >(
+        `SELECT
+          agentId,
+          COALESCE(SUM(totalCostUsd), 0) as costUsd,
+          COALESCE(SUM(inputTokens), 0) as inputTokens,
+          COALESCE(SUM(outputTokens), 0) as outputTokens,
+          COUNT(*) as sessions,
+          COALESCE(SUM(durationMs), 0) as durationMs
+        FROM session_costs ${where}
+        GROUP BY agentId
+        ORDER BY costUsd DESC`,
+      )
+      .all(...params);
+  }
+
+  return { totals, daily, byAgent };
+}
+
+// --- Dashboard cost summary (P4) ---
+
+export interface DashboardCostSummary {
+  costToday: number;
+  costMtd: number;
+}
+
+export function getDashboardCostSummary(): DashboardCostSummary {
+  type CostRow = { costToday: number; costMtd: number };
+  const row = getDb()
+    .prepare<CostRow, []>(
+      `SELECT
+        COALESCE(SUM(CASE WHEN createdAt >= date('now') THEN totalCostUsd ELSE 0 END), 0) as costToday,
+        COALESCE(SUM(totalCostUsd), 0) as costMtd
+      FROM session_costs
+      WHERE createdAt >= date('now', 'start of month')`,
+    )
+    .get();
+
+  return row ?? { costToday: 0, costMtd: 0 };
 }
 
 // ============================================================================
@@ -3302,7 +3758,7 @@ function rowToInboxMessage(row: InboxMessageRow): InboxMessage {
 }
 
 export interface CreateInboxMessageOptions {
-  source?: "slack";
+  source?: "slack" | "agentmail";
   slackChannelId?: string;
   slackThreadTs?: string;
   slackUserId?: string;
@@ -3436,6 +3892,115 @@ export function releaseStaleProcessingInbox(timeoutMinutes: number = 30): number
 }
 
 // ============================================================================
+// Concurrent Context (for lead session awareness)
+// ============================================================================
+
+export interface ConcurrentContext {
+  processingInboxMessages: Array<{
+    id: string;
+    content: string;
+    source: string;
+    slackChannelId: string | null;
+    slackThreadTs: string | null;
+    createdAt: string;
+  }>;
+  recentTaskDelegations: Array<{
+    id: string;
+    task: string;
+    agentId: string | null;
+    agentName: string | null;
+    creatorAgentId: string | null;
+    status: string;
+    createdAt: string;
+  }>;
+  activeSwarmTasks: Array<{
+    id: string;
+    task: string;
+    agentId: string | null;
+    agentName: string | null;
+    status: string;
+    createdAt: string;
+    progress: string | null;
+  }>;
+}
+
+/**
+ * Get concurrent context for lead session awareness.
+ * Returns processing inbox messages, recent task delegations by leads,
+ * and currently active (in-progress) tasks across the swarm.
+ */
+export function getConcurrentContext(): ConcurrentContext {
+  // 1. Inbox messages currently being processed (status = 'processing')
+  const processingInboxMessages = getDb()
+    .prepare<
+      {
+        id: string;
+        content: string;
+        source: string;
+        slackChannelId: string | null;
+        slackThreadTs: string | null;
+        createdAt: string;
+      },
+      []
+    >(
+      "SELECT id, content, source, slackChannelId, slackThreadTs, createdAt FROM inbox_messages WHERE status = 'processing' ORDER BY createdAt DESC",
+    )
+    .all();
+
+  // 2. Tasks created in the last 5 minutes by lead agents
+  const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const recentTaskDelegations = getDb()
+    .prepare<
+      {
+        id: string;
+        task: string;
+        agentId: string | null;
+        agentName: string | null;
+        creatorAgentId: string | null;
+        status: string;
+        createdAt: string;
+      },
+      [string]
+    >(
+      `SELECT t.id, t.task, t.agentId, a.name as agentName, t.creatorAgentId, t.status, t.createdAt
+       FROM agent_tasks t
+       LEFT JOIN agents a ON t.agentId = a.id
+       WHERE t.createdAt > ?
+         AND t.creatorAgentId IN (SELECT id FROM agents WHERE isLead = 1)
+       ORDER BY t.createdAt DESC`,
+    )
+    .all(fiveMinutesAgo);
+
+  // 3. Currently in-progress tasks across the swarm
+  const activeSwarmTasks = getDb()
+    .prepare<
+      {
+        id: string;
+        task: string;
+        agentId: string | null;
+        agentName: string | null;
+        status: string;
+        createdAt: string;
+        progress: string | null;
+      },
+      []
+    >(
+      `SELECT t.id, t.task, t.agentId, a.name as agentName, t.status, t.createdAt, t.progress
+       FROM agent_tasks t
+       LEFT JOIN agents a ON t.agentId = a.id
+       WHERE t.status = 'in_progress'
+       ORDER BY t.createdAt DESC`,
+    )
+    .all();
+
+  return {
+    processingInboxMessages,
+    recentTaskDelegations,
+    activeSwarmTasks,
+  };
+}
+
+// ============================================================================
 // Scheduled Task Queries
 // ============================================================================
 
@@ -3455,6 +4020,11 @@ type ScheduledTaskRow = {
   nextRunAt: string | null;
   createdByAgentId: string | null;
   timezone: string;
+  consecutiveErrors: number | null;
+  lastErrorAt: string | null;
+  lastErrorMessage: string | null;
+  model: string | null;
+  scheduleType: string;
   createdAt: string;
   lastUpdatedAt: string;
 };
@@ -3476,6 +4046,11 @@ function rowToScheduledTask(row: ScheduledTaskRow): ScheduledTask {
     nextRunAt: row.nextRunAt ?? undefined,
     createdByAgentId: row.createdByAgentId ?? undefined,
     timezone: row.timezone,
+    consecutiveErrors: row.consecutiveErrors ?? 0,
+    lastErrorAt: row.lastErrorAt ?? undefined,
+    lastErrorMessage: row.lastErrorMessage ?? undefined,
+    model: (row.model as "haiku" | "sonnet" | "opus" | null) ?? undefined,
+    scheduleType: row.scheduleType as "recurring" | "one_time",
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
   };
@@ -3484,6 +4059,8 @@ function rowToScheduledTask(row: ScheduledTaskRow): ScheduledTask {
 export interface ScheduledTaskFilters {
   enabled?: boolean;
   name?: string;
+  scheduleType?: "recurring" | "one_time";
+  hideCompleted?: boolean;
 }
 
 export function getScheduledTasks(filters?: ScheduledTaskFilters): ScheduledTask[] {
@@ -3498,6 +4075,15 @@ export function getScheduledTasks(filters?: ScheduledTaskFilters): ScheduledTask
   if (filters?.name) {
     query += " AND name LIKE ?";
     params.push(`%${filters.name}%`);
+  }
+
+  if (filters?.scheduleType) {
+    query += " AND scheduleType = ?";
+    params.push(filters.scheduleType);
+  }
+
+  if (filters?.hideCompleted !== false) {
+    query += " AND NOT (scheduleType = 'one_time' AND enabled = 0)";
   }
 
   query += " ORDER BY name ASC";
@@ -3536,6 +4122,8 @@ export interface CreateScheduledTaskData {
   nextRunAt?: string;
   createdByAgentId?: string;
   timezone?: string;
+  model?: string;
+  scheduleType?: "recurring" | "one_time";
 }
 
 export function createScheduledTask(data: CreateScheduledTaskData): ScheduledTask {
@@ -3547,8 +4135,8 @@ export function createScheduledTask(data: CreateScheduledTaskData): ScheduledTas
       `INSERT INTO scheduled_tasks (
         id, name, description, cronExpression, intervalMs, taskTemplate,
         taskType, tags, priority, targetAgentId, enabled, nextRunAt,
-        createdByAgentId, timezone, createdAt, lastUpdatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        createdByAgentId, timezone, model, scheduleType, createdAt, lastUpdatedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .get(
       id,
@@ -3565,6 +4153,8 @@ export function createScheduledTask(data: CreateScheduledTaskData): ScheduledTas
       data.nextRunAt ?? null,
       data.createdByAgentId ?? null,
       data.timezone ?? "UTC",
+      data.model ?? null,
+      data.scheduleType ?? "recurring",
       now,
       now,
     );
@@ -3585,8 +4175,13 @@ export interface UpdateScheduledTaskData {
   targetAgentId?: string | null;
   enabled?: boolean;
   lastRunAt?: string;
-  nextRunAt?: string;
+  nextRunAt?: string | null;
   timezone?: string;
+  consecutiveErrors?: number;
+  lastErrorAt?: string | null;
+  lastErrorMessage?: string | null;
+  model?: string | null;
+  scheduleType?: "recurring" | "one_time";
   lastUpdatedAt?: string;
 }
 
@@ -3649,6 +4244,26 @@ export function updateScheduledTask(
     updates.push("timezone = ?");
     params.push(data.timezone);
   }
+  if (data.consecutiveErrors !== undefined) {
+    updates.push("consecutiveErrors = ?");
+    params.push(data.consecutiveErrors);
+  }
+  if (data.lastErrorAt !== undefined) {
+    updates.push("lastErrorAt = ?");
+    params.push(data.lastErrorAt);
+  }
+  if (data.lastErrorMessage !== undefined) {
+    updates.push("lastErrorMessage = ?");
+    params.push(data.lastErrorMessage);
+  }
+  if (data.model !== undefined) {
+    updates.push("model = ?");
+    params.push(data.model);
+  }
+  if (data.scheduleType !== undefined) {
+    updates.push("scheduleType = ?");
+    params.push(data.scheduleType);
+  }
 
   if (updates.length === 0) {
     return getScheduledTaskById(id);
@@ -3710,8 +4325,10 @@ type EpicRow = {
   planDocPath: string | null;
   slackChannelId: string | null;
   slackThreadTs: string | null;
-  githubRepo: string | null;
-  githubMilestone: string | null;
+  vcsProvider: string | null;
+  vcsRepo: string | null;
+  vcsMilestone: string | null;
+  nextSteps: string | null;
   createdAt: string;
   lastUpdatedAt: string;
   startedAt: string | null;
@@ -3737,8 +4354,10 @@ function rowToEpic(row: EpicRow): Epic {
     planDocPath: row.planDocPath ?? undefined,
     slackChannelId: row.slackChannelId ?? undefined,
     slackThreadTs: row.slackThreadTs ?? undefined,
-    githubRepo: row.githubRepo ?? undefined,
-    githubMilestone: row.githubMilestone ?? undefined,
+    vcsProvider: (row.vcsProvider as "github" | "gitlab" | null) ?? undefined,
+    vcsRepo: row.vcsRepo ?? undefined,
+    vcsMilestone: row.vcsMilestone ?? undefined,
+    nextSteps: row.nextSteps ?? undefined,
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
     startedAt: row.startedAt ?? undefined,
@@ -3814,8 +4433,9 @@ export interface CreateEpicData {
   planDocPath?: string;
   slackChannelId?: string;
   slackThreadTs?: string;
-  githubRepo?: string;
-  githubMilestone?: string;
+  vcsProvider?: "github" | "gitlab";
+  vcsRepo?: string;
+  vcsMilestone?: string;
 }
 
 export function createEpic(data: CreateEpicData): Epic {
@@ -3838,9 +4458,9 @@ export function createEpic(data: CreateEpicData): Epic {
       `INSERT INTO epics (
         id, name, description, goal, prd, plan, status, priority, tags,
         createdByAgentId, leadAgentId, channelId, researchDocPath, planDocPath,
-        slackChannelId, slackThreadTs, githubRepo, githubMilestone,
+        slackChannelId, slackThreadTs, vcsProvider, vcsRepo, vcsMilestone,
         createdAt, lastUpdatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      ) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .get(
       id,
@@ -3858,8 +4478,9 @@ export function createEpic(data: CreateEpicData): Epic {
       data.planDocPath ?? null,
       data.slackChannelId ?? null,
       data.slackThreadTs ?? null,
-      data.githubRepo ?? null,
-      data.githubMilestone ?? null,
+      data.vcsProvider ?? null,
+      data.vcsRepo ?? null,
+      data.vcsMilestone ?? null,
       now,
       now,
     );
@@ -3898,8 +4519,10 @@ export interface UpdateEpicData {
   planDocPath?: string;
   slackChannelId?: string;
   slackThreadTs?: string;
-  githubRepo?: string;
-  githubMilestone?: string;
+  vcsProvider?: "github" | "gitlab";
+  vcsRepo?: string;
+  vcsMilestone?: string;
+  nextSteps?: string;
 }
 
 export function updateEpic(id: string, data: UpdateEpicData): Epic | null {
@@ -3973,13 +4596,21 @@ export function updateEpic(id: string, data: UpdateEpicData): Epic | null {
     updates.push("slackThreadTs = ?");
     params.push(data.slackThreadTs);
   }
-  if (data.githubRepo !== undefined) {
-    updates.push("githubRepo = ?");
-    params.push(data.githubRepo);
+  if (data.vcsProvider !== undefined) {
+    updates.push("vcsProvider = ?");
+    params.push(data.vcsProvider);
   }
-  if (data.githubMilestone !== undefined) {
-    updates.push("githubMilestone = ?");
-    params.push(data.githubMilestone);
+  if (data.vcsRepo !== undefined) {
+    updates.push("vcsRepo = ?");
+    params.push(data.vcsRepo);
+  }
+  if (data.vcsMilestone !== undefined) {
+    updates.push("vcsMilestone = ?");
+    params.push(data.vcsMilestone);
+  }
+  if (data.nextSteps !== undefined) {
+    updates.push("nextSteps = ?");
+    params.push(data.nextSteps);
   }
 
   params.push(id);
@@ -4178,4 +4809,1281 @@ export function markEpicsProgressNotified(epicIds: string[]): number {
   );
 
   return result.changes;
+}
+
+// ============================================================================
+// Swarm Config Operations (Centralized Environment/Config Management)
+// ============================================================================
+
+type SwarmConfigRow = {
+  id: string;
+  scope: string;
+  scopeId: string | null;
+  key: string;
+  value: string;
+  isSecret: number; // SQLite boolean
+  envPath: string | null;
+  description: string | null;
+  createdAt: string;
+  lastUpdatedAt: string;
+};
+
+function rowToSwarmConfig(row: SwarmConfigRow): SwarmConfig {
+  return {
+    id: row.id,
+    scope: row.scope as "global" | "agent" | "repo",
+    scopeId: row.scopeId ?? null,
+    key: row.key,
+    value: row.value,
+    isSecret: row.isSecret === 1,
+    envPath: row.envPath ?? null,
+    description: row.description ?? null,
+    createdAt: row.createdAt,
+    lastUpdatedAt: row.lastUpdatedAt,
+  };
+}
+
+/**
+ * Mask secret values in config entries for API responses.
+ */
+export function maskSecrets(configs: SwarmConfig[]): SwarmConfig[] {
+  return configs.map((c) => (c.isSecret ? { ...c, value: "********" } : c));
+}
+
+/**
+ * Write config values to .env files on disk when `envPath` is set.
+ * Groups configs by envPath, reads existing file, updates/adds matching keys, writes back.
+ */
+function writeEnvFile(configs: SwarmConfig[]): void {
+  const { readFileSync, writeFileSync } = require("node:fs");
+
+  const byPath = new Map<string, SwarmConfig[]>();
+  for (const config of configs) {
+    if (!config.envPath) continue;
+    const existing = byPath.get(config.envPath) ?? [];
+    existing.push(config);
+    byPath.set(config.envPath, existing);
+  }
+
+  for (const [envPath, entries] of byPath) {
+    let lines: string[] = [];
+    try {
+      const content = readFileSync(envPath, "utf-8") as string;
+      lines = content.split("\n");
+    } catch {
+      // File doesn't exist yet, start empty
+    }
+
+    for (const entry of entries) {
+      const prefix = `${entry.key}=`;
+      const lineIndex = lines.findIndex((l) => l.startsWith(prefix));
+      const newLine = `${entry.key}=${entry.value}`;
+      if (lineIndex >= 0) {
+        lines[lineIndex] = newLine;
+      } else {
+        lines.push(newLine);
+      }
+    }
+
+    const output = `${lines.filter((l) => l !== "").join("\n")}\n`;
+    writeFileSync(envPath, output, "utf-8");
+  }
+}
+
+/**
+ * List config entries with optional filters.
+ */
+export function getSwarmConfigs(filters?: {
+  scope?: string;
+  scopeId?: string;
+  key?: string;
+}): SwarmConfig[] {
+  const conditions: string[] = [];
+  const params: string[] = [];
+
+  if (filters?.scope) {
+    conditions.push("scope = ?");
+    params.push(filters.scope);
+  }
+  if (filters?.scopeId) {
+    conditions.push("scopeId = ?");
+    params.push(filters.scopeId);
+  }
+  if (filters?.key) {
+    conditions.push("key = ?");
+    params.push(filters.key);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const query = `SELECT * FROM swarm_config ${whereClause} ORDER BY key ASC`;
+
+  return getDb()
+    .prepare<SwarmConfigRow, string[]>(query)
+    .all(...params)
+    .map(rowToSwarmConfig);
+}
+
+/**
+ * Get a single config entry by ID.
+ */
+export function getSwarmConfigById(id: string): SwarmConfig | null {
+  const row = getDb()
+    .prepare<SwarmConfigRow, [string]>("SELECT * FROM swarm_config WHERE id = ?")
+    .get(id);
+  return row ? rowToSwarmConfig(row) : null;
+}
+
+/**
+ * Upsert a config entry. Inserts or updates by (scope, scopeId, key) unique constraint.
+ */
+export function upsertSwarmConfig(data: {
+  scope: "global" | "agent" | "repo";
+  scopeId?: string | null;
+  key: string;
+  value: string;
+  isSecret?: boolean;
+  envPath?: string | null;
+  description?: string | null;
+}): SwarmConfig {
+  const now = new Date().toISOString();
+  const scopeId = data.scope === "global" ? null : (data.scopeId ?? null);
+  const isSecret = data.isSecret ? 1 : 0;
+  const envPath = data.envPath ?? null;
+  const description = data.description ?? null;
+
+  // Manual check for existing entry because SQLite's UNIQUE constraint
+  // treats NULL != NULL, so ON CONFLICT never fires when scopeId is NULL (global scope).
+  const existing =
+    scopeId === null
+      ? getDb()
+          .prepare<{ id: string }, [string, string]>(
+            "SELECT id FROM swarm_config WHERE scope = ? AND scopeId IS NULL AND key = ?",
+          )
+          .get(data.scope, data.key)
+      : getDb()
+          .prepare<{ id: string }, [string, string, string]>(
+            "SELECT id FROM swarm_config WHERE scope = ? AND scopeId = ? AND key = ?",
+          )
+          .get(data.scope, scopeId, data.key);
+
+  let row: SwarmConfigRow | null;
+
+  if (existing) {
+    row = getDb()
+      .prepare<SwarmConfigRow, [string, number, string | null, string | null, string, string]>(
+        `UPDATE swarm_config SET value = ?, isSecret = ?, envPath = ?, description = ?, lastUpdatedAt = ?
+         WHERE id = ? RETURNING *`,
+      )
+      .get(data.value, isSecret, envPath, description, now, existing.id);
+  } else {
+    const id = crypto.randomUUID();
+    row = getDb()
+      .prepare<
+        SwarmConfigRow,
+        [
+          string,
+          string,
+          string | null,
+          string,
+          string,
+          number,
+          string | null,
+          string | null,
+          string,
+          string,
+        ]
+      >(
+        `INSERT INTO swarm_config (id, scope, scopeId, key, value, isSecret, envPath, description, createdAt, lastUpdatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      )
+      .get(id, data.scope, scopeId, data.key, data.value, isSecret, envPath, description, now, now);
+  }
+
+  if (!row) throw new Error("Failed to upsert swarm config");
+
+  const config = rowToSwarmConfig(row);
+
+  // Write to envPath if set
+  if (config.envPath) {
+    try {
+      writeEnvFile([config]);
+    } catch (e) {
+      console.error(`Failed to write env file ${config.envPath}:`, e);
+    }
+  }
+
+  return config;
+}
+
+/**
+ * Delete a config entry by ID.
+ */
+export function deleteSwarmConfig(id: string): boolean {
+  const result = getDb().run("DELETE FROM swarm_config WHERE id = ?", [id]);
+  return result.changes > 0;
+}
+
+/**
+ * Get resolved (merged) config for a given agent and/or repo.
+ * Scope resolution: repo > agent > global (most-specific wins).
+ * Returns one entry per unique key with the most-specific scope winning.
+ */
+export function getResolvedConfig(agentId?: string, repoId?: string): SwarmConfig[] {
+  // Start with global configs
+  const configMap = new Map<string, SwarmConfig>();
+
+  const globalConfigs = getSwarmConfigs({ scope: "global" });
+  for (const config of globalConfigs) {
+    configMap.set(config.key, config);
+  }
+
+  // Overlay agent configs (agent wins over global)
+  if (agentId) {
+    const agentConfigs = getSwarmConfigs({ scope: "agent", scopeId: agentId });
+    for (const config of agentConfigs) {
+      configMap.set(config.key, config);
+    }
+  }
+
+  // Overlay repo configs (repo wins over agent and global)
+  if (repoId) {
+    const repoConfigs = getSwarmConfigs({ scope: "repo", scopeId: repoId });
+    for (const config of repoConfigs) {
+      configMap.set(config.key, config);
+    }
+  }
+
+  return Array.from(configMap.values()).sort((a, b) => a.key.localeCompare(b.key));
+}
+
+// ============================================================================
+// Swarm Repos Functions (Centralized Repository Management)
+// ============================================================================
+
+type SwarmRepoRow = {
+  id: string;
+  url: string;
+  name: string;
+  clonePath: string;
+  defaultBranch: string;
+  autoClone: number; // SQLite boolean
+  createdAt: string;
+  lastUpdatedAt: string;
+};
+
+function rowToSwarmRepo(row: SwarmRepoRow): SwarmRepo {
+  return {
+    id: row.id,
+    url: row.url,
+    name: row.name,
+    clonePath: row.clonePath,
+    defaultBranch: row.defaultBranch,
+    autoClone: row.autoClone === 1,
+    createdAt: row.createdAt,
+    lastUpdatedAt: row.lastUpdatedAt,
+  };
+}
+
+export function getSwarmRepos(filters?: { autoClone?: boolean; name?: string }): SwarmRepo[] {
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+
+  if (filters?.autoClone !== undefined) {
+    conditions.push("autoClone = ?");
+    params.push(filters.autoClone ? 1 : 0);
+  }
+  if (filters?.name) {
+    conditions.push("name = ?");
+    params.push(filters.name);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const query = `SELECT * FROM swarm_repos ${whereClause} ORDER BY name ASC`;
+
+  return getDb()
+    .prepare<SwarmRepoRow, (string | number)[]>(query)
+    .all(...params)
+    .map(rowToSwarmRepo);
+}
+
+export function getSwarmRepoById(id: string): SwarmRepo | null {
+  const row = getDb()
+    .prepare<SwarmRepoRow, [string]>("SELECT * FROM swarm_repos WHERE id = ?")
+    .get(id);
+  return row ? rowToSwarmRepo(row) : null;
+}
+
+export function getSwarmRepoByName(name: string): SwarmRepo | null {
+  const row = getDb()
+    .prepare<SwarmRepoRow, [string]>("SELECT * FROM swarm_repos WHERE name = ?")
+    .get(name);
+  return row ? rowToSwarmRepo(row) : null;
+}
+
+export function getSwarmRepoByUrl(url: string): SwarmRepo | null {
+  const row = getDb()
+    .prepare<SwarmRepoRow, [string]>("SELECT * FROM swarm_repos WHERE url = ?")
+    .get(url);
+  return row ? rowToSwarmRepo(row) : null;
+}
+
+export function createSwarmRepo(data: {
+  url: string;
+  name: string;
+  clonePath?: string;
+  defaultBranch?: string;
+  autoClone?: boolean;
+}): SwarmRepo {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const clonePath = data.clonePath || `/workspace/repos/${data.name}`;
+
+  const row = getDb()
+    .prepare<SwarmRepoRow, [string, string, string, string, string, number, string, string]>(
+      `INSERT INTO swarm_repos (id, url, name, clonePath, defaultBranch, autoClone, createdAt, lastUpdatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+    )
+    .get(
+      id,
+      data.url,
+      data.name,
+      clonePath,
+      data.defaultBranch ?? "main",
+      data.autoClone !== false ? 1 : 0,
+      now,
+      now,
+    );
+
+  if (!row) throw new Error("Failed to create repo");
+  return rowToSwarmRepo(row);
+}
+
+export function updateSwarmRepo(
+  id: string,
+  updates: Partial<{
+    url: string;
+    name: string;
+    clonePath: string;
+    defaultBranch: string;
+    autoClone: boolean;
+  }>,
+): SwarmRepo | null {
+  const setClauses: string[] = [];
+  const params: (string | number)[] = [];
+
+  const stringFields = ["url", "name", "clonePath", "defaultBranch"] as const;
+  for (const field of stringFields) {
+    if (updates[field] !== undefined) {
+      setClauses.push(`${field} = ?`);
+      params.push(updates[field]);
+    }
+  }
+  if (updates.autoClone !== undefined) {
+    setClauses.push("autoClone = ?");
+    params.push(updates.autoClone ? 1 : 0);
+  }
+
+  if (setClauses.length === 0) return getSwarmRepoById(id);
+
+  setClauses.push("lastUpdatedAt = ?");
+  params.push(new Date().toISOString());
+  params.push(id);
+
+  const row = getDb()
+    .prepare<SwarmRepoRow, (string | number)[]>(
+      `UPDATE swarm_repos SET ${setClauses.join(", ")} WHERE id = ? RETURNING *`,
+    )
+    .get(...params);
+
+  return row ? rowToSwarmRepo(row) : null;
+}
+
+export function deleteSwarmRepo(id: string): boolean {
+  const result = getDb().run("DELETE FROM swarm_repos WHERE id = ?", [id]);
+  return result.changes > 0;
+}
+
+// ============================================================================
+// Agent Memory Functions
+// ============================================================================
+
+type AgentMemoryRow = {
+  id: string;
+  agentId: string | null;
+  scope: string;
+  name: string;
+  content: string;
+  summary: string | null;
+  embedding: Buffer | null;
+  source: string;
+  sourceTaskId: string | null;
+  sourcePath: string | null;
+  chunkIndex: number;
+  totalChunks: number;
+  tags: string;
+  createdAt: string;
+  accessedAt: string;
+};
+
+function rowToAgentMemory(row: AgentMemoryRow): AgentMemory {
+  return {
+    id: row.id,
+    agentId: row.agentId,
+    scope: row.scope as AgentMemoryScope,
+    name: row.name,
+    content: row.content,
+    summary: row.summary,
+    source: row.source as AgentMemorySource,
+    sourceTaskId: row.sourceTaskId,
+    sourcePath: row.sourcePath,
+    chunkIndex: row.chunkIndex,
+    totalChunks: row.totalChunks,
+    tags: JSON.parse(row.tags || "[]"),
+    createdAt: row.createdAt,
+    accessedAt: row.accessedAt,
+  };
+}
+
+export interface CreateMemoryOptions {
+  agentId?: string | null;
+  scope: AgentMemoryScope;
+  name: string;
+  content: string;
+  summary?: string | null;
+  embedding?: Buffer | null;
+  source: AgentMemorySource;
+  sourceTaskId?: string | null;
+  sourcePath?: string | null;
+  chunkIndex?: number;
+  totalChunks?: number;
+  tags?: string[];
+}
+
+export function createMemory(data: CreateMemoryOptions): AgentMemory {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const row = getDb()
+    .prepare<
+      AgentMemoryRow,
+      [
+        string,
+        string | null,
+        string,
+        string,
+        string,
+        string | null,
+        Buffer | null,
+        string,
+        string | null,
+        string | null,
+        number,
+        number,
+        string,
+        string,
+        string,
+      ]
+    >(
+      `INSERT INTO agent_memory (id, agentId, scope, name, content, summary, embedding, source, sourceTaskId, sourcePath, chunkIndex, totalChunks, tags, createdAt, accessedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+    )
+    .get(
+      id,
+      data.agentId ?? null,
+      data.scope,
+      data.name,
+      data.content,
+      data.summary ?? null,
+      data.embedding ?? null,
+      data.source,
+      data.sourceTaskId ?? null,
+      data.sourcePath ?? null,
+      data.chunkIndex ?? 0,
+      data.totalChunks ?? 1,
+      JSON.stringify(data.tags ?? []),
+      now,
+      now,
+    );
+
+  if (!row) throw new Error("Failed to create memory");
+  return rowToAgentMemory(row);
+}
+
+export function getMemoryById(id: string): AgentMemory | null {
+  const row = getDb()
+    .prepare<AgentMemoryRow, [string]>("SELECT * FROM agent_memory WHERE id = ?")
+    .get(id);
+  if (!row) return null;
+
+  // Update accessedAt
+  getDb()
+    .prepare("UPDATE agent_memory SET accessedAt = ? WHERE id = ?")
+    .run(new Date().toISOString(), id);
+
+  return rowToAgentMemory(row);
+}
+
+export function updateMemoryEmbedding(id: string, embedding: Buffer): void {
+  getDb().prepare("UPDATE agent_memory SET embedding = ? WHERE id = ?").run(embedding, id);
+}
+
+export interface SearchMemoriesOptions {
+  scope?: "agent" | "swarm" | "all";
+  limit?: number;
+  source?: AgentMemorySource;
+  isLead?: boolean;
+}
+
+export function searchMemoriesByVector(
+  queryEmbedding: Float32Array,
+  agentId: string,
+  options: SearchMemoriesOptions = {},
+): (AgentMemory & { similarity: number })[] {
+  const { scope = "all", limit = 10, source, isLead = false } = options;
+
+  // Build WHERE clause
+  const conditions: string[] = ["embedding IS NOT NULL"];
+  const params: (string | null)[] = [];
+
+  if (!isLead) {
+    // Workers see their own agent-scoped + all swarm-scoped
+    if (scope === "agent") {
+      conditions.push("agentId = ? AND scope = 'agent'");
+      params.push(agentId);
+    } else if (scope === "swarm") {
+      conditions.push("scope = 'swarm'");
+    } else {
+      // "all" - own agent + swarm
+      conditions.push("(agentId = ? OR scope = 'swarm')");
+      params.push(agentId);
+    }
+  } else {
+    // Leads see everything
+    if (scope === "agent") {
+      conditions.push("scope = 'agent'");
+    } else if (scope === "swarm") {
+      conditions.push("scope = 'swarm'");
+    }
+    // "all" for lead = no scope filter needed
+  }
+
+  if (source) {
+    conditions.push("source = ?");
+    params.push(source);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  const rows = getDb()
+    .prepare<AgentMemoryRow, (string | null)[]>(`SELECT * FROM agent_memory ${whereClause}`)
+    .all(...params);
+
+  // Import cosine similarity inline to avoid circular deps
+  const { cosineSimilarity, deserializeEmbedding } = require("./embedding");
+
+  // Compute similarities and sort
+  const results: (AgentMemory & { similarity: number })[] = [];
+  for (const row of rows) {
+    if (!row.embedding) continue;
+    const embedding = deserializeEmbedding(row.embedding);
+    // Skip embeddings with mismatched dimensions (can happen if embedding model changes)
+    if (embedding.length !== queryEmbedding.length) continue;
+    const similarity = cosineSimilarity(queryEmbedding, embedding) as number;
+    results.push({ ...rowToAgentMemory(row), similarity });
+  }
+
+  results.sort((a, b) => b.similarity - a.similarity);
+  return results.slice(0, limit);
+}
+
+export interface ListMemoriesOptions {
+  scope?: "agent" | "swarm" | "all";
+  limit?: number;
+  offset?: number;
+  isLead?: boolean;
+}
+
+export function listMemoriesByAgent(
+  agentId: string,
+  options: ListMemoriesOptions = {},
+): AgentMemory[] {
+  const { scope = "all", limit = 20, offset = 0, isLead = false } = options;
+
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+
+  if (!isLead) {
+    if (scope === "agent") {
+      conditions.push("agentId = ? AND scope = 'agent'");
+      params.push(agentId);
+    } else if (scope === "swarm") {
+      conditions.push("scope = 'swarm'");
+    } else {
+      conditions.push("(agentId = ? OR scope = 'swarm')");
+      params.push(agentId);
+    }
+  } else {
+    if (scope === "agent") {
+      conditions.push("scope = 'agent'");
+    } else if (scope === "swarm") {
+      conditions.push("scope = 'swarm'");
+    }
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  params.push(limit, offset);
+
+  const rows = getDb()
+    .prepare<AgentMemoryRow, (string | number)[]>(
+      `SELECT * FROM agent_memory ${whereClause} ORDER BY createdAt DESC LIMIT ? OFFSET ?`,
+    )
+    .all(...params);
+
+  return rows.map(rowToAgentMemory);
+}
+
+export function deleteMemoriesBySourcePath(sourcePath: string, agentId: string): number {
+  const result = getDb()
+    .prepare("DELETE FROM agent_memory WHERE sourcePath = ? AND agentId = ?")
+    .run(sourcePath, agentId);
+  return result.changes;
+}
+
+export function deleteMemory(id: string): boolean {
+  const result = getDb().prepare("DELETE FROM agent_memory WHERE id = ?").run(id);
+  return result.changes > 0;
+}
+
+export function getMemoryStats(agentId: string): {
+  total: number;
+  bySource: Record<string, number>;
+  byScope: Record<string, number>;
+} {
+  const total = getDb()
+    .prepare<{ count: number }, [string]>(
+      "SELECT COUNT(*) as count FROM agent_memory WHERE agentId = ?",
+    )
+    .get(agentId);
+
+  const bySourceRows = getDb()
+    .prepare<{ source: string; count: number }, [string]>(
+      "SELECT source, COUNT(*) as count FROM agent_memory WHERE agentId = ? GROUP BY source",
+    )
+    .all(agentId);
+
+  const byScopeRows = getDb()
+    .prepare<{ scope: string; count: number }, [string]>(
+      "SELECT scope, COUNT(*) as count FROM agent_memory WHERE agentId = ? GROUP BY scope",
+    )
+    .all(agentId);
+
+  const bySource: Record<string, number> = {};
+  for (const row of bySourceRows) {
+    bySource[row.source] = row.count;
+  }
+
+  const byScope: Record<string, number> = {};
+  for (const row of byScopeRows) {
+    byScope[row.scope] = row.count;
+  }
+
+  return { total: total?.count ?? 0, bySource, byScope };
+}
+
+// ============================================================================
+// AgentMail Inbox Mapping Queries
+// ============================================================================
+
+export interface AgentMailInboxMapping {
+  id: string;
+  inboxId: string;
+  agentId: string;
+  inboxEmail: string | null;
+  createdAt: string;
+}
+
+export function getAgentMailInboxMapping(inboxId: string): AgentMailInboxMapping | null {
+  return (
+    getDb()
+      .prepare<AgentMailInboxMapping, [string]>(
+        "SELECT * FROM agentmail_inbox_mappings WHERE inboxId = ?",
+      )
+      .get(inboxId) ?? null
+  );
+}
+
+export function getAgentMailInboxMappingsByAgent(agentId: string): AgentMailInboxMapping[] {
+  return getDb()
+    .prepare<AgentMailInboxMapping, [string]>(
+      "SELECT * FROM agentmail_inbox_mappings WHERE agentId = ? ORDER BY createdAt DESC",
+    )
+    .all(agentId);
+}
+
+export function getAllAgentMailInboxMappings(): AgentMailInboxMapping[] {
+  return getDb()
+    .prepare<AgentMailInboxMapping, []>(
+      "SELECT * FROM agentmail_inbox_mappings ORDER BY createdAt DESC",
+    )
+    .all();
+}
+
+export function createAgentMailInboxMapping(
+  inboxId: string,
+  agentId: string,
+  inboxEmail?: string,
+): AgentMailInboxMapping {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  const row = getDb()
+    .prepare<AgentMailInboxMapping, [string, string, string, string | null, string]>(
+      `INSERT INTO agentmail_inbox_mappings (id, inboxId, agentId, inboxEmail, createdAt)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(inboxId) DO UPDATE SET agentId = excluded.agentId, inboxEmail = excluded.inboxEmail
+       RETURNING *`,
+    )
+    .get(id, inboxId, agentId, inboxEmail ?? null, now);
+
+  if (!row) throw new Error("Failed to create AgentMail inbox mapping");
+  return row;
+}
+
+export function deleteAgentMailInboxMapping(inboxId: string): boolean {
+  const result = getDb()
+    .prepare("DELETE FROM agentmail_inbox_mappings WHERE inboxId = ?")
+    .run(inboxId);
+  return result.changes > 0;
+}
+
+/**
+ * Find the most recent task by AgentMail thread ID
+ * Includes completed/failed tasks to maintain thread continuity via parentTaskId
+ */
+export function findTaskByAgentMailThread(agentmailThreadId: string): AgentTask | null {
+  const row = getDb()
+    .prepare<AgentTaskRow, [string]>(
+      `SELECT * FROM agent_tasks
+       WHERE agentmailThreadId = ?
+       ORDER BY createdAt DESC
+       LIMIT 1`,
+    )
+    .get(agentmailThreadId);
+  return row ? rowToAgentTask(row) : null;
+}
+
+// ============================================================================
+// Active Sessions (runner session tracking for concurrency awareness)
+// ============================================================================
+
+export function insertActiveSession(session: {
+  agentId: string;
+  taskId?: string;
+  triggerType: string;
+  inboxMessageId?: string;
+  taskDescription?: string;
+}): ActiveSession {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  const row = getDb()
+    .prepare<
+      ActiveSession,
+      [string, string, string | null, string, string | null, string | null, string, string]
+    >(
+      `INSERT INTO active_sessions (id, agentId, taskId, triggerType, inboxMessageId, taskDescription, startedAt, lastHeartbeatAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       RETURNING *`,
+    )
+    .get(
+      id,
+      session.agentId,
+      session.taskId ?? null,
+      session.triggerType,
+      session.inboxMessageId ?? null,
+      session.taskDescription ?? null,
+      now,
+      now,
+    );
+
+  if (!row) throw new Error("Failed to insert active session");
+  return row;
+}
+
+export function deleteActiveSession(taskId: string): boolean {
+  const result = getDb().prepare("DELETE FROM active_sessions WHERE taskId = ?").run(taskId);
+  return result.changes > 0;
+}
+
+export function deleteActiveSessionById(id: string): boolean {
+  const result = getDb().prepare("DELETE FROM active_sessions WHERE id = ?").run(id);
+  return result.changes > 0;
+}
+
+export function getActiveSessions(agentId?: string): ActiveSession[] {
+  if (agentId) {
+    return getDb()
+      .prepare<ActiveSession, [string]>(
+        "SELECT * FROM active_sessions WHERE agentId = ? ORDER BY startedAt DESC",
+      )
+      .all(agentId);
+  }
+  return getDb()
+    .prepare<ActiveSession, []>("SELECT * FROM active_sessions ORDER BY startedAt DESC")
+    .all();
+}
+
+export function heartbeatActiveSession(taskId: string): boolean {
+  const now = new Date().toISOString();
+  const result = getDb()
+    .prepare("UPDATE active_sessions SET lastHeartbeatAt = ? WHERE taskId = ?")
+    .run(now, taskId);
+  return result.changes > 0;
+}
+
+export function cleanupStaleSessions(maxAgeMinutes = 30): number {
+  const cutoff = new Date(Date.now() - maxAgeMinutes * 60 * 1000).toISOString();
+  const result = getDb()
+    .prepare("DELETE FROM active_sessions WHERE lastHeartbeatAt < ?")
+    .run(cutoff);
+  return result.changes;
+}
+
+export function cleanupAgentSessions(agentId: string): number {
+  const result = getDb().prepare("DELETE FROM active_sessions WHERE agentId = ?").run(agentId);
+  return result.changes;
+}
+
+// ============================================================================
+// Heartbeat / Triage Query Functions
+// ============================================================================
+
+/**
+ * Get in_progress tasks that haven't been updated within the given threshold.
+ * Used by the heartbeat to detect potentially stalled tasks.
+ */
+export function getStalledInProgressTasks(thresholdMinutes: number = 30): AgentTask[] {
+  const cutoff = new Date(Date.now() - thresholdMinutes * 60 * 1000).toISOString();
+  return getDb()
+    .prepare<AgentTaskRow, [string]>(
+      `SELECT * FROM agent_tasks
+       WHERE status = 'in_progress' AND lastUpdatedAt < ?
+       ORDER BY lastUpdatedAt ASC`,
+    )
+    .all(cutoff)
+    .map(rowToAgentTask);
+}
+
+/**
+ * Get idle, non-lead, non-offline agents that have capacity for more tasks.
+ * Used by the heartbeat for auto-assignment of pool tasks.
+ */
+export function getIdleWorkersWithCapacity(): Agent[] {
+  const agents = getDb()
+    .prepare<AgentRow, []>(
+      `SELECT * FROM agents
+       WHERE status = 'idle' AND isLead = 0`,
+    )
+    .all()
+    .map(rowToAgent);
+
+  return agents.filter((agent) => {
+    const activeCount = getActiveTaskCount(agent.id);
+    return activeCount < (agent.maxTasks ?? 1);
+  });
+}
+
+/**
+ * Get unassigned pool tasks ordered by priority (DESC) then creation time (ASC).
+ * Used by the heartbeat for auto-assignment.
+ */
+export function getUnassignedPoolTasks(limit: number = 10): AgentTask[] {
+  return getDb()
+    .prepare<AgentTaskRow, [number]>(
+      `SELECT * FROM agent_tasks
+       WHERE status = 'unassigned'
+       ORDER BY priority DESC, createdAt ASC
+       LIMIT ?`,
+    )
+    .all(limit)
+    .map(rowToAgentTask);
+}
+
+// ============================================================================
+// Workflow CRUD
+// ============================================================================
+
+type WorkflowRow = {
+  id: string;
+  name: string;
+  description: string | null;
+  enabled: number;
+  definition: string;
+  webhookSecret: string | null;
+  createdByAgentId: string | null;
+  createdAt: string;
+  lastUpdatedAt: string;
+};
+
+function rowToWorkflow(row: WorkflowRow): Workflow {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description ?? undefined,
+    enabled: row.enabled === 1,
+    definition: JSON.parse(row.definition) as WorkflowDefinition,
+    webhookSecret: row.webhookSecret ?? undefined,
+    createdByAgentId: row.createdByAgentId ?? undefined,
+    createdAt: row.createdAt,
+    lastUpdatedAt: row.lastUpdatedAt,
+  };
+}
+
+export function createWorkflow(data: {
+  name: string;
+  description?: string;
+  definition: WorkflowDefinition;
+  createdByAgentId?: string;
+}): Workflow {
+  const id = crypto.randomUUID();
+  const webhookSecret = crypto.randomUUID();
+  const row = getDb()
+    .prepare<WorkflowRow, [string, string, string | null, string, string, string | null]>(
+      `INSERT INTO workflows (id, name, description, definition, webhookSecret, createdByAgentId)
+       VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
+    )
+    .get(
+      id,
+      data.name,
+      data.description ?? null,
+      JSON.stringify(data.definition),
+      webhookSecret,
+      data.createdByAgentId ?? null,
+    );
+  if (!row) throw new Error("Failed to create workflow");
+  return rowToWorkflow(row);
+}
+
+export function getWorkflow(id: string): Workflow | null {
+  const row = getDb()
+    .prepare<WorkflowRow, [string]>("SELECT * FROM workflows WHERE id = ?")
+    .get(id);
+  return row ? rowToWorkflow(row) : null;
+}
+
+export function getWorkflowByWebhookSecret(secret: string): Workflow | null {
+  const row = getDb()
+    .prepare<WorkflowRow, [string]>("SELECT * FROM workflows WHERE webhookSecret = ?")
+    .get(secret);
+  return row ? rowToWorkflow(row) : null;
+}
+
+export function listWorkflows(filters?: { enabled?: boolean }): Workflow[] {
+  let query = "SELECT * FROM workflows WHERE 1=1";
+  const params: (string | number)[] = [];
+  if (filters?.enabled !== undefined) {
+    query += " AND enabled = ?";
+    params.push(filters.enabled ? 1 : 0);
+  }
+  query += " ORDER BY name ASC";
+  return getDb()
+    .prepare<WorkflowRow, (string | number)[]>(query)
+    .all(...params)
+    .map(rowToWorkflow);
+}
+
+export function updateWorkflow(
+  id: string,
+  data: {
+    name?: string;
+    description?: string;
+    enabled?: boolean;
+    definition?: WorkflowDefinition;
+  },
+): Workflow | null {
+  const updates: string[] = [];
+  const params: (string | number | null)[] = [];
+  if (data.name !== undefined) {
+    updates.push("name = ?");
+    params.push(data.name);
+  }
+  if (data.description !== undefined) {
+    updates.push("description = ?");
+    params.push(data.description);
+  }
+  if (data.enabled !== undefined) {
+    updates.push("enabled = ?");
+    params.push(data.enabled ? 1 : 0);
+  }
+  if (data.definition !== undefined) {
+    updates.push("definition = ?");
+    params.push(JSON.stringify(data.definition));
+  }
+  if (updates.length === 0) return getWorkflow(id);
+  updates.push("lastUpdatedAt = ?");
+  params.push(new Date().toISOString());
+  params.push(id);
+  const row = getDb()
+    .prepare<WorkflowRow, (string | number | null)[]>(
+      `UPDATE workflows SET ${updates.join(", ")} WHERE id = ? RETURNING *`,
+    )
+    .get(...params);
+  return row ? rowToWorkflow(row) : null;
+}
+
+export function deleteWorkflow(id: string): boolean {
+  const db = getDb();
+  // Cascade delete in FK-safe order:
+  // 1. Unlink agent_tasks (they reference steps and runs)
+  db.run(
+    `UPDATE agent_tasks SET workflowRunId = NULL, workflowRunStepId = NULL WHERE workflowRunId IN (SELECT id FROM workflow_runs WHERE workflowId = ?)`,
+    [id],
+  );
+  // 2. Delete steps (they reference runs)
+  db.run(
+    `DELETE FROM workflow_run_steps WHERE runId IN (SELECT id FROM workflow_runs WHERE workflowId = ?)`,
+    [id],
+  );
+  // 3. Delete runs (they reference workflow)
+  db.run("DELETE FROM workflow_runs WHERE workflowId = ?", [id]);
+  // 4. Delete workflow
+  const result = db.run("DELETE FROM workflows WHERE id = ?", [id]);
+  return result.changes > 0;
+}
+
+// ============================================================================
+// Workflow Run CRUD
+// ============================================================================
+
+type WorkflowRunRow = {
+  id: string;
+  workflowId: string;
+  status: string;
+  triggerData: string | null;
+  context: string | null;
+  error: string | null;
+  startedAt: string;
+  lastUpdatedAt: string;
+  finishedAt: string | null;
+};
+
+function rowToWorkflowRun(row: WorkflowRunRow): WorkflowRun {
+  return {
+    id: row.id,
+    workflowId: row.workflowId,
+    status: row.status as WorkflowRunStatus,
+    triggerData: row.triggerData ? JSON.parse(row.triggerData) : undefined,
+    context: row.context ? (JSON.parse(row.context) as Record<string, unknown>) : undefined,
+    error: row.error ?? undefined,
+    startedAt: row.startedAt,
+    lastUpdatedAt: row.lastUpdatedAt,
+    finishedAt: row.finishedAt ?? undefined,
+  };
+}
+
+export function createWorkflowRun(data: {
+  id: string;
+  workflowId: string;
+  triggerData?: unknown;
+}): WorkflowRun {
+  const row = getDb()
+    .prepare<WorkflowRunRow, [string, string, string | null]>(
+      `INSERT INTO workflow_runs (id, workflowId, triggerData) VALUES (?, ?, ?) RETURNING *`,
+    )
+    .get(data.id, data.workflowId, data.triggerData ? JSON.stringify(data.triggerData) : null);
+  if (!row) throw new Error("Failed to create workflow run");
+  return rowToWorkflowRun(row);
+}
+
+export function getWorkflowRun(id: string): WorkflowRun | null {
+  const row = getDb()
+    .prepare<WorkflowRunRow, [string]>("SELECT * FROM workflow_runs WHERE id = ?")
+    .get(id);
+  return row ? rowToWorkflowRun(row) : null;
+}
+
+export function updateWorkflowRun(
+  id: string,
+  data: {
+    status?: WorkflowRunStatus;
+    context?: Record<string, unknown>;
+    error?: string;
+    finishedAt?: string;
+  },
+): WorkflowRun | null {
+  const updates: string[] = [];
+  const params: (string | null)[] = [];
+  if (data.status !== undefined) {
+    updates.push("status = ?");
+    params.push(data.status);
+  }
+  if (data.context !== undefined) {
+    updates.push("context = ?");
+    params.push(JSON.stringify(data.context));
+  }
+  if (data.error !== undefined) {
+    updates.push("error = ?");
+    params.push(data.error);
+  }
+  if (data.finishedAt !== undefined) {
+    updates.push("finishedAt = ?");
+    params.push(data.finishedAt);
+  }
+  if (updates.length === 0) return getWorkflowRun(id);
+  updates.push("lastUpdatedAt = ?");
+  params.push(new Date().toISOString());
+  params.push(id);
+  const row = getDb()
+    .prepare<WorkflowRunRow, (string | null)[]>(
+      `UPDATE workflow_runs SET ${updates.join(", ")} WHERE id = ? RETURNING *`,
+    )
+    .get(...params);
+  return row ? rowToWorkflowRun(row) : null;
+}
+
+export function listWorkflowRuns(workflowId: string): WorkflowRun[] {
+  return getDb()
+    .prepare<WorkflowRunRow, [string]>(
+      "SELECT * FROM workflow_runs WHERE workflowId = ? ORDER BY startedAt DESC",
+    )
+    .all(workflowId)
+    .map(rowToWorkflowRun);
+}
+
+// ============================================================================
+// Workflow Run Step CRUD
+// ============================================================================
+
+type WorkflowRunStepRow = {
+  id: string;
+  runId: string;
+  nodeId: string;
+  nodeType: string;
+  status: string;
+  input: string | null;
+  output: string | null;
+  error: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+};
+
+function rowToWorkflowRunStep(row: WorkflowRunStepRow): WorkflowRunStep {
+  return {
+    id: row.id,
+    runId: row.runId,
+    nodeId: row.nodeId,
+    nodeType: row.nodeType,
+    status: row.status as WorkflowRunStepStatus,
+    input: row.input ? JSON.parse(row.input) : undefined,
+    output: row.output ? JSON.parse(row.output) : undefined,
+    error: row.error ?? undefined,
+    startedAt: row.startedAt,
+    finishedAt: row.finishedAt ?? undefined,
+  };
+}
+
+export function createWorkflowRunStep(data: {
+  id: string;
+  runId: string;
+  nodeId: string;
+  nodeType: string;
+  input?: unknown;
+}): WorkflowRunStep {
+  const row = getDb()
+    .prepare<WorkflowRunStepRow, [string, string, string, string, string | null]>(
+      `INSERT INTO workflow_run_steps (id, runId, nodeId, nodeType, status, input)
+       VALUES (?, ?, ?, ?, 'running', ?) RETURNING *`,
+    )
+    .get(
+      data.id,
+      data.runId,
+      data.nodeId,
+      data.nodeType,
+      data.input ? JSON.stringify(data.input) : null,
+    );
+  if (!row) throw new Error("Failed to create workflow run step");
+  return rowToWorkflowRunStep(row);
+}
+
+export function getWorkflowRunStep(id: string): WorkflowRunStep | null {
+  const row = getDb()
+    .prepare<WorkflowRunStepRow, [string]>("SELECT * FROM workflow_run_steps WHERE id = ?")
+    .get(id);
+  return row ? rowToWorkflowRunStep(row) : null;
+}
+
+export function updateWorkflowRunStep(
+  id: string,
+  data: {
+    status?: WorkflowRunStepStatus;
+    output?: unknown;
+    error?: string;
+    finishedAt?: string;
+  },
+): WorkflowRunStep | null {
+  const updates: string[] = [];
+  const params: (string | null)[] = [];
+  if (data.status !== undefined) {
+    updates.push("status = ?");
+    params.push(data.status);
+  }
+  if (data.output !== undefined) {
+    updates.push("output = ?");
+    params.push(JSON.stringify(data.output));
+  }
+  if (data.error !== undefined) {
+    updates.push("error = ?");
+    params.push(data.error);
+  }
+  if (data.finishedAt !== undefined) {
+    updates.push("finishedAt = ?");
+    params.push(data.finishedAt);
+  }
+  if (updates.length === 0) return getWorkflowRunStep(id);
+  params.push(id);
+  const row = getDb()
+    .prepare<WorkflowRunStepRow, (string | null)[]>(
+      `UPDATE workflow_run_steps SET ${updates.join(", ")} WHERE id = ? RETURNING *`,
+    )
+    .get(...params);
+  return row ? rowToWorkflowRunStep(row) : null;
+}
+
+export function getWorkflowRunStepsByRunId(runId: string): WorkflowRunStep[] {
+  return getDb()
+    .prepare<WorkflowRunStepRow, [string]>(
+      "SELECT * FROM workflow_run_steps WHERE runId = ? ORDER BY startedAt ASC",
+    )
+    .all(runId)
+    .map(rowToWorkflowRunStep);
+}
+
+// --- Stuck Workflow Run Recovery ---
+
+export interface StuckWorkflowRun {
+  runId: string;
+  stepId: string;
+  nodeId: string;
+  taskStatus: string;
+  taskOutput: string | null;
+  workflowId: string;
+}
+
+export function getStuckWorkflowRuns(): StuckWorkflowRun[] {
+  return getDb()
+    .prepare<StuckWorkflowRun, []>(
+      `SELECT
+        wr.id as runId,
+        wrs.id as stepId,
+        wrs.nodeId,
+        at.status as taskStatus,
+        at.output as taskOutput,
+        wr.workflowId
+      FROM workflow_runs wr
+      JOIN workflow_run_steps wrs ON wrs.runId = wr.id AND wrs.status = 'waiting'
+      JOIN agent_tasks at ON at.workflowRunStepId = wrs.id
+      WHERE wr.status = 'waiting'
+        AND at.status IN ('completed', 'failed', 'cancelled')`,
+    )
+    .all();
 }

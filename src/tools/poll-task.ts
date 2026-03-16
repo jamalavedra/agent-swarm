@@ -26,6 +26,8 @@ export const registerPollTaskTool = (server: McpServer) => {
       title: "Poll for a task",
       description:
         "Poll for a new task assignment. Returns immediately if there are offered tasks awaiting accept/reject. Also returns count of unassigned tasks in the pool.",
+      annotations: { readOnlyHint: true },
+
       inputSchema: z.object({}),
       outputSchema: z.object({
         yourAgentId: z.string().uuid().optional(),
@@ -79,26 +81,6 @@ export const registerPollTaskTool = (server: McpServer) => {
             yourAgentId: requestInfo.agentId,
             success: false,
             message: `Agent with ID "${agentId}" not found in the swarm.`,
-            offeredTasks: [],
-            availableCount: 0,
-            waitedForSeconds: 0,
-          },
-        };
-      }
-
-      // Lead agents should not poll for tasks - they use inbox tools instead
-      if (agent.isLead) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Lead agents should not poll for tasks. Use inbox tools to respond to Slack messages, or get-tasks to monitor workers.",
-            },
-          ],
-          structuredContent: {
-            yourAgentId: requestInfo.agentId,
-            success: false,
-            message: "Lead agents use inbox and delegation tools instead of polling for tasks.",
             offeredTasks: [],
             availableCount: 0,
             waitedForSeconds: 0,

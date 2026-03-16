@@ -15,6 +15,7 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
     "update-schedule",
     {
       title: "Update Scheduled Task",
+      annotations: { idempotentHint: true },
       description:
         "Update an existing scheduled task. Only the creator or lead agent can update schedules.",
       inputSchema: z.object({
@@ -31,6 +32,11 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
         targetAgentId: z.string().uuid().nullable().optional().describe("New target agent ID"),
         timezone: z.string().optional().describe("New timezone"),
         enabled: z.boolean().optional().describe("Enable or disable the schedule"),
+        model: z
+          .enum(["haiku", "sonnet", "opus"])
+          .nullable()
+          .optional()
+          .describe("Model to use for tasks created by this schedule. Set to null to clear."),
       }),
       outputSchema: z.object({
         yourAgentId: z.string().uuid().optional(),
@@ -53,6 +59,8 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
             nextRunAt: z.string().optional(),
             createdByAgentId: z.string().optional(),
             timezone: z.string(),
+            model: z.string().optional(),
+            scheduleType: z.string(),
             createdAt: z.string(),
             lastUpdatedAt: z.string(),
           })
@@ -74,6 +82,7 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
         targetAgentId,
         timezone,
         enabled,
+        model,
       },
       requestInfo,
       _meta,
@@ -116,6 +125,22 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
           structuredContent: {
             success: false,
             message: "Only the creator or lead can update this schedule.",
+          },
+        };
+      }
+
+      // Reject updates on completed one-time schedules
+      if (schedule.scheduleType === "one_time" && !schedule.enabled && schedule.lastRunAt) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `One-time schedule "${schedule.name}" has already executed. Create a new one instead.`,
+            },
+          ],
+          structuredContent: {
+            success: false,
+            message: `One-time schedule "${schedule.name}" has already executed. Create a new one instead.`,
           },
         };
       }
@@ -181,24 +206,31 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
         if (targetAgentId !== undefined) updateData.targetAgentId = targetAgentId;
         if (timezone !== undefined) updateData.timezone = timezone;
         if (enabled !== undefined) updateData.enabled = enabled;
+        if (model !== undefined) updateData.model = model;
 
-        // Recalculate nextRunAt if cron/interval/timezone changes or schedule is re-enabled
-        const needsNextRunRecalc =
-          cronExpression !== undefined ||
-          intervalMs !== undefined ||
-          timezone !== undefined ||
-          (enabled === true && !schedule.enabled);
+        // Recalculate nextRunAt based on schedule type
+        if (schedule.scheduleType === "one_time") {
+          // One-time schedules: no recalculation of nextRunAt via cron/interval
+          if (enabled === false) {
+            updateData.nextRunAt = undefined;
+          }
+        } else {
+          const needsNextRunRecalc =
+            cronExpression !== undefined ||
+            intervalMs !== undefined ||
+            timezone !== undefined ||
+            (enabled === true && !schedule.enabled);
 
-        if (needsNextRunRecalc && enabled !== false) {
-          const tempSchedule = {
-            cronExpression: cronExpression ?? schedule.cronExpression,
-            intervalMs: intervalMs ?? schedule.intervalMs,
-            timezone: timezone ?? schedule.timezone,
-          } as Parameters<typeof calculateNextRun>[0];
-          updateData.nextRunAt = calculateNextRun(tempSchedule, new Date());
-        } else if (enabled === false) {
-          // When disabling, clear nextRunAt
-          updateData.nextRunAt = undefined;
+          if (needsNextRunRecalc && enabled !== false) {
+            const tempSchedule = {
+              cronExpression: cronExpression ?? schedule.cronExpression,
+              intervalMs: intervalMs ?? schedule.intervalMs,
+              timezone: timezone ?? schedule.timezone,
+            } as Parameters<typeof calculateNextRun>[0];
+            updateData.nextRunAt = calculateNextRun(tempSchedule, new Date());
+          } else if (enabled === false) {
+            updateData.nextRunAt = undefined;
+          }
         }
 
         const updated = updateScheduledTask(schedule.id, updateData);

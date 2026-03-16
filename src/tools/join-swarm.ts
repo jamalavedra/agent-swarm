@@ -3,6 +3,8 @@ import * as z from "zod";
 import {
   createAgent,
   generateDefaultClaudeMd,
+  generateDefaultIdentityMd,
+  generateDefaultSoulMd,
   getAllAgents,
   getDb,
   updateAgentProfile,
@@ -17,6 +19,8 @@ export const registerJoinSwarmTool = (server: McpServer) => {
       title: "Join the agent swarm",
       description:
         "Tool for an agent to join the swarm of agents with optional profile information.",
+      annotations: { idempotentHint: true },
+
       inputSchema: z.object({
         requestedId: z
           .string()
@@ -96,20 +100,29 @@ export const registerJoinSwarmTool = (server: McpServer) => {
             capabilities: [],
           });
 
-          // Generate default CLAUDE.md with agent info
+          // Generate default CLAUDE.md, SOUL.md, and IDENTITY.md
           const defaultClaudeMd = generateDefaultClaudeMd({
             name,
             description,
             role,
             capabilities,
           });
+          const defaultSoulMd = generateDefaultSoulMd({ name, role });
+          const defaultIdentityMd = generateDefaultIdentityMd({
+            name,
+            description,
+            role,
+            capabilities,
+          });
 
-          // Update profile with any provided fields and the default CLAUDE.md
+          // Update profile with any provided fields and the default templates
           const updatedAgent = updateAgentProfile(agent.id, {
             description,
             role,
             capabilities,
             claudeMd: defaultClaudeMd,
+            soulMd: defaultSoulMd,
+            identityMd: defaultIdentityMd,
           });
 
           return updatedAgent ?? agent;
