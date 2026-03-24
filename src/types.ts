@@ -63,6 +63,7 @@ export const AgentTaskSourceSchema = z.enum([
   "system",
   "schedule",
   "workflow",
+  "linear",
 ]);
 export type AgentTaskSource = z.infer<typeof AgentTaskSourceSchema>;
 
@@ -139,6 +140,9 @@ export const AgentTaskSchema = z.object({
   // Workflow linking (optional — set when task was created by a workflow)
   workflowRunId: z.string().uuid().nullable().optional(),
   workflowRunStepId: z.string().uuid().nullable().optional(),
+
+  // Structured output schema (optional — JSON Schema that task output must conform to)
+  outputSchema: z.record(z.string(), z.unknown()).optional(),
 });
 
 export const AgentStatusSchema = z.enum(["idle", "busy", "offline"]);
@@ -539,6 +543,8 @@ export const ActiveSessionSchema = z.object({
   triggerType: z.string(),
   inboxMessageId: z.string().nullable(),
   taskDescription: z.string().nullable(),
+  runnerSessionId: z.string().nullable(),
+  providerSessionId: z.string().nullable(),
   startedAt: z.iso.datetime(),
   lastHeartbeatAt: z.iso.datetime(),
 });
@@ -549,30 +555,93 @@ export type ActiveSession = z.infer<typeof ActiveSessionSchema>;
 // Workflow Engine Types
 // ============================================================================
 
-export const WorkflowNodeTypeSchema = z.enum([
-  "trigger-new-task",
-  "trigger-task-completed",
-  "trigger-webhook",
-  "trigger-email",
-  "trigger-slack-message",
-  "trigger-github-event",
-  "trigger-gitlab-event",
-  "llm-classify",
-  "property-match",
-  "code-match",
-  "create-task",
-  "send-message",
-  "delegate-to-agent",
-]);
-export type WorkflowNodeType = z.infer<typeof WorkflowNodeTypeSchema>;
+// --- Retry Policy ---
+
+export const RetryPolicySchema = z.object({
+  maxRetries: z.number().int().min(0).default(3),
+  strategy: z.enum(["exponential", "static", "linear"]).default("exponential"),
+  baseDelayMs: z.number().int().min(0).default(1000),
+  maxDelayMs: z.number().int().min(0).default(60000),
+});
+export type RetryPolicy = z.infer<typeof RetryPolicySchema>;
+
+// --- Executor Metadata ---
+
+export const ExecutorMetaSchema = z.object({
+  runId: z.string().uuid(),
+  stepId: z.string().uuid(),
+  nodeId: z.string(),
+  workflowId: z.string().uuid(),
+  dryRun: z.boolean().default(false),
+});
+export type ExecutorMeta = z.infer<typeof ExecutorMetaSchema>;
+
+// --- Validation ---
+
+export const ValidationResultSchema = z.object({
+  pass: z.boolean(),
+  reasoning: z.string(),
+  confidence: z.number().min(0).max(1),
+});
+export type ValidationResult = z.infer<typeof ValidationResultSchema>;
+
+export const StepValidationConfigSchema = z.object({
+  executor: z.string().default("validate"),
+  config: z.record(z.string(), z.unknown()),
+  mustPass: z.boolean().default(false),
+  retry: RetryPolicySchema.optional(),
+});
+export type StepValidationConfig = z.infer<typeof StepValidationConfigSchema>;
+
+// --- Workflow Node (nodes-with-next) ---
 
 export const WorkflowNodeSchema = z.object({
-  id: z.string(),
-  type: WorkflowNodeTypeSchema,
-  label: z.string().optional(),
-  config: z.record(z.string(), z.unknown()),
+  id: z.string().describe("Unique node identifier, used in 'next' and 'inputs' mappings"),
+  type: z
+    .string()
+    .describe("Executor type: 'agent-task', 'script', 'raw-llm', 'validate', 'property-match'"),
+  label: z.string().optional().describe("Human-readable label for UI display"),
+  config: z
+    .record(z.string(), z.unknown())
+    .describe(
+      "Executor-specific config. For agent-task: { template, outputSchema?, agentId?, tags?, priority?, dir?, vcsRepo?, model? }. " +
+        "Values support {{interpolation}} from the node's inputs context. " +
+        "NOTE: config.outputSchema on agent-task nodes validates the AGENT's raw JSON output, " +
+        "while node-level outputSchema validates the EXECUTOR's return value ({taskId, taskOutput}).",
+    ),
+  next: z
+    .union([z.string(), z.array(z.string()), z.record(z.string(), z.string())])
+    .optional()
+    .describe(
+      "Next node(s): string for simple chaining, string[] for fan-out to parallel nodes, or record for port-based routing ({pass: 'a', fail: 'b'})",
+    ),
+  validation: StepValidationConfigSchema.optional(),
+  retry: RetryPolicySchema.optional(),
+  // REQUIRED for cross-node data access — without this, only 'trigger' and 'input' are available for interpolation.
+  inputs: z
+    .record(z.string(), z.string())
+    .optional()
+    .describe(
+      "REQUIRED for cross-node data access. Maps local names to context paths. " +
+        "Without this, upstream step outputs are NOT available for interpolation — only 'trigger' and 'input' are. " +
+        'Example: { "cityData": "generate-city" } → use {{cityData.taskOutput.field}} in config templates. ' +
+        'For trigger data: { "pr": "trigger.pullRequest" }.',
+    ),
+  inputSchema: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe("JSON Schema to validate resolved inputs before execution"),
+  outputSchema: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe(
+      "JSON Schema to validate the executor's output (e.g. {taskId, taskOutput} for agent-task). " +
+        "Different from config.outputSchema which validates the agent's raw output.",
+    ),
 });
 export type WorkflowNode = z.infer<typeof WorkflowNodeSchema>;
+
+// --- Workflow Edge (derived — for UI rendering) ---
 
 export const WorkflowEdgeSchema = z.object({
   id: z.string(),
@@ -582,11 +651,100 @@ export const WorkflowEdgeSchema = z.object({
 });
 export type WorkflowEdge = z.infer<typeof WorkflowEdgeSchema>;
 
+// --- Workflow Definition (nodes-only, no explicit edges) ---
+
 export const WorkflowDefinitionSchema = z.object({
-  nodes: z.array(WorkflowNodeSchema),
-  edges: z.array(WorkflowEdgeSchema),
+  nodes: z.array(WorkflowNodeSchema).min(1),
+  onNodeFailure: z
+    .enum(["fail", "continue"])
+    .default("fail")
+    .describe(
+      "Behavior when a node's task fails or is cancelled. " +
+        "'fail' (default): mark the entire run as failed. " +
+        "'continue': treat the failed node as completed with error output and proceed — " +
+        "downstream convergence nodes receive '[FAILED: reason]' and can handle partial results.",
+    ),
 });
 export type WorkflowDefinition = z.infer<typeof WorkflowDefinitionSchema>;
+
+// --- Trigger Configuration ---
+
+export const TriggerConfigSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("webhook"),
+    hmacSecret: z.string().optional(),
+    hmacHeader: z.string().default("X-Hub-Signature-256"),
+  }),
+  z.object({
+    type: z.literal("schedule"),
+    scheduleId: z.string().uuid(),
+  }),
+]);
+export type TriggerConfig = z.infer<typeof TriggerConfigSchema>;
+
+// --- Cooldown Configuration ---
+
+export const CooldownConfigSchema = z
+  .object({
+    hours: z.number().min(0).optional(),
+    minutes: z.number().min(0).optional(),
+    seconds: z.number().min(0).optional(),
+  })
+  .refine((v) => v.hours !== undefined || v.minutes !== undefined || v.seconds !== undefined, {
+    message: "At least one of hours, minutes, or seconds is required",
+  });
+export type CooldownConfig = z.infer<typeof CooldownConfigSchema>;
+
+// --- Input Value Resolution ---
+
+export const InputValueSchema = z.union([
+  z
+    .string()
+    .regex(/^\$\{.+\}$/), // env var: ${MY_VAR}
+  z
+    .string()
+    .regex(/^secret\..+$/), // swarm secret: secret.OPENAI_KEY
+  z.string(), // literal value
+]);
+export type InputValue = z.infer<typeof InputValueSchema>;
+
+// --- Workflow Template ---
+
+export const WorkflowTemplateSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+  description: z.string(),
+  category: z.string(),
+  variables: z.array(
+    z.object({
+      name: z.string(),
+      description: z.string(),
+      type: z.enum(["string", "number", "boolean"]),
+      default: z.unknown().optional(),
+      required: z.boolean().default(true),
+    }),
+  ),
+  definition: WorkflowDefinitionSchema,
+});
+export type WorkflowTemplate = z.infer<typeof WorkflowTemplateSchema>;
+
+// --- Workflow Snapshot (for version history) ---
+
+export const WorkflowSnapshotSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  definition: WorkflowDefinitionSchema,
+  triggers: z.array(TriggerConfigSchema),
+  cooldown: CooldownConfigSchema.optional(),
+  input: z.record(z.string(), InputValueSchema).optional(),
+  triggerSchema: z.record(z.string(), z.unknown()).optional(),
+  dir: z.string().min(1).startsWith("/").optional(),
+  vcsRepo: z.string().min(1).optional(),
+  enabled: z.boolean(),
+});
+export type WorkflowSnapshot = z.infer<typeof WorkflowSnapshotSchema>;
+
+// --- Workflow ---
 
 export const WorkflowSchema = z.object({
   id: z.string().uuid(),
@@ -594,14 +752,39 @@ export const WorkflowSchema = z.object({
   description: z.string().optional(),
   enabled: z.boolean(),
   definition: WorkflowDefinitionSchema,
-  webhookSecret: z.string().optional(),
+  triggers: z.array(TriggerConfigSchema).default([]),
+  cooldown: CooldownConfigSchema.optional(),
+  input: z.record(z.string(), InputValueSchema).optional(),
+  triggerSchema: z.record(z.string(), z.unknown()).optional(),
+  dir: z.string().min(1).startsWith("/").optional(),
+  vcsRepo: z.string().min(1).optional(),
   createdByAgentId: z.string().uuid().optional(),
   createdAt: z.string(),
   lastUpdatedAt: z.string(),
 });
 export type Workflow = z.infer<typeof WorkflowSchema>;
 
-export const WorkflowRunStatusSchema = z.enum(["running", "waiting", "completed", "failed"]);
+// --- Workflow Version ---
+
+export const WorkflowVersionSchema = z.object({
+  id: z.string().uuid(),
+  workflowId: z.string().uuid(),
+  version: z.number().int().min(1),
+  snapshot: WorkflowSnapshotSchema,
+  changedByAgentId: z.string().uuid().optional(),
+  createdAt: z.string(),
+});
+export type WorkflowVersion = z.infer<typeof WorkflowVersionSchema>;
+
+// --- Workflow Run ---
+
+export const WorkflowRunStatusSchema = z.enum([
+  "running",
+  "waiting",
+  "completed",
+  "failed",
+  "skipped",
+]);
 export type WorkflowRunStatus = z.infer<typeof WorkflowRunStatusSchema>;
 
 export const WorkflowRunSchema = z.object({
@@ -616,6 +799,8 @@ export const WorkflowRunSchema = z.object({
   finishedAt: z.string().optional(),
 });
 export type WorkflowRun = z.infer<typeof WorkflowRunSchema>;
+
+// --- Workflow Run Step ---
 
 export const WorkflowRunStepStatusSchema = z.enum([
   "pending",
@@ -638,5 +823,49 @@ export const WorkflowRunStepSchema = z.object({
   error: z.string().optional(),
   startedAt: z.string(),
   finishedAt: z.string().optional(),
+  retryCount: z.number().int().min(0).default(0),
+  maxRetries: z.number().int().min(0).default(3),
+  nextRetryAt: z.string().optional(),
+  idempotencyKey: z.string().optional(),
+  diagnostics: z.string().optional(),
+  nextPort: z.string().optional(),
 });
 export type WorkflowRunStep = z.infer<typeof WorkflowRunStepSchema>;
+
+// ============================================================================
+// Prompt Template Types
+// ============================================================================
+
+export const PromptTemplateScopeSchema = z.enum(["global", "agent", "repo"]);
+export const PromptTemplateStateSchema = z.enum([
+  "enabled",
+  "default_prompt_fallback",
+  "skip_event",
+]);
+
+export const PromptTemplateSchema = z.object({
+  id: z.string(),
+  eventType: z.string(),
+  scope: PromptTemplateScopeSchema,
+  scopeId: z.string().nullable(),
+  state: PromptTemplateStateSchema,
+  body: z.string(),
+  isDefault: z.boolean(),
+  version: z.number(),
+  createdBy: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type PromptTemplate = z.infer<typeof PromptTemplateSchema>;
+
+export const PromptTemplateHistorySchema = z.object({
+  id: z.string(),
+  templateId: z.string(),
+  version: z.number(),
+  body: z.string(),
+  state: z.string(),
+  changedBy: z.string().nullable(),
+  changedAt: z.string(),
+  changeReason: z.string().nullable(),
+});
+export type PromptTemplateHistory = z.infer<typeof PromptTemplateHistorySchema>;

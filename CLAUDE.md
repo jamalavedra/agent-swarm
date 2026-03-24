@@ -88,12 +88,124 @@ templates/       # Template data (official + community)
 templates-ui/    # Templates registry (Next.js app)
 ```
 
+## Architecture Invariants
+
+**Worker/API DB boundary**: The API server (`src/http.ts`, `src/server.ts`, `src/tools/`, `src/http/`) is the **sole owner** of the SQLite database. Worker-side code (`src/commands/`, `src/hooks/`, `src/providers/`, `src/prompts/`, `src/cli.tsx`, `src/claude.ts`) must **never** import from `src/be/db` or `bun:sqlite`. Workers communicate with the API exclusively via HTTP using `API_KEY` and `X-Agent-ID` headers.
+
+Enforced by `scripts/check-db-boundary.sh` (pre-push hook + CI merge gate). If you need to share pure logic between API and worker code, put it in a shared module (e.g., `src/prompts/`, `src/utils/`).
+
 ## Code Style
 
 - Run `bun run lint:fix` before committing (lint + format)
 - Run `bun run format` for formatting only
 - Use Bun APIs, not Node.js equivalents
 - Prefer `Bun.$` over execa for shell commands
+- Use `google/gemini-3-flash-preview` as the default Gemini model in tests, workflows, and examples (not `gemini-2.0-flash-001`)
+
+### CLI Commands & Help System
+
+CLI help is plain `console.log` (not Ink), defined in `src/cli.tsx` via the `COMMAND_HELP` record and `printHelp()` function.
+
+**When adding or modifying CLI commands:**
+1. Add/update the command's entry in the `COMMAND_HELP` record (usage, description, options, examples)
+2. Add the command to the `commands` array in `printHelp()` (general help listing)
+3. Add routing in the `App` switch statement (UI commands) or the non-UI section before `render()` (simple commands like `docs`, `help`, `version`)
+4. Run `bun run src/cli.tsx help` and `bun run src/cli.tsx <command> --help` to verify
+
+**Command types:**
+- **Non-UI commands** (handled before `render()`): `help`, `version`, `docs`, `hook`, `artifact` — use `console.log` + `process.exit(0)`
+- **UI commands** (rendered by Ink): `onboard`, `connect`, `api`, `claude`, `worker`, `lead` — return JSX from the `App` switch
+
+### Adding HTTP Endpoints
+
+**Always use the `route()` factory** from `src/http/route-def.ts` when creating new REST endpoints. This auto-registers the route in the OpenAPI spec. Do NOT use raw `matchRoute` — it bypasses OpenAPI generation.
+
+```typescript
+// In src/http/my-feature.ts
+import { route } from "./route-def";
+
+const myRoute = route({
+  method: "post",
+  path: "/api/my-feature",
+  pattern: ["api", "my-feature"],
+  summary: "What this endpoint does",
+  tags: ["MyTag"],
+  body: z.object({ ... }),
+  responses: { 200: { description: "Success" }, 400: { description: "Error" } },
+  auth: { apiKey: true },
+});
+
+export async function handleMyFeature(req, res, pathSegments, queryParams): Promise<boolean> {
+  if (!myRoute.match(req.method, pathSegments)) return false;
+  const parsed = await myRoute.parse(req, res, pathSegments, queryParams);
+  if (!parsed) return true; // parse() already sent 400
+  // ... business logic using parsed.body, parsed.params, parsed.query
+  json(res, result);
+  return true;
+}
+```
+
+After creating the handler:
+1. Import and add to handler chain in `src/http/index.ts`
+2. Add the import to `scripts/generate-openapi.ts` (for spec generation)
+3. Run `bun run docs:openapi` to regenerate `openapi.json` and commit it
+
+## Workflow Authoring Guide
+
+Workflows are defined as a DAG of nodes connected via `next`. Key concepts for creating workflows with `create-workflow`:
+
+### Cross-node data access (`inputs` mapping)
+
+**By default, upstream step outputs are NOT available for interpolation.** Only `trigger` (trigger data) and `input` (workflow-level resolved inputs) are in scope. To access another node's output, you MUST declare an `inputs` mapping:
+
+```json
+{
+  "id": "summarize",
+  "type": "agent-task",
+  "inputs": { "cityData": "generate-city" },
+  "config": {
+    "template": "The city is {{cityData.taskOutput.city}} in {{cityData.taskOutput.country}}"
+  }
+}
+```
+
+- Keys are local names used in `{{interpolation}}`, values are context paths (usually a node ID)
+- Agent-task output shape is `{ taskId: string, taskOutput: <agent's JSON> }`, so access fields via `localName.taskOutput.field`
+- For trigger data: `{ "pr": "trigger.pullRequest" }` → `{{pr.number}}`
+- Without `inputs`, templates referencing upstream nodes silently resolve to empty strings (check `diagnostics.unresolvedTokens` on the step)
+
+### Structured output (`outputSchema`)
+
+There are **two different `outputSchema` locations** — they validate at different layers:
+
+| Location | Validates | Example schema |
+|----------|-----------|---------------|
+| `config.outputSchema` (inside config) | The **agent's raw JSON** response | `{ type: "object", required: ["city"], properties: { city: { type: "string" } } }` |
+| Node-level `outputSchema` (sibling of config) | The **executor's return** (`{ taskId, taskOutput }` for agent-task) | Rarely needed — executor schemas are built-in |
+
+For agent-task nodes, put your schema in `config.outputSchema`. The agent will be prompted to produce JSON matching this schema, and `store-progress` validates it inline.
+
+### Interpolation
+
+- Syntax: `{{path.to.value}}` in any string field inside `config`
+- Paths traverse the interpolation context (built from `inputs` + `trigger` + `input`)
+- Objects are JSON-stringified, nulls resolve to empty string
+- Unresolved tokens are logged in step `diagnostics` and the step proceeds (soft failure)
+
+### Agent-task executor config fields
+
+```
+template       (required) — Task description / prompt for the agent
+outputSchema   (optional) — JSON Schema for agent's structured output
+agentId        (optional) — Assign to specific agent (UUID)
+tags           (optional) — Task tags for filtering
+priority       (optional) — 0-100, default 50
+offerMode      (optional) — Offer to agent instead of direct assign
+dir            (optional) — Working directory for the agent
+vcsRepo        (optional) — Git repo for workspace scoping
+model          (optional) — Model override for the agent
+parentTaskId   (optional) — Link to parent task
+```
 
 ## Related
 
@@ -127,6 +239,9 @@ curl -H "Authorization: Bearer 123123" -H "X-Agent-ID: <uuid>" http://localhost:
 - `HARNESS_PROVIDER` - Provider selection: `claude` (default) or `pi` (pi-mono)
 - `TEMPLATE_ID` - Template for initial worker profile (e.g., `official/coder`). Fetched from registry on first boot.
 - `TEMPLATE_REGISTRY_URL` - Templates registry URL (default: https://templates.agent-swarm.dev)
+
+**Portless (local dev):**
+`bun run dev:http` uses [portless](https://port1355.dev/) → `https://api.swarm.localhost:1355`. Set `MCP_BASE_URL=https://api.swarm.localhost:1355` and `APP_URL=https://ui.swarm.localhost:1355` in `.env`. Update `.mcp.json` URL to match. Non-portless fallback: `bun run start:http`. Worktrees auto-get `<branch>.api.swarm.localhost:1355` subdomains.
 
 **Local Docker Compose (builds from source):**
 ```bash
@@ -240,6 +355,58 @@ Key differences between lead and worker env files:
 - `.env.docker` — worker-specific `AGENT_ID`, includes `OPENROUTER_API_KEY`
 - `AGENT_ROLE=lead` must be passed explicitly (not in the env file)
 
+### Entrypoint Integration Testing
+
+When modifying `docker-entrypoint.sh` (e.g. adding new conditional bootstrap logic), validate beyond `bash -n` syntax checks with a full Docker round-trip:
+
+1. **Validate API endpoints first**: Before Docker testing, verify the exact HTTP methods and paths used by `curl` calls in the entrypoint against the actual route definitions in `src/http/`. Common gotcha: config API uses `PUT /api/config` (not `POST`). Use `context-mode execute` for curl calls to avoid hook blocks.
+2. **Test idempotency**: Start a container (first boot = registers), stop it, start another with the same env file (same `AGENT_ID`). Second boot should skip registration via the config check (e.g. `if [ -z "$SOME_KEY" ]`).
+3. **Test failure mode**: Stop the external service, boot a container. The entrypoint should continue (via `|| true` guards) with a warning log.
+4. **Test lead vs worker paths**: Use `.env.docker-lead` + `-e AGENT_ROLE=lead` for lead, `.env.docker` for worker. They have different `AGENT_ID` values and different bootstrap paths.
+5. **Grep logs for your feature**: `docker logs <name> 2>&1 | grep -i "<feature>"` to verify the exact log lines.
+6. **Verify persisted state**: After boot, check `GET /api/config?includeSecrets=true` to confirm secrets/config were stored correctly.
+
+**Entrypoint E2E commands:**
+```bash
+# 1. Clean DB + start API
+rm -f agent-swarm-db.sqlite agent-swarm-db.sqlite-wal agent-swarm-db.sqlite-shm
+bun run start:http &
+
+# 2. Set any required global config (use PUT, not POST!)
+curl -s -X PUT "http://localhost:3013/api/config" \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"scope":"global","key":"SOME_KEY","value":"some-value","isSecret":false}'
+
+# 3. Build image with current code
+bun run docker:build:worker
+
+# 4. First boot (lead)
+docker run --rm -d --name e2e-lead \
+  --env-file .env.docker-lead -e AGENT_ROLE=lead \
+  -e MAX_CONCURRENT_TASKS=1 -p 3201:3000 agent-swarm-worker:latest
+
+# 5. First boot (worker)
+docker run --rm -d --name e2e-worker \
+  --env-file .env.docker \
+  -e MAX_CONCURRENT_TASKS=1 -p 3203:3000 agent-swarm-worker:latest
+
+# 6. Check logs (wait ~15s for boot)
+docker logs e2e-lead 2>&1 | grep -i "<feature>"
+docker logs e2e-worker 2>&1 | grep -i "<feature>"
+
+# 7. Idempotency: stop and restart same worker (same AGENT_ID)
+docker stop e2e-worker
+docker run --rm -d --name e2e-worker-2 \
+  --env-file .env.docker \
+  -e MAX_CONCURRENT_TASKS=1 -p 3203:3000 agent-swarm-worker:latest
+# Should see "Already registered" or equivalent skip message
+docker logs e2e-worker-2 2>&1 | grep -i "<feature>"
+
+# 8. Cleanup
+docker stop e2e-lead e2e-worker-2 2>/dev/null
+kill $(lsof -ti :3013) 2>/dev/null
+```
+
 ### MCP Tool Testing (Streamable HTTP)
 
 To test MCP tools via curl, you need a proper session handshake:
@@ -309,9 +476,10 @@ Before pushing a PR, run the checks that CI will enforce. Which checks to run de
 
 **Root project (src/, tools/, etc.):**
 ```bash
-bun run lint:fix        # Biome lint + format
-bun run tsc:check       # TypeScript type check
-bun test                # Unit tests
+bun run lint:fix             # Biome lint + format
+bun run tsc:check            # TypeScript type check
+bun test                     # Unit tests
+bash scripts/check-db-boundary.sh  # Worker/API DB boundary
 ```
 
 **If you changed `plugin/commands/*.md`:** Rebuild pi-mono skills and commit the result:
@@ -333,7 +501,13 @@ pnpm exec tsc --noEmit  # TypeScript type check
 
 All of these are enforced by the Merge Gate workflow (`.github/workflows/merge-gate.yml`). The gate job blocks merge if any check fails.
 
+**Local E2E (when changes touch runtime behavior):** After implementing changes to the API, runner, polling, task lifecycle, session logs, Docker entrypoint, or worker/lead behavior, run a local E2E test using the `swarm-local-e2e` skill (`.claude/skills/swarm-local-e2e/SKILL.md`). This spins up an API server + Docker lead/worker, creates tasks, and verifies end-to-end correctness. The skill should also be used when running `/desplega:implement-plan` or after a Claude Plan mode implementation — include it as the final verification phase.
+
 ---
+
+## Architecture Invariants
+
+**Workers have NO local database.** Docker workers (lead and worker containers) communicate with the API server exclusively via HTTP using `API_KEY` + `X-Agent-ID` headers. All state lives in the API server's SQLite DB. Workers never import `db.ts` functions that write/query the DB directly — they call REST API endpoints instead. If worker-side code needs data that lives in the DB (e.g. template resolution, config lookup), it must fetch it from the API via HTTP, not query a local SQLite instance.
 
 ## Bun Rules
 

@@ -97,6 +97,24 @@ export const DEFERRED_TOOLS = new Set([
   // AgentMail (1)
   "register-agentmail-inbox",
 
+  // Tracker (6)
+  "tracker-status",
+  "tracker-link-task",
+  "tracker-link-epic",
+  "tracker-unlink",
+  "tracker-sync-status",
+  "tracker-map-agent",
+
+  // Prompt Templates (5)
+  "list-prompt-templates",
+  "get-prompt-template",
+  "set-prompt-template",
+  "delete-prompt-template",
+  "preview-prompt-template",
+
+  // Debug (1)
+  "db-query",
+
   // Other (3)
   "cancel-task",
   "inject-learning",

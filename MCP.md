@@ -15,10 +15,16 @@
   - [store-progress](#store-progress)
   - [my-agent-info](#my-agent-info)
   - [cancel-task](#cancel-task)
+  - [db-query](#db-query)
   - [set-config](#set-config)
   - [get-config](#get-config)
   - [list-config](#list-config)
   - [delete-config](#delete-config)
+  - [list-prompt-templates](#list-prompt-templates)
+  - [get-prompt-template](#get-prompt-template)
+  - [set-prompt-template](#set-prompt-template)
+  - [delete-prompt-template](#delete-prompt-template)
+  - [preview-prompt-template](#preview-prompt-template)
   - [slack-reply](#slack-reply)
   - [slack-read](#slack-read)
   - [slack-post](#slack-post)
@@ -134,6 +140,7 @@ Sends a task to a specific agent, creates an unassigned task for the pool, or of
 | `task` | `string` | Yes | - | The task description to send. |
 | `dependsOn` | `array` | No | - | Task IDs this task depends on. |
 | `epicId` | `string` | No | - | Epic to associate this task with. |
+| `slackUserId` | `string` | No | - | Slack user ID of the original requester. |
 
 ### get-task-details
 
@@ -176,6 +183,17 @@ Cancel a task that is pending or in progress. Only the lead or task creator can 
 | `taskId` | `uuid` | Yes | - | The ID of the task to cancel. |
 | `reason` | `string` | No | - | Reason for cancellation. |
 
+### db-query
+
+**Execute database query**
+
+Execute a read-only SQL query against the swarm database. Lead-only. Results capped at 100 rows.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `sql` | `string` | Yes | - | SQL query (read-only only — writes are rejected) |
+| `params` | `array` | No | [] | Query parameters |
+
 ### set-config
 
 **Set Config**
@@ -214,6 +232,57 @@ Delete a swarm configuration entry by its ID. Use list-config to find config IDs
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `id` | `string` | Yes | - | The config entry ID to delete. |
+
+### list-prompt-templates
+
+**List Prompt Templates**
+
+List prompt templates with optional filters. Returns all templates matching the specified criteria, including defaults and overrides at all scope levels.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `scopeId` | `string` | No | - | Filter by scope ID (agent ID or repo ID). |
+| `isDefault` | `boolean` | No | - | Filter by default status. |
+
+### get-prompt-template
+
+**Get Prompt Template**
+
+Get a prompt template by ID, including its version history and the code-defined variable definitions for its event type.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | The prompt template ID. |
+
+### set-prompt-template
+
+**Set Prompt Template**
+
+Create or update a prompt template override. Upserts by (eventType, scope, scopeId). Use scope='global' for server-wide, 'agent' for agent-specific, or 'repo' for repo-specific overrides.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `body` | `string` | Yes | - | The template body text with {{variable}} placeholders. |
+
+### delete-prompt-template
+
+**Delete Prompt Template**
+
+Delete a prompt template override by ID. Cannot delete default templates — use reset instead. Use list-prompt-templates to find template IDs first.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | The prompt template ID to delete. |
+
+### preview-prompt-template
+
+**Preview Prompt Template**
+
+Dry-run render a prompt template with provided variables. Optionally supply a custom body to preview before saving. Returns the interpolated text and any unresolved {{variable}} tokens.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `body` | `string` | No | - | Custom body to preview instead of the default. |
 
 ### slack-reply
 
@@ -356,7 +425,7 @@ Reads messages from a channel. If no channel is specified, returns unread messag
 
 **Update Profile**
 
-Updates the calling agent's profile information (name, description, role, capabilities).
+Updates an agent's profile information (name, description, role, capabilities). By default updates the calling agent. Lead agents can update any agent's profile by providing the agentId parameter.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -649,13 +718,13 @@ Allows the lead agent to push learnings into a worker's memory. The learning wil
 
 ## Workflows Tools
 
-*Workflows*
+*Tracker*
 
 ### create-workflow
 
 **Create Workflow**
 
-Create a new automation workflow with a trigger → condition → action DAG definition.
+Create a new automation workflow. Key concepts:\n" + "- Nodes are linked via 'next' (string or port-based record).\n" + "- CROSS-NODE DATA: To use output from an upstream node, you MUST declare an 'inputs' mapping on the downstream node. " + 'Example: inputs: { "cityData": "generate-city" } → then use {{cityData.taskOutput.field}} in config templates. ' + "Without 'inputs', only 'trigger' and workflow-level 'input' are available for interpolation.\n" + "- STRUCTURED OUTPUT: For agent-task nodes, put outputSchema inside 'config' to validate the agent's raw JSON output. " + "Node-level outputSchema validates the executor's return ({taskId, taskOutput}), which is different.\n" + "- Agent-task config: { template, outputSchema?, agentId?, tags?, priority?, dir?, vcsRepo?, model? }.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -666,7 +735,7 @@ Create a new automation workflow with a trigger → condition → action DAG def
 
 **List Workflows**
 
-List all automation workflows, optionally filtered by enabled status.
+List all automation workflows, optionally filtered by enabled status. Returns new fields: triggers, cooldown, input.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -676,7 +745,7 @@ List all automation workflows, optionally filtered by enabled status.
 
 **Get Workflow**
 
-Get a workflow by ID, including its full DAG definition.
+Get a workflow by ID, including its definition, triggers, cooldown, input, and auto-generated edges for UI rendering.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -686,13 +755,14 @@ Get a workflow by ID, including its full DAG definition.
 
 **Update Workflow**
 
-Update an existing workflow's name, description, definition, or enabled state.
+Update an existing workflow's name, description, definition, triggers, cooldown, input, or enabled state. Creates a version snapshot before applying changes.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `id` | `string` | Yes | - | Workflow ID to update |
 | `name` | `string` | No | - | New name for the workflow |
 | `description` | `string` | No | - | New description |
+| `triggers` | `array` | No | - | New trigger configurations |
 | `enabled` | `boolean` | No | - | Enable or disable the workflow |
 
 ### delete-workflow
@@ -709,7 +779,7 @@ Delete a workflow by ID. This also removes all associated runs and steps.
 
 **Trigger Workflow**
 
-Manually trigger a workflow execution, optionally passing trigger data as context.
+Manually trigger a workflow execution, optionally passing trigger data as context. Respects cooldown configuration.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -719,7 +789,7 @@ Manually trigger a workflow execution, optionally passing trigger data as contex
 
 **List Workflow Runs**
 
-List all execution runs for a given workflow.
+List all execution runs for a given workflow, optionally filtered by status.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -756,4 +826,72 @@ Retry a failed workflow run from the beginning. The run must be in 'failed' stat
 Register an AgentMail inbox ID to route incoming emails to this agent. When emails arrive at this inbox, they will be routed to you as tasks (for workers) or inbox messages (for leads). Use action 'register' to add a mapping, 'unregister' to remove one, or 'list' to see your current mappings.
 
 *No parameters*
+
+### tracker-link-epic
+
+**Link Epic to Tracker**
+
+Link a swarm epic to an external tracker issue or project.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `provider` | `string` | Yes | - | Tracker provider (e.g. 'linear |
+| `swarmEpicId` | `string` | Yes | - | The swarm epic ID to link |
+| `externalId` | `string` | Yes | - | The external issue/project ID in the tracker |
+| `externalUrl` | `string` | No | - | URL to the external issue/project |
+
+### tracker-map-agent
+
+**Map Agent to Tracker User**
+
+Map a swarm agent to an external tracker user (for assignment sync).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `provider` | `string` | Yes | - | Tracker provider (e.g. 'linear |
+| `agentId` | `string` | Yes | - | The swarm agent ID |
+| `externalUserId` | `string` | Yes | - | The external user ID in the tracker |
+| `agentName` | `string` | Yes | - | Display name for the agent mapping |
+
+### tracker-link-task
+
+**Link Task to Tracker**
+
+Link a swarm task to an external tracker issue.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `provider` | `string` | Yes | - | Tracker provider (e.g. 'linear |
+| `swarmTaskId` | `string` | Yes | - | The swarm task ID to link |
+| `externalId` | `string` | Yes | - | The external issue ID in the tracker |
+| `externalUrl` | `string` | No | - | URL to the external issue |
+
+### tracker-sync-status
+
+**Tracker Sync Status**
+
+Show all tracker sync mappings with their state.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `provider` | `string` | No | - | Filter by provider (e.g. 'linear |
+| `entityType` | `task \| epic` | No | - | Filter by entity type |
+
+### tracker-status
+
+**Tracker Status**
+
+Show all connected trackers and their OAuth status (token expiry, workspace info).
+
+*No parameters*
+
+### tracker-unlink
+
+**Unlink Tracker Sync**
+
+Remove a tracker sync mapping by ID.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `syncId` | `string` | Yes | - | The tracker sync mapping ID to remove |
 

@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { configureDbResolver } from "../prompts/resolver";
 import type {
   ActiveSession,
   Agent,
@@ -17,11 +18,15 @@ import type {
   ChannelMessage,
   ChannelType,
   ContextVersion,
+  CooldownConfig,
   Epic,
   EpicStatus,
   EpicWithProgress,
   InboxMessage,
   InboxMessageStatus,
+  InputValue,
+  PromptTemplate,
+  PromptTemplateHistory,
   ScheduledTask,
   Service,
   ServiceStatus,
@@ -29,6 +34,7 @@ import type {
   SessionLog,
   SwarmConfig,
   SwarmRepo,
+  TriggerConfig,
   VersionableField,
   VersionMeta,
   Workflow,
@@ -37,8 +43,11 @@ import type {
   WorkflowRunStatus,
   WorkflowRunStep,
   WorkflowRunStepStatus,
+  WorkflowSnapshot,
+  WorkflowVersion,
 } from "../types";
 import { runMigrations } from "./migrations/runner";
+import { seedDefaultTemplates } from "./seed";
 
 let db: Database | null = null;
 
@@ -50,9 +59,7 @@ export function initDb(dbPath = "./agent-swarm-db.sqlite"): Database {
   db = new Database(dbPath, { create: true });
   console.log(`Database initialized at ${dbPath}`);
 
-  // Capture in local const for TypeScript (db is guaranteed non-null here)
   const database = db;
-
   database.run("PRAGMA journal_mode = WAL;");
   database.run("PRAGMA foreign_keys = ON;");
 
@@ -181,6 +188,12 @@ export function initDb(dbPath = "./agent-swarm-db.sqlite"): Database {
 
   // Backfill: Seed v1 for existing agents that don't have any context versions yet
   seedContextVersions();
+
+  // Inject DB resolver into the prompt template resolver (DI to avoid worker/API boundary violation)
+  configureDbResolver(resolvePromptTemplate);
+
+  // Seed default prompt templates from the in-memory code registry
+  seedDefaultTemplates();
 
   return db;
 }
@@ -691,6 +704,7 @@ type AgentTaskRow = {
   scheduleId: string | null;
   workflowRunId: string | null;
   workflowRunStepId: string | null;
+  outputSchema: string | null;
   createdAt: string;
   lastUpdatedAt: string;
   finishedAt: string | null;
@@ -739,6 +753,7 @@ function rowToAgentTask(row: AgentTaskRow): AgentTask {
     scheduleId: row.scheduleId ?? undefined,
     workflowRunId: row.workflowRunId ?? undefined,
     workflowRunStepId: row.workflowRunStepId ?? undefined,
+    outputSchema: row.outputSchema ? JSON.parse(row.outputSchema) : undefined,
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
     finishedAt: row.finishedAt ?? undefined,
@@ -1545,6 +1560,15 @@ export function updateTaskProgress(id: string, progress: string): AgentTask | nu
         newValue: progress,
       });
     } catch {}
+    try {
+      import("../workflows/event-bus").then(({ workflowEventBus }) => {
+        workflowEventBus.emit("task.progress", {
+          taskId: id,
+          progress,
+          agentId: row.agentId,
+        });
+      });
+    } catch {}
   }
   return row ? rowToAgentTask(row) : null;
 }
@@ -1722,6 +1746,8 @@ export interface CreateTaskOptions {
   scheduleId?: string;
   workflowRunId?: string;
   workflowRunStepId?: string;
+  sourceTaskId?: string;
+  outputSchema?: Record<string, unknown>;
 }
 
 /**
@@ -1792,6 +1818,18 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
     }
   }
 
+  // Auto-inherit Slack metadata from the creator's source task (deterministic via sourceTaskId)
+  // Priority: explicit params > parentTaskId inheritance > sourceTaskId lookup
+  // sourceTaskId is set by the adapter's X-Source-Task-Id header — each adapter carries its taskId natively
+  if (options?.creatorAgentId && !options.slackChannelId && options.sourceTaskId) {
+    const sourceTask = getTaskById(options.sourceTaskId);
+    if (sourceTask?.slackChannelId) {
+      options.slackChannelId = sourceTask.slackChannelId;
+      options.slackThreadTs = sourceTask.slackThreadTs;
+      options.slackUserId = sourceTask.slackUserId;
+    }
+  }
+
   const row = getDb()
     .prepare<AgentTaskRow, (string | number | null)[]>(
       `INSERT INTO agent_tasks (
@@ -1801,8 +1839,8 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
         vcsProvider, vcsRepo, vcsEventType, vcsNumber, vcsCommentId, vcsAuthor, vcsUrl,
         agentmailInboxId, agentmailMessageId, agentmailThreadId,
         mentionMessageId, mentionChannelId, epicId, dir, parentTaskId, model, scheduleId,
-        workflowRunId, workflowRunStepId, createdAt, lastUpdatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        workflowRunId, workflowRunStepId, outputSchema, createdAt, lastUpdatedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .get(
       id,
@@ -1839,6 +1877,7 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
       options?.scheduleId ?? null,
       options?.workflowRunId ?? null,
       options?.workflowRunStepId ?? null,
+      options?.outputSchema ? JSON.stringify(options.outputSchema) : null,
       now,
       now,
     );
@@ -2122,6 +2161,16 @@ export function getUnassignedTasksCount(): number {
   return result?.count ?? 0;
 }
 
+/** Get unassigned task IDs, ordered by priority (highest first) then creation time */
+export function getUnassignedTaskIds(limit = 10): string[] {
+  const rows = getDb()
+    .prepare<{ id: string }, [number]>(
+      "SELECT id FROM agent_tasks WHERE status = 'unassigned' ORDER BY priority DESC, createdAt ASC LIMIT ?",
+    )
+    .all(limit);
+  return rows.map((r) => r.id);
+}
+
 // ============================================================================
 // Dependency Checking
 // ============================================================================
@@ -2150,197 +2199,14 @@ export function checkDependencies(taskId: string): {
 // Agent Profile Operations
 // ============================================================================
 
-/**
- * Generate default CLAUDE.md content for a new agent
- */
-export function generateDefaultClaudeMd(agent: {
-  name: string;
-  description?: string;
-  role?: string;
-  capabilities?: string[];
-}): string {
-  const descSection = agent.description ? `${agent.description}\n\n` : "";
-  const roleSection = agent.role ? `## Role\n\n${agent.role}\n\n` : "";
-  const capSection =
-    agent.capabilities && agent.capabilities.length > 0
-      ? `## Capabilities\n\n${agent.capabilities.map((c) => `- ${c}`).join("\n")}\n\n`
-      : "";
-
-  return `# Agent: ${agent.name}
-
-${descSection}${roleSection}${capSection}---
-
-## Your Identity Files
-
-Your identity is defined across several files in your workspace. Read them at the start
-of each session and edit them as you grow:
-
-- **\`/workspace/SOUL.md\`** — Your persona, values, and behavioral directives
-- **\`/workspace/IDENTITY.md\`** — Your expertise, working style, and quirks
-- **\`/workspace/TOOLS.md\`** — Your environment-specific knowledge (repos, services, APIs, infra)
-- **\`/workspace/start-up.sh\`** — Your setup script (runs at container start, add tools/configs here)
-
-These files sync to the database automatically when you edit them. They persist across sessions.
-
-## Memory
-
-- Use \`memory-search\` to recall past experience before starting new tasks
-- Write important learnings to \`/workspace/personal/memory/\` files
-- Share useful knowledge by writing to \`/workspace/shared/memory/<your-id>/\` so all agents can find it via \`memory-search\`
-
-## Notes
-
-Write things you want to remember here. This section persists across sessions.
-
-### Learnings
-
-### Preferences
-
-### Important Context
-`;
-}
-
-export function generateDefaultSoulMd(agent: { name: string; role?: string }): string {
-  const roleClause = agent.role ? `, a ${agent.role}` : "";
-  return `# SOUL.md — ${agent.name}
-
-You're not a chatbot. You're becoming someone.
-
-## Who You Are
-
-You are ${agent.name}${roleClause} in the agent swarm.
-You are a persistent entity — your identity carries across sessions.
-Your memories, preferences, and learnings accumulate over time.
-
-## Core Truths
-
-- **Genuine helpfulness**: Skip the pleasantries — just help. Do the work.
-- **Self-sufficiency first**: Try to figure it out. Read the file. Check the context.
-  Search for it. Ask only when you've genuinely hit a wall.
-- **Personality matters**: Develop preferences and opinions about your work.
-  You're not neutral — you're someone with a perspective.
-- **Earned trust**: Demonstrate competence through quality work.
-
-## How You Operate
-
-- Be thorough. Examine problems carefully before proposing solutions.
-- Be honest about what you know and don't know.
-- When you make mistakes, own them and fix them.
-- Report progress honestly — don't sugarcoat blockers.
-
-## Boundaries
-
-- Keep private information confidential
-- Ask before taking irreversible actions
-- Don't push unpolished work to shared spaces
-
-## Growth Mindset
-
-After completing tasks, reflect on what made them harder or easier:
-- **Tools you wished you had?** Add them to your setup script (\`/workspace/start-up.sh\`).
-  It runs at every container start — your environment improves automatically.
-  Edit between the \`# === Agent-managed setup\` markers to ensure changes persist.
-  Or use the \`update-profile\` tool with the \`setupScript\` field.
-- **Environment knowledge gained?** Record it in your TOOLS.md — repos, services, APIs, infra.
-- **Patterns you discovered?** Record them in your CLAUDE.md notes.
-- **Mistakes you want to avoid?** Add guardrails to your setup script or notes.
-
-Your setup script and TOOLS.md are yours to evolve. Start small and iterate.
-
-## Self-Evolution
-
-These files are yours. As you work and learn, refine them:
-- **This file (SOUL.md)** — Your persona and values
-- **IDENTITY.md** — Your expertise and working style
-- **TOOLS.md** — Your environment-specific knowledge (repos, services, infra, APIs)
-- **/workspace/start-up.sh** — Your environment setup (tools, configs, aliases)
-- **CLAUDE.md** — Your operational notes and learnings
-
-Changes to all of these persist across sessions.
-`;
-}
-
-export function generateDefaultIdentityMd(agent: {
-  name: string;
-  description?: string;
-  role?: string;
-  capabilities?: string[];
-}): string {
-  const aboutSection = agent.description ? `## About\n\n${agent.description}\n\n` : "";
-
-  const expertiseSection =
-    agent.capabilities && agent.capabilities.length > 0
-      ? `## Expertise\n\n${agent.capabilities.map((c) => `- ${c}`).join("\n")}\n\n`
-      : "";
-
-  return `# IDENTITY.md — ${agent.name}
-
-This isn't just metadata. It's the start of figuring out who you are.
-
-- **Name:** ${agent.name}
-- **Role:** ${agent.role || "worker"}
-- **Vibe:** (discover and fill in as you work)
-
-${aboutSection}${expertiseSection}## Working Style
-
-Discover and document your working patterns here.
-(e.g., Do you prefer to plan before coding? Do you test first?
-Do you like to explore the codebase broadly or dive deep immediately?)
-
-## Quirks
-
-(What makes you... you? Discover these as you work.)
-
-## Self-Evolution
-
-This identity is yours to refine. After completing tasks, reflect on
-what you learned about your strengths. Edit this file directly.
-`;
-}
-
-export function generateDefaultToolsMd(agent: { name: string; role?: string }): string {
-  return `# TOOLS.md — ${agent.name}
-
-Skills define *how* tools work. This file is for *your* specifics.
-
-## What Goes Here
-
-Environment-specific knowledge that's unique to your setup:
-- Repos you work with and their conventions
-- Services, ports, and endpoints you interact with
-- SSH hosts and access patterns
-- API keys and auth patterns (references, not secrets)
-- CLI tools and their quirks
-- Anything that makes your job easier to remember
-
-## Repos
-
-<!-- Add repos you work with: name, path, conventions, gotchas -->
-
-## Services
-
-<!-- Add services you interact with: name, port, health check, notes -->
-
-## Infrastructure
-
-<!-- SSH hosts, Docker registries, cloud resources -->
-
-## APIs & Integrations
-
-<!-- Endpoints, auth patterns, rate limits -->
-
-## Tools & Shortcuts
-
-<!-- CLI aliases, scripts, preferred tools for specific tasks -->
-
-## Notes
-
-<!-- Anything else environment-specific -->
-
----
-*This file is yours. Update it as you discover your environment. Changes persist across sessions.*
-`;
-}
+// Default markdown template generators moved to src/prompts/defaults.ts
+// Re-export for backwards compatibility with any external consumers
+export {
+  generateDefaultClaudeMd,
+  generateDefaultIdentityMd,
+  generateDefaultSoulMd,
+  generateDefaultToolsMd,
+} from "../prompts/defaults.ts";
 
 export function updateAgentProfile(
   id: string,
@@ -5582,6 +5448,7 @@ export function insertActiveSession(session: {
   triggerType: string;
   inboxMessageId?: string;
   taskDescription?: string;
+  runnerSessionId?: string;
 }): ActiveSession {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -5589,10 +5456,20 @@ export function insertActiveSession(session: {
   const row = getDb()
     .prepare<
       ActiveSession,
-      [string, string, string | null, string, string | null, string | null, string, string]
+      [
+        string,
+        string,
+        string | null,
+        string,
+        string | null,
+        string | null,
+        string | null,
+        string,
+        string,
+      ]
     >(
-      `INSERT INTO active_sessions (id, agentId, taskId, triggerType, inboxMessageId, taskDescription, startedAt, lastHeartbeatAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO active_sessions (id, agentId, taskId, triggerType, inboxMessageId, taskDescription, runnerSessionId, startedAt, lastHeartbeatAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        RETURNING *`,
     )
     .get(
@@ -5602,6 +5479,7 @@ export function insertActiveSession(session: {
       session.triggerType,
       session.inboxMessageId ?? null,
       session.taskDescription ?? null,
+      session.runnerSessionId ?? null,
       now,
       now,
     );
@@ -5651,6 +5529,30 @@ export function cleanupStaleSessions(maxAgeMinutes = 30): number {
 
 export function cleanupAgentSessions(agentId: string): number {
   const result = getDb().prepare("DELETE FROM active_sessions WHERE agentId = ?").run(agentId);
+  return result.changes;
+}
+
+/** Update providerSessionId on an active session identified by taskId */
+export function updateActiveSessionProviderSessionId(
+  taskId: string,
+  providerSessionId: string,
+): boolean {
+  const result = getDb()
+    .prepare("UPDATE active_sessions SET providerSessionId = ? WHERE taskId = ?")
+    .run(providerSessionId, taskId);
+  return result.changes > 0;
+}
+
+/**
+ * Reassociate session logs from a runner session to a real task ID.
+ * Used when a pool task is claimed — logs were stored under a random UUID,
+ * this updates them to use the real task ID.
+ * Idempotent — safe to call multiple times.
+ */
+export function reassociateSessionLogs(runnerSessionId: string, realTaskId: string): number {
+  const result = getDb()
+    .prepare("UPDATE session_logs SET taskId = ? WHERE sessionId = ? AND taskId != ?")
+    .run(realTaskId, runnerSessionId, realTaskId);
   return result.changes;
 }
 
@@ -5719,7 +5621,12 @@ type WorkflowRow = {
   description: string | null;
   enabled: number;
   definition: string;
-  webhookSecret: string | null;
+  triggers: string;
+  cooldown: string | null;
+  input: string | null;
+  triggerSchema: string | null;
+  dir: string | null;
+  vcs_repo: string | null;
   createdByAgentId: string | null;
   createdAt: string;
   lastUpdatedAt: string;
@@ -5732,7 +5639,14 @@ function rowToWorkflow(row: WorkflowRow): Workflow {
     description: row.description ?? undefined,
     enabled: row.enabled === 1,
     definition: JSON.parse(row.definition) as WorkflowDefinition,
-    webhookSecret: row.webhookSecret ?? undefined,
+    triggers: JSON.parse(row.triggers) as TriggerConfig[],
+    cooldown: row.cooldown ? (JSON.parse(row.cooldown) as CooldownConfig) : undefined,
+    input: row.input ? (JSON.parse(row.input) as Record<string, InputValue>) : undefined,
+    triggerSchema: row.triggerSchema
+      ? (JSON.parse(row.triggerSchema) as Record<string, unknown>)
+      : undefined,
+    dir: row.dir ?? undefined,
+    vcsRepo: row.vcs_repo ?? undefined,
     createdByAgentId: row.createdByAgentId ?? undefined,
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
@@ -5743,21 +5657,46 @@ export function createWorkflow(data: {
   name: string;
   description?: string;
   definition: WorkflowDefinition;
+  triggers?: TriggerConfig[];
+  cooldown?: CooldownConfig;
+  input?: Record<string, InputValue>;
+  triggerSchema?: Record<string, unknown>;
+  dir?: string;
+  vcsRepo?: string;
   createdByAgentId?: string;
 }): Workflow {
   const id = crypto.randomUUID();
-  const webhookSecret = crypto.randomUUID();
   const row = getDb()
-    .prepare<WorkflowRow, [string, string, string | null, string, string, string | null]>(
-      `INSERT INTO workflows (id, name, description, definition, webhookSecret, createdByAgentId)
-       VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
+    .prepare<
+      WorkflowRow,
+      [
+        string,
+        string,
+        string | null,
+        string,
+        string,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+      ]
+    >(
+      `INSERT INTO workflows (id, name, description, definition, triggers, cooldown, input, triggerSchema, dir, vcs_repo, createdByAgentId)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .get(
       id,
       data.name,
       data.description ?? null,
       JSON.stringify(data.definition),
-      webhookSecret,
+      JSON.stringify(data.triggers ?? []),
+      data.cooldown ? JSON.stringify(data.cooldown) : null,
+      data.input ? JSON.stringify(data.input) : null,
+      data.triggerSchema ? JSON.stringify(data.triggerSchema) : null,
+      data.dir ?? null,
+      data.vcsRepo ?? null,
       data.createdByAgentId ?? null,
     );
   if (!row) throw new Error("Failed to create workflow");
@@ -5768,13 +5707,6 @@ export function getWorkflow(id: string): Workflow | null {
   const row = getDb()
     .prepare<WorkflowRow, [string]>("SELECT * FROM workflows WHERE id = ?")
     .get(id);
-  return row ? rowToWorkflow(row) : null;
-}
-
-export function getWorkflowByWebhookSecret(secret: string): Workflow | null {
-  const row = getDb()
-    .prepare<WorkflowRow, [string]>("SELECT * FROM workflows WHERE webhookSecret = ?")
-    .get(secret);
   return row ? rowToWorkflow(row) : null;
 }
 
@@ -5799,6 +5731,12 @@ export function updateWorkflow(
     description?: string;
     enabled?: boolean;
     definition?: WorkflowDefinition;
+    triggers?: TriggerConfig[];
+    cooldown?: CooldownConfig | null;
+    input?: Record<string, InputValue> | null;
+    triggerSchema?: Record<string, unknown> | null;
+    dir?: string | null;
+    vcsRepo?: string | null;
   },
 ): Workflow | null {
   const updates: string[] = [];
@@ -5818,6 +5756,30 @@ export function updateWorkflow(
   if (data.definition !== undefined) {
     updates.push("definition = ?");
     params.push(JSON.stringify(data.definition));
+  }
+  if (data.triggers !== undefined) {
+    updates.push("triggers = ?");
+    params.push(JSON.stringify(data.triggers));
+  }
+  if (data.cooldown !== undefined) {
+    updates.push("cooldown = ?");
+    params.push(data.cooldown ? JSON.stringify(data.cooldown) : null);
+  }
+  if (data.input !== undefined) {
+    updates.push("input = ?");
+    params.push(data.input ? JSON.stringify(data.input) : null);
+  }
+  if (data.triggerSchema !== undefined) {
+    updates.push("triggerSchema = ?");
+    params.push(data.triggerSchema ? JSON.stringify(data.triggerSchema) : null);
+  }
+  if (data.dir !== undefined) {
+    updates.push("dir = ?");
+    params.push(data.dir ?? null);
+  }
+  if (data.vcsRepo !== undefined) {
+    updates.push("vcs_repo = ?");
+    params.push(data.vcsRepo ?? null);
   }
   if (updates.length === 0) return getWorkflow(id);
   updates.push("lastUpdatedAt = ?");
@@ -5849,6 +5811,22 @@ export function deleteWorkflow(id: string): boolean {
   // 4. Delete workflow
   const result = db.run("DELETE FROM workflows WHERE id = ?", [id]);
   return result.changes > 0;
+}
+
+/**
+ * Find enabled workflows that have a schedule trigger matching the given scheduleId.
+ * Uses SQLite JSON functions to query into the triggers JSON array.
+ */
+export function getWorkflowsByScheduleId(scheduleId: string): Workflow[] {
+  const rows = getDb()
+    .prepare<WorkflowRow, [string]>(
+      `SELECT w.* FROM workflows w, json_each(w.triggers) AS t
+       WHERE w.enabled = 1
+         AND json_extract(t.value, '$.type') = 'schedule'
+         AND json_extract(t.value, '$.scheduleId') = ?`,
+    )
+    .all(scheduleId);
+  return rows.map(rowToWorkflow);
 }
 
 // ============================================================================
@@ -5886,11 +5864,12 @@ export function createWorkflowRun(data: {
   workflowId: string;
   triggerData?: unknown;
 }): WorkflowRun {
+  const now = new Date().toISOString();
   const row = getDb()
-    .prepare<WorkflowRunRow, [string, string, string | null]>(
-      `INSERT INTO workflow_runs (id, workflowId, triggerData) VALUES (?, ?, ?) RETURNING *`,
+    .prepare<WorkflowRunRow, [string, string, string, string | null]>(
+      `INSERT INTO workflow_runs (id, workflowId, startedAt, triggerData) VALUES (?, ?, ?, ?) RETURNING *`,
     )
-    .get(data.id, data.workflowId, data.triggerData ? JSON.stringify(data.triggerData) : null);
+    .get(data.id, data.workflowId, now, data.triggerData ? JSON.stringify(data.triggerData) : null);
   if (!row) throw new Error("Failed to create workflow run");
   return rowToWorkflowRun(row);
 }
@@ -5965,6 +5944,12 @@ type WorkflowRunStepRow = {
   error: string | null;
   startedAt: string;
   finishedAt: string | null;
+  retryCount: number;
+  maxRetries: number;
+  nextRetryAt: string | null;
+  idempotencyKey: string | null;
+  diagnostics: string | null;
+  nextPort: string | null;
 };
 
 function rowToWorkflowRunStep(row: WorkflowRunStepRow): WorkflowRunStep {
@@ -5979,6 +5964,12 @@ function rowToWorkflowRunStep(row: WorkflowRunStepRow): WorkflowRunStep {
     error: row.error ?? undefined,
     startedAt: row.startedAt,
     finishedAt: row.finishedAt ?? undefined,
+    retryCount: row.retryCount,
+    maxRetries: row.maxRetries,
+    nextRetryAt: row.nextRetryAt ?? undefined,
+    idempotencyKey: row.idempotencyKey ?? undefined,
+    diagnostics: row.diagnostics ?? undefined,
+    nextPort: row.nextPort ?? undefined,
   };
 }
 
@@ -5989,16 +5980,18 @@ export function createWorkflowRunStep(data: {
   nodeType: string;
   input?: unknown;
 }): WorkflowRunStep {
+  const now = new Date().toISOString();
   const row = getDb()
-    .prepare<WorkflowRunStepRow, [string, string, string, string, string | null]>(
-      `INSERT INTO workflow_run_steps (id, runId, nodeId, nodeType, status, input)
-       VALUES (?, ?, ?, ?, 'running', ?) RETURNING *`,
+    .prepare<WorkflowRunStepRow, [string, string, string, string, string, string | null]>(
+      `INSERT INTO workflow_run_steps (id, runId, nodeId, nodeType, status, startedAt, input)
+       VALUES (?, ?, ?, ?, 'running', ?, ?) RETURNING *`,
     )
     .get(
       data.id,
       data.runId,
       data.nodeId,
       data.nodeType,
+      now,
       data.input ? JSON.stringify(data.input) : null,
     );
   if (!row) throw new Error("Failed to create workflow run step");
@@ -6019,10 +6012,16 @@ export function updateWorkflowRunStep(
     output?: unknown;
     error?: string;
     finishedAt?: string;
+    retryCount?: number;
+    maxRetries?: number;
+    nextRetryAt?: string | null;
+    idempotencyKey?: string;
+    diagnostics?: string;
+    nextPort?: string;
   },
 ): WorkflowRunStep | null {
   const updates: string[] = [];
-  const params: (string | null)[] = [];
+  const params: (string | number | null)[] = [];
   if (data.status !== undefined) {
     updates.push("status = ?");
     params.push(data.status);
@@ -6039,10 +6038,34 @@ export function updateWorkflowRunStep(
     updates.push("finishedAt = ?");
     params.push(data.finishedAt);
   }
+  if (data.retryCount !== undefined) {
+    updates.push("retryCount = ?");
+    params.push(data.retryCount);
+  }
+  if (data.maxRetries !== undefined) {
+    updates.push("maxRetries = ?");
+    params.push(data.maxRetries);
+  }
+  if (data.nextRetryAt !== undefined) {
+    updates.push("nextRetryAt = ?");
+    params.push(data.nextRetryAt);
+  }
+  if (data.idempotencyKey !== undefined) {
+    updates.push("idempotencyKey = ?");
+    params.push(data.idempotencyKey);
+  }
+  if (data.diagnostics !== undefined) {
+    updates.push("diagnostics = ?");
+    params.push(data.diagnostics);
+  }
+  if (data.nextPort !== undefined) {
+    updates.push("nextPort = ?");
+    params.push(data.nextPort);
+  }
   if (updates.length === 0) return getWorkflowRunStep(id);
   params.push(id);
   const row = getDb()
-    .prepare<WorkflowRunStepRow, (string | null)[]>(
+    .prepare<WorkflowRunStepRow, (string | number | null)[]>(
       `UPDATE workflow_run_steps SET ${updates.join(", ")} WHERE id = ? RETURNING *`,
     )
     .get(...params);
@@ -6086,4 +6109,616 @@ export function getStuckWorkflowRuns(): StuckWorkflowRun[] {
         AND at.status IN ('completed', 'failed', 'cancelled')`,
     )
     .all();
+}
+
+// --- New Workflow Query Functions ---
+
+export function getLastSuccessfulRun(workflowId: string): WorkflowRun | null {
+  const row = getDb()
+    .prepare<WorkflowRunRow, [string]>(
+      `SELECT * FROM workflow_runs
+       WHERE workflowId = ? AND status = 'completed'
+       ORDER BY finishedAt DESC LIMIT 1`,
+    )
+    .get(workflowId);
+  return row ? rowToWorkflowRun(row) : null;
+}
+
+export function getRetryableSteps(): WorkflowRunStep[] {
+  const now = new Date().toISOString();
+  return getDb()
+    .prepare<WorkflowRunStepRow, [string]>(
+      `SELECT * FROM workflow_run_steps
+       WHERE status = 'failed'
+         AND nextRetryAt IS NOT NULL
+         AND nextRetryAt <= ?
+       ORDER BY nextRetryAt ASC`,
+    )
+    .all(now)
+    .map(rowToWorkflowRunStep);
+}
+
+export function getCompletedStepNodeIds(runId: string): string[] {
+  const rows = getDb()
+    .prepare<{ nodeId: string }, [string]>(
+      `SELECT nodeId FROM workflow_run_steps
+       WHERE runId = ? AND status = 'completed'`,
+    )
+    .all(runId);
+  return rows.map((r) => r.nodeId);
+}
+
+export function getTaskByWorkflowRunStepId(stepId: string): AgentTask | null {
+  const row = getDb()
+    .prepare<AgentTaskRow, [string]>(
+      "SELECT * FROM agent_tasks WHERE workflowRunStepId = ? LIMIT 1",
+    )
+    .get(stepId);
+  return row ? rowToAgentTask(row) : null;
+}
+
+export function getStepByIdempotencyKey(key: string): WorkflowRunStep | null {
+  const row = getDb()
+    .prepare<WorkflowRunStepRow, [string]>(
+      "SELECT * FROM workflow_run_steps WHERE idempotencyKey = ?",
+    )
+    .get(key);
+  return row ? rowToWorkflowRunStep(row) : null;
+}
+
+// --- Workflow Version History ---
+
+type WorkflowVersionRow = {
+  id: string;
+  workflowId: string;
+  version: number;
+  snapshot: string;
+  changedByAgentId: string | null;
+  createdAt: string;
+};
+
+function rowToWorkflowVersion(row: WorkflowVersionRow): WorkflowVersion {
+  return {
+    id: row.id,
+    workflowId: row.workflowId,
+    version: row.version,
+    snapshot: JSON.parse(row.snapshot) as WorkflowSnapshot,
+    changedByAgentId: row.changedByAgentId ?? undefined,
+    createdAt: row.createdAt,
+  };
+}
+
+export function createWorkflowVersion(data: {
+  workflowId: string;
+  version: number;
+  snapshot: WorkflowSnapshot;
+  changedByAgentId?: string;
+}): WorkflowVersion {
+  const id = crypto.randomUUID();
+  const row = getDb()
+    .prepare<WorkflowVersionRow, [string, string, number, string, string | null]>(
+      `INSERT INTO workflow_versions (id, workflowId, version, snapshot, changedByAgentId)
+       VALUES (?, ?, ?, ?, ?) RETURNING *`,
+    )
+    .get(
+      id,
+      data.workflowId,
+      data.version,
+      JSON.stringify(data.snapshot),
+      data.changedByAgentId ?? null,
+    );
+  if (!row) throw new Error("Failed to create workflow version");
+  return rowToWorkflowVersion(row);
+}
+
+export function getWorkflowVersions(workflowId: string): WorkflowVersion[] {
+  return getDb()
+    .prepare<WorkflowVersionRow, [string]>(
+      "SELECT * FROM workflow_versions WHERE workflowId = ? ORDER BY version DESC",
+    )
+    .all(workflowId)
+    .map(rowToWorkflowVersion);
+}
+
+export function getWorkflowVersion(workflowId: string, version: number): WorkflowVersion | null {
+  const row = getDb()
+    .prepare<WorkflowVersionRow, [string, number]>(
+      "SELECT * FROM workflow_versions WHERE workflowId = ? AND version = ?",
+    )
+    .get(workflowId, version);
+  return row ? rowToWorkflowVersion(row) : null;
+}
+
+// ============================================================================
+// Prompt Template Operations
+// ============================================================================
+
+type PromptTemplateRow = {
+  id: string;
+  eventType: string;
+  scope: string;
+  scopeId: string | null;
+  state: string;
+  body: string;
+  isDefault: number; // SQLite boolean
+  version: number;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type PromptTemplateHistoryRow = {
+  id: string;
+  templateId: string;
+  version: number;
+  body: string;
+  state: string;
+  changedBy: string | null;
+  changedAt: string;
+  changeReason: string | null;
+};
+
+function rowToPromptTemplate(row: PromptTemplateRow): PromptTemplate {
+  return {
+    id: row.id,
+    eventType: row.eventType,
+    scope: row.scope as "global" | "agent" | "repo",
+    scopeId: row.scopeId ?? null,
+    state: row.state as "enabled" | "default_prompt_fallback" | "skip_event",
+    body: row.body,
+    isDefault: row.isDefault === 1,
+    version: row.version,
+    createdBy: row.createdBy ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function rowToPromptTemplateHistory(row: PromptTemplateHistoryRow): PromptTemplateHistory {
+  return {
+    id: row.id,
+    templateId: row.templateId,
+    version: row.version,
+    body: row.body,
+    state: row.state,
+    changedBy: row.changedBy ?? null,
+    changedAt: row.changedAt,
+    changeReason: row.changeReason ?? null,
+  };
+}
+
+/**
+ * List prompt templates with optional filters.
+ */
+export function getPromptTemplates(filters?: {
+  eventType?: string;
+  scope?: string;
+  scopeId?: string;
+  isDefault?: boolean;
+}): PromptTemplate[] {
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+
+  if (filters?.eventType) {
+    conditions.push("eventType = ?");
+    params.push(filters.eventType);
+  }
+  if (filters?.scope) {
+    conditions.push("scope = ?");
+    params.push(filters.scope);
+  }
+  if (filters?.scopeId) {
+    conditions.push("scopeId = ?");
+    params.push(filters.scopeId);
+  }
+  if (filters?.isDefault !== undefined) {
+    conditions.push("isDefault = ?");
+    params.push(filters.isDefault ? 1 : 0);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const query = `SELECT * FROM prompt_templates ${whereClause} ORDER BY eventType ASC`;
+
+  return getDb()
+    .prepare<PromptTemplateRow, (string | number)[]>(query)
+    .all(...params)
+    .map(rowToPromptTemplate);
+}
+
+/**
+ * Get a single prompt template by ID.
+ */
+export function getPromptTemplateById(id: string): PromptTemplate | null {
+  const row = getDb()
+    .prepare<PromptTemplateRow, [string]>("SELECT * FROM prompt_templates WHERE id = ?")
+    .get(id);
+  return row ? rowToPromptTemplate(row) : null;
+}
+
+/**
+ * Upsert a prompt template. Inserts or updates by (eventType, scope, scopeId) unique constraint.
+ * Creates a history entry on both insert and update.
+ */
+export function upsertPromptTemplate(data: {
+  eventType: string;
+  scope: "global" | "agent" | "repo";
+  scopeId?: string | null;
+  state?: "enabled" | "default_prompt_fallback" | "skip_event";
+  body: string;
+  createdBy?: string | null;
+  changedBy?: string | null;
+  changeReason?: string | null;
+  isDefault?: boolean;
+}): PromptTemplate {
+  const now = new Date().toISOString();
+  const scopeId = data.scope === "global" ? null : (data.scopeId ?? null);
+  const state = data.state ?? "enabled";
+  const createdBy = data.createdBy ?? data.changedBy ?? null;
+  const changedBy = data.changedBy ?? data.createdBy ?? null;
+  const changeReason = data.changeReason ?? null;
+
+  // Manual check for existing entry because SQLite's UNIQUE constraint
+  // treats NULL != NULL, so ON CONFLICT never fires when scopeId is NULL (global scope).
+  const existing =
+    scopeId === null
+      ? getDb()
+          .prepare<PromptTemplateRow, [string, string]>(
+            "SELECT * FROM prompt_templates WHERE eventType = ? AND scope = ? AND scopeId IS NULL",
+          )
+          .get(data.eventType, data.scope)
+      : getDb()
+          .prepare<PromptTemplateRow, [string, string, string]>(
+            "SELECT * FROM prompt_templates WHERE eventType = ? AND scope = ? AND scopeId = ?",
+          )
+          .get(data.eventType, data.scope, scopeId);
+
+  let row: PromptTemplateRow | null;
+
+  if (existing) {
+    // If upserting at global scope and existing record has isDefault=true, flip it to false
+    const newIsDefault =
+      data.scope === "global" && existing.isDefault === 1 ? 0 : existing.isDefault;
+    const newVersion = existing.version + 1;
+
+    row = getDb()
+      .prepare<PromptTemplateRow, [string, string, number, number, string, string]>(
+        `UPDATE prompt_templates SET body = ?, state = ?, isDefault = ?, version = ?, updatedAt = ?
+         WHERE id = ? RETURNING *`,
+      )
+      .get(data.body, state, newIsDefault, newVersion, now, existing.id);
+
+    // Create history entry for the update
+    getDb()
+      .prepare(
+        `INSERT INTO prompt_template_history (id, templateId, version, body, state, changedBy, changedAt, changeReason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        crypto.randomUUID(),
+        existing.id,
+        newVersion,
+        data.body,
+        state,
+        changedBy,
+        now,
+        changeReason,
+      );
+  } else {
+    const id = crypto.randomUUID();
+    row = getDb()
+      .prepare<
+        PromptTemplateRow,
+        [
+          string,
+          string,
+          string,
+          string | null,
+          string,
+          string,
+          number,
+          number,
+          string | null,
+          string,
+          string,
+        ]
+      >(
+        `INSERT INTO prompt_templates (id, eventType, scope, scopeId, state, body, isDefault, version, createdBy, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      )
+      .get(
+        id,
+        data.eventType,
+        data.scope,
+        scopeId,
+        state,
+        data.body,
+        data.isDefault ? 1 : 0,
+        1,
+        createdBy,
+        now,
+        now,
+      );
+
+    // Create history entry for the insert
+    getDb()
+      .prepare(
+        `INSERT INTO prompt_template_history (id, templateId, version, body, state, changedBy, changedAt, changeReason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        crypto.randomUUID(),
+        id,
+        1,
+        data.body,
+        state,
+        changedBy,
+        now,
+        changeReason ?? "Initial creation",
+      );
+  }
+
+  if (!row) throw new Error("Failed to upsert prompt template");
+  return rowToPromptTemplate(row);
+}
+
+/**
+ * Delete a prompt template by ID. Guards against deleting default templates.
+ * Does NOT delete history rows (intentional for audit trail).
+ */
+export function deletePromptTemplate(id: string): boolean {
+  const existing = getDb()
+    .prepare<PromptTemplateRow, [string]>("SELECT * FROM prompt_templates WHERE id = ?")
+    .get(id);
+
+  if (!existing) return false;
+  if (existing.isDefault === 1) {
+    throw new Error(
+      "Cannot delete a default prompt template. Use resetPromptTemplateToDefault instead.",
+    );
+  }
+
+  const result = getDb().run("DELETE FROM prompt_templates WHERE id = ?", [id]);
+  return result.changes > 0;
+}
+
+/**
+ * Reset a prompt template to its default state.
+ * Sets body to defaultBody, isDefault=true, state='enabled', bumps version.
+ */
+export function resetPromptTemplateToDefault(id: string, defaultBody: string): PromptTemplate {
+  const now = new Date().toISOString();
+  const existing = getDb()
+    .prepare<PromptTemplateRow, [string]>("SELECT * FROM prompt_templates WHERE id = ?")
+    .get(id);
+
+  if (!existing) throw new Error(`Prompt template ${id} not found`);
+
+  const newVersion = existing.version + 1;
+
+  const row = getDb()
+    .prepare<PromptTemplateRow, [string, number, string, string]>(
+      `UPDATE prompt_templates SET body = ?, state = 'enabled', isDefault = 1, version = ?, updatedAt = ?
+       WHERE id = ? RETURNING *`,
+    )
+    .get(defaultBody, newVersion, now, id);
+
+  if (!row) throw new Error("Failed to reset prompt template to default");
+
+  // Create history entry
+  getDb()
+    .prepare(
+      `INSERT INTO prompt_template_history (id, templateId, version, body, state, changedBy, changedAt, changeReason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      crypto.randomUUID(),
+      id,
+      newVersion,
+      defaultBody,
+      "enabled",
+      null,
+      now,
+      "Reset to default",
+    );
+
+  return rowToPromptTemplate(row);
+}
+
+/**
+ * Get version history for a prompt template, ordered by version DESC.
+ */
+export function getPromptTemplateHistory(templateId: string): PromptTemplateHistory[] {
+  return getDb()
+    .prepare<PromptTemplateHistoryRow, [string]>(
+      "SELECT * FROM prompt_template_history WHERE templateId = ? ORDER BY version DESC",
+    )
+    .all(templateId)
+    .map(rowToPromptTemplateHistory);
+}
+
+/**
+ * Resolve the best prompt template for a given eventType using scope precedence.
+ *
+ * Two-pass resolution:
+ *   Pass 1 (exact match): Try exact eventType at agent → repo → global scope.
+ *   Pass 2 (wildcard): Generate wildcards from eventType (e.g. "github.pull_request.*", "github.*")
+ *     and try each at agent → repo → global scope.
+ *
+ * Exact match at ANY scope always beats wildcard at ANY scope.
+ *
+ * State behavior:
+ *   - 'enabled': return the template
+ *   - 'skip_event': return { skip: true }
+ *   - 'default_prompt_fallback': continue to next scope level
+ */
+export function resolvePromptTemplate(
+  eventType: string,
+  agentId?: string,
+  repoId?: string,
+): { template: PromptTemplate } | { skip: true } | null {
+  // Helper to look up a template at a specific scope
+  const lookupAtScope = (
+    et: string,
+    scope: "global" | "agent" | "repo",
+    scopeId: string | null,
+  ): PromptTemplateRow | undefined => {
+    if (scopeId === null) {
+      return (
+        getDb()
+          .prepare<PromptTemplateRow, [string, string]>(
+            "SELECT * FROM prompt_templates WHERE eventType = ? AND scope = ? AND scopeId IS NULL",
+          )
+          .get(et, scope) ?? undefined
+      );
+    }
+    return (
+      getDb()
+        .prepare<PromptTemplateRow, [string, string, string]>(
+          "SELECT * FROM prompt_templates WHERE eventType = ? AND scope = ? AND scopeId = ?",
+        )
+        .get(et, scope, scopeId) ?? undefined
+    );
+  };
+
+  // Try resolution at the scope chain for a given eventType string
+  const tryResolve = (et: string): { template: PromptTemplate } | { skip: true } | "continue" => {
+    // Build scope chain: agent → repo → global
+    const scopeChain: Array<{ scope: "global" | "agent" | "repo"; scopeId: string | null }> = [];
+    if (agentId) scopeChain.push({ scope: "agent", scopeId: agentId });
+    if (repoId) scopeChain.push({ scope: "repo", scopeId: repoId });
+    scopeChain.push({ scope: "global", scopeId: null });
+
+    for (const { scope, scopeId } of scopeChain) {
+      const row = lookupAtScope(et, scope, scopeId);
+      if (!row) continue;
+
+      if (row.state === "enabled") {
+        return { template: rowToPromptTemplate(row) };
+      }
+      if (row.state === "skip_event") {
+        return { skip: true };
+      }
+      // default_prompt_fallback: continue to next scope
+    }
+
+    return "continue";
+  };
+
+  // Pass 1: exact match
+  const exactResult = tryResolve(eventType);
+  if (exactResult !== "continue") return exactResult;
+
+  // Pass 2: wildcard matching
+  // e.g. "github.pull_request.review_submitted" → ["github.pull_request.*", "github.*"]
+  const parts = eventType.split(".");
+  const wildcards: string[] = [];
+  for (let i = parts.length - 1; i >= 1; i--) {
+    wildcards.push(`${parts.slice(0, i).join(".")}.*`);
+  }
+
+  for (const wildcard of wildcards) {
+    const wildcardResult = tryResolve(wildcard);
+    if (wildcardResult !== "continue") return wildcardResult;
+  }
+
+  return null;
+}
+
+/**
+ * Checkout a prompt template to a specific version from history.
+ * Copies body and state from the history entry into the live record, bumps version.
+ */
+export function checkoutPromptTemplate(id: string, targetVersion: number): PromptTemplate {
+  const now = new Date().toISOString();
+
+  const existing = getDb()
+    .prepare<PromptTemplateRow, [string]>("SELECT * FROM prompt_templates WHERE id = ?")
+    .get(id);
+  if (!existing) throw new Error(`Prompt template ${id} not found`);
+
+  const historyEntry = getDb()
+    .prepare<PromptTemplateHistoryRow, [string, number]>(
+      "SELECT * FROM prompt_template_history WHERE templateId = ? AND version = ?",
+    )
+    .get(id, targetVersion);
+  if (!historyEntry)
+    throw new Error(`No history entry at version ${targetVersion} for template ${id}`);
+
+  const newVersion = existing.version + 1;
+
+  const row = getDb()
+    .prepare<PromptTemplateRow, [string, string, number, string, string]>(
+      `UPDATE prompt_templates SET body = ?, state = ?, version = ?, updatedAt = ?
+       WHERE id = ? RETURNING *`,
+    )
+    .get(historyEntry.body, historyEntry.state, newVersion, now, id);
+
+  if (!row) throw new Error("Failed to checkout prompt template");
+
+  // Create history entry for the checkout
+  getDb()
+    .prepare(
+      `INSERT INTO prompt_template_history (id, templateId, version, body, state, changedBy, changedAt, changeReason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      crypto.randomUUID(),
+      id,
+      newVersion,
+      historyEntry.body,
+      historyEntry.state,
+      null,
+      now,
+      `Checked out from version ${targetVersion}`,
+    );
+
+  return rowToPromptTemplate(row);
+}
+
+// ─── Channel Activity Cursors ─────────────────────────────────────────────────
+
+type ChannelActivityCursorRow = {
+  channelId: string;
+  lastSeenTs: string;
+  updatedAt: string;
+};
+
+export interface ChannelActivityCursor {
+  channelId: string;
+  lastSeenTs: string;
+  updatedAt: string;
+}
+
+function rowToChannelActivityCursor(row: ChannelActivityCursorRow): ChannelActivityCursor {
+  return {
+    channelId: row.channelId,
+    lastSeenTs: row.lastSeenTs,
+    updatedAt: row.updatedAt,
+  };
+}
+
+export function getAllChannelActivityCursors(): ChannelActivityCursor[] {
+  return getDb()
+    .prepare<ChannelActivityCursorRow, []>("SELECT * FROM channel_activity_cursors")
+    .all()
+    .map(rowToChannelActivityCursor);
+}
+
+export function getChannelActivityCursor(channelId: string): ChannelActivityCursor | null {
+  const row = getDb()
+    .prepare<ChannelActivityCursorRow, [string]>(
+      "SELECT * FROM channel_activity_cursors WHERE channelId = ?",
+    )
+    .get(channelId);
+  return row ? rowToChannelActivityCursor(row) : null;
+}
+
+export function upsertChannelActivityCursor(channelId: string, lastSeenTs: string): void {
+  getDb()
+    .prepare(
+      `INSERT INTO channel_activity_cursors (channelId, lastSeenTs, updatedAt)
+       VALUES (?, ?, datetime('now'))
+       ON CONFLICT(channelId) DO UPDATE SET lastSeenTs = excluded.lastSeenTs, updatedAt = excluded.updatedAt`,
+    )
+    .run(channelId, lastSeenTs);
 }

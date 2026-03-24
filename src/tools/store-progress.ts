@@ -17,8 +17,12 @@ import {
   updateTaskProgress,
 } from "@/be/db";
 import { getEmbedding, serializeEmbedding } from "@/be/embedding";
+import { resolveTemplate } from "@/prompts/resolver";
 import { createToolRegistrar } from "@/tools/utils";
 import { AgentTaskSchema } from "@/types";
+// Side-effect import: registers task lifecycle templates in the in-memory registry
+import "./templates";
+import { validateJsonSchema } from "@/workflows/json-schema-validator";
 
 // Schema for optional cost data that agents can self-report
 const CostDataSchema = z
@@ -116,6 +120,39 @@ export const registerStoreProgressTool = (server: McpServer) => {
           if (!isDuplicate) {
             const result = updateTaskProgress(taskId, progress);
             if (result) updatedTask = result;
+          }
+        }
+
+        // Validate structured output against outputSchema if present
+        if (
+          status === "completed" &&
+          existingTask.outputSchema &&
+          typeof existingTask.outputSchema === "object"
+        ) {
+          const schema = existingTask.outputSchema as Record<string, unknown>;
+          if (!output) {
+            return {
+              success: false,
+              message: `Task has an outputSchema but no output was provided. You must call store-progress with a valid JSON output matching this schema:\n${JSON.stringify(schema, null, 2)}`,
+            };
+          }
+
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(output);
+          } catch {
+            return {
+              success: false,
+              message: `Task output must be valid JSON matching the outputSchema. Got invalid JSON. Schema:\n${JSON.stringify(schema, null, 2)}`,
+            };
+          }
+
+          const validationErrors = validateJsonSchema(schema, parsed);
+          if (validationErrors.length > 0) {
+            return {
+              success: false,
+              message: `Task output does not match the outputSchema. Errors:\n${validationErrors.join("\n")}\n\nExpected schema:\n${JSON.stringify(schema, null, 2)}\n\nPlease fix your output and retry.`,
+            };
           }
         }
 
@@ -234,7 +271,8 @@ export const registerStoreProgressTool = (server: McpServer) => {
 
       // Create follow-up task for the lead when a worker task finishes.
       // This replaces the old poll-based tasks_finished trigger which was unreliable.
-      if (status && result.success && result.task) {
+      // Skip for workflow-managed tasks — the workflow engine handles sequencing via resume.ts.
+      if (status && result.success && result.task && !result.task.workflowRunId) {
         try {
           const taskAgent = getAgentById(result.task.agentId ?? "");
           // Only create follow-ups for worker tasks (not lead's own tasks)
@@ -246,11 +284,25 @@ export const registerStoreProgressTool = (server: McpServer) => {
 
               let followUpDescription: string;
               if (status === "completed") {
-                const outputSummary = output ? output.slice(0, 500) : "(no output)";
-                followUpDescription = `Worker task completed — review needed.\n\nAgent: ${agentName}\nTask: "${taskDesc}"\n\nOutput:\n${outputSummary}${output && output.length > 500 ? "..." : ""}\n\nUse \`get-task-details\` with taskId "${taskId}" for full details.`;
+                const outputSummary = output
+                  ? `${output.slice(0, 500)}${output.length > 500 ? "..." : ""}`
+                  : "(no output)";
+                const completedResult = resolveTemplate("task.worker.completed", {
+                  agent_name: agentName,
+                  task_desc: taskDesc,
+                  output_summary: outputSummary,
+                  task_id: taskId,
+                });
+                followUpDescription = completedResult.text;
               } else {
                 const reason = failureReason || "(no reason given)";
-                followUpDescription = `Worker task failed — action needed.\n\nAgent: ${agentName}\nTask: "${taskDesc}"\n\nFailure reason: ${reason}\n\nDecide whether to reassign, retry, or handle the failure. Use \`get-task-details\` with taskId "${taskId}" for full details.`;
+                const failedResult = resolveTemplate("task.worker.failed", {
+                  agent_name: agentName,
+                  task_desc: taskDesc,
+                  failure_reason: reason,
+                  task_id: taskId,
+                });
+                followUpDescription = failedResult.text;
               }
 
               // Enrich follow-up with epic context if task belongs to an epic

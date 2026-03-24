@@ -11,22 +11,26 @@ import { closeDb } from "../be/db";
 import { initGitHub } from "../github";
 import { initGitLab } from "../gitlab";
 import { stopHeartbeat } from "../heartbeat";
+import { initLinear } from "../linear";
 import { startSlackApp, stopSlackApp } from "../slack";
 import { initWorkflows } from "../workflows";
 import { handleActiveSessions } from "./active-sessions";
 import { handleAgentRegister, handleAgentsRest } from "./agents";
 import { handleConfig } from "./config";
 import { handleCore, loadGlobalConfigsIntoEnv } from "./core";
+import { handleDbQuery } from "./db-query";
 import { handleEcosystem } from "./ecosystem";
 import { handleEpics } from "./epics";
 import { handleMcp } from "./mcp";
 import { handleMemory } from "./memory";
 import { handlePoll } from "./poll";
+import { handlePromptTemplates } from "./prompt-templates";
 import { handleRepos } from "./repos";
 import { handleSchedules } from "./schedules";
 import { handleSessionData } from "./session-data";
 import { handleStats } from "./stats";
 import { handleTasks } from "./tasks";
+import { handleTrackers } from "./trackers";
 import { getPathSegments, parseQueryParams, setCorsHeaders } from "./utils";
 import { handleWebhooks } from "./webhooks";
 import { handleWorkflows } from "./workflows";
@@ -88,9 +92,10 @@ const httpServer = createHttpServer(async (req, res) => {
   // ── Route handlers (order matters — first match wins) ──
   const handlers: (() => Promise<boolean>)[] = [
     () => handleAgentRegister(req, res, pathSegments, myAgentId),
-    () => handlePoll(req, res, pathSegments, myAgentId),
+    () => handlePoll(req, res, pathSegments, queryParams, myAgentId),
     () => handleSessionData(req, res, pathSegments, queryParams, myAgentId),
     () => handleEcosystem(req, res, pathSegments, myAgentId),
+    () => handleTrackers(req, res, pathSegments),
     () => handleWebhooks(req, res, pathSegments),
     () => handleAgentsRest(req, res, pathSegments, queryParams, myAgentId),
     () => handleTasks(req, res, pathSegments, queryParams, myAgentId),
@@ -100,6 +105,8 @@ const httpServer = createHttpServer(async (req, res) => {
     () => handleSchedules(req, res, pathSegments, queryParams, myAgentId),
     () => handleWorkflows(req, res, pathSegments, queryParams, myAgentId),
     () => handleConfig(req, res, pathSegments, queryParams),
+    () => handlePromptTemplates(req, res, pathSegments, queryParams),
+    () => handleDbQuery(req, res, pathSegments, queryParams),
     () => handleRepos(req, res, pathSegments, queryParams),
     () => handleMemory(req, res, pathSegments, myAgentId),
     () => handleMcp(req, res, transports),
@@ -183,14 +190,18 @@ httpServer
     // Initialize AgentMail webhook handler (if configured)
     initAgentMail();
 
+    // Initialize Linear tracker integration (if configured)
+    initLinear();
+
     // Initialize workflow engine (trigger subscriptions + resume listener)
     initWorkflows();
 
     // Start scheduler (if enabled)
     if (hasCapability("scheduling")) {
       const { startScheduler } = await import("../scheduler");
+      const { getExecutorRegistry } = await import("../workflows");
       const intervalMs = Number(process.env.SCHEDULER_INTERVAL_MS) || 10000;
-      startScheduler(intervalMs);
+      startScheduler(getExecutorRegistry(), intervalMs);
     }
 
     // Start heartbeat triage (unless disabled)

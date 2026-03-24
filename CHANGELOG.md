@@ -4,9 +4,179 @@ All notable changes to Agent Swarm are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.51.0] - 2026-03-23
+
+### Added
+- Bot name aliases for GitHub @mentions via `GITHUB_BOT_ALIASES` env var — comma-separated list of alternative names that trigger the bot alongside `GITHUB_BOT_NAME` (#211)
+- Channel activity poll trigger — lead agent can poll for new Slack channel messages since last cursor, enabling event-driven workflows (#218)
+- Lead agents can now update any worker's profile via `update-profile` tool with the new `agentId` parameter (#225)
+- Dynamic docs sitemap generation and 20 new documentation pages (#224)
 
 ### Fixed
+- Session logs stored under wrong task ID after auto-claim pool task changes — removed redundant reassociation logic in `store-progress` (#226)
+- Skip workflow-managed tasks from creating follow-up lead tasks — workflow engine handles sequencing via `resume.ts` (#226)
+
+## [1.50.0] - 2026-03-23
+
+### Added
+- Workflow fan-out support — `next` field now accepts `string[]` for parallel execution of multiple nodes (#220)
+- Configurable `onNodeFailure` on workflow definitions — `"fail"` (default) or `"continue"` to proceed with partial results (#220)
+- Convergence gating — downstream nodes automatically wait for all fan-out predecessors to complete before executing (#220)
+- Step deduplication — prevents duplicate steps when async tasks resume into convergence nodes (#220)
+- Auto-claim for pool tasks — workers atomically claim unassigned tasks during poll instead of receiving notifications (#222)
+- Session log reassociation for pool tasks — logs from pool trigger sessions are correctly linked to the real task ID (#222)
+- `runnerSessionId` field on active sessions for session log tracking (#222)
+- Active sessions API endpoint for updating provider session ID (`PUT /api/active-sessions/provider-session/{taskId}`) (#222)
+- Schedule→Workflow triggering — when a schedule fires and an enabled workflow references that schedule in its `triggers` array, the workflow executes instead of creating a standalone task (#219)
+  - Backward compatible: schedules without linked workflows still create tasks as before
+  - Multiple workflows can reference the same schedule
+  - `POST /api/schedules/:id/run` returns `workflowRunIds` when workflows are triggered
+- Workflow-level `dir` and `vcsRepo` fields — all `agent-task` nodes that don't explicitly set these inherit the workflow-level defaults (#219)
+  - Available for interpolation as `{{workflow.dir}}` and `{{workflow.vcsRepo}}`
+- Prompt template registry — per-event customizable templates with scope resolution (global → agent → repo), wildcard matching, and version history (#208)
+  - HTTP render endpoint for Docker workers to resolve templates via API
+  - Templates UI (`templates-ui/`) with AG Grid list, Monaco editor, live preview, and template history
+  - Seed runner/tool/session templates from code registry on API startup
+
+### Fixed
+- Workflow resume race condition — `finalizeOrWait` prevents stuck runs when no nodes are ready (#220)
+- Retry logic uses convergence-aware node detection instead of blindly passing successors (#220)
+- Worker/API DB boundary: moved `seed.ts` to `src/be/`, use DI pattern for resolver's DB access (#208)
+- Test DB isolation for bun's single-process test model (#208)
+- Migration version collision detection (#208)
+
+## [1.49.0] - 2026-03-21
+
+### Added
+- `agent-swarm onboard` CLI wizard — interactive first-time setup that collects credentials, generates `docker-compose.yml` + `.env`, starts the stack, and verifies health (#206)
+  - Presets: `dev`, `content`, `research`, `solo`
+  - Progress indicator, `ANTHROPIC_API_KEY` support, Ctrl+C handling
+  - Inline validation errors for integration steps (GitHub, GitLab, Sentry, Slack)
+- `agent-swarm docs` command — show documentation URL with `--open` flag to launch in browser
+- `agent-swarm claude` command — run Claude CLI with optional message and headless mode
+- Workflow structured output support — agent-task nodes can define `config.outputSchema` for validated JSON responses (#207)
+  - `store-progress` validates agent output against schema inline
+  - Workspace scoping for agent-task executor via `vcsRepo`
+- Workflow I/O schemas with explicit input mappings and data flow validation (#201)
+- Fumadocs LLMs and OpenAPI integrations for docs site (#205)
+
+### Changed
+- CLI command renames: `setup` → `connect`, `mcp` → `api` (#206)
+- `api` command gains `--db` flag for custom database file path
+- CLI help rewritten as plain `console.log` with per-command `--help` support
+- `connect` command auto-reads `API_KEY` from `.env`, uses random port, supports `APP_URL`
+
+### Fixed
+- Workflow validation: clear `nextRetryAt` when retries are exhausted (#207)
+- Workflow validation: re-run validation after retry poller re-executes a step (#207)
+- Workflow validation: normalize pass/fail across all executor types (#207)
+
+## [1.48.0] - 2026-03-20
+
+### Added
+- Workflow I/O schemas with explicit input mappings and data flow validation (#201)
+  - Node-level `inputs` mapping for cross-node data flow
+  - Static data flow validation for input references
+  - `triggerSchema` for validating trigger payloads
+- Fumadocs LLMs and OpenAPI integrations for docs site (#205)
+  - API Reference pages auto-generated from OpenAPI spec
+  - Project selector for Documentation vs API Reference
+  - `.md` extension support for LLM-friendly content
+- CI merge gate for generated API docs drift detection
+- SEO: automated inbound links to new documentation pages
+
+### Changed
+- API reference consolidated to single page with tag-based subsections
+- Docs site sidebar navigation improved with API Reference visibility
+
+### Fixed
+- Docs site project selector visibility on all pages
+
+## [1.47.0] - 2026-03-20
+
+### Added
+- Linear integration — bidirectional ticket tracker sync via OAuth + webhooks (#161)
+  - OAuth 2.0 authorization flow with PKCE
+  - Webhook handler for issue/comment events
+  - `AgentSession` lifecycle tracking for Linear issues
+  - Generic tracker abstraction layer (`tracker_sync` table) for future integrations
+  - `.env.example` updated with Linear setup instructions
+- Workflow engine redesign — DAG-based workflow automation with improved reliability (#196)
+  - Executor registry architecture for extensible step types
+  - Node I/O schemas with explicit input mappings and validation
+  - Workflow-level `triggerSchema` validation
+  - Static data flow validation for input mappings
+  - Convergence deadlock fix with active edge tracking
+  - Interpolation rewrite with unresolved variable tracking and deep config support
+  - Slack notification executor for workflow steps
+- Portless integration for local development — friendly URLs like `api.swarm.localhost:1355` (#200)
+  - `dev:http` script uses portless by default
+  - New `start:portless` script for production-like local runs
+  - `.env.example` updated with portless configuration instructions
+- `agent-fs` Claude plugin pre-installed in worker containers
+
+### Changed
+- Claude Code version pinned in Dockerfile.worker via `CLAUDE_CODE_VERSION` build arg (default: `2.1.80`) — replaces dynamic installer for reproducible builds (#202)
+- Runner prompt generation is now provider-aware for pi skill prefix
+
+### Fixed
+- Corepack permissions — `COREPACK_HOME` redirected to user-writable directory to avoid "operation rejected by your operating system" errors (#202)
+- `task.cancelled` outbound handler added for proper cancellation event propagation
+- Follow-up tasks properly repoint `tracker_sync` for session lifecycle
+- Read user message from `agentActivity` with proper stop signal handling
+- Avoid duplicate responses — prefer `AgentSession` over issue comments
+- [UI] Use node ID as graph label, remove schema sections from workflow inspector
+
+## [1.45.1] - 2026-03-19
+
+### Added
+- Debug tab with database explorer — SQL query interface in the dashboard with Monaco editor, table browser sidebar, and AG Grid results display
+- `db-query` MCP tool — lead-only read-only SQL queries against the swarm database (capped at 100 rows)
+- `POST /api/db-query` REST endpoint for database inspection
+- Agent-fs native integration — persistent, searchable filesystem shared across the swarm
+  - Auto-registration on first container boot (idempotent)
+  - Lead creates shared org, workers receive invitations automatically
+  - System prompt conditionally includes agent-fs CLI usage instructions
+  - `agent-fs` CLI and Claude plugin pre-installed in worker containers
+
+### Changed
+- Per-session MCP config — each Claude session gets its own `/tmp/mcp-{taskId}.json` config file instead of sharing `.mcp.json`, eliminating race conditions with concurrent sessions (#192)
+- `--strict-mcp-config` flag ensures only per-session MCP servers are loaded (#192)
+- Removed time-based `getAgentCurrentTask()` fallback — uses deterministic `sourceTaskId` only
+- Slack metadata is now auto-inherited from the creator's current task via `X-Source-Task-Id` header — explicit `slackChannelId`/`slackThreadTs`/`slackUserId` params on `send-task` remain available as optional overrides (#191)
+
+### Fixed
+- Concurrency safety for Slack metadata auto-inheritance — pass `sourceTaskId` through MCP session context via `X-Source-Task-Id` header instead of guessing current task (#191)
+- `send-task` now propagates `sourceTaskId` for accurate Slack metadata lookup
+
+## [Unreleased]
+
+### Added
+- Multi-API-config UI for dashboard — connect to multiple swarm instances from a single browser (#189)
+  - Slug-based connection data layer with localStorage persistence (Phase 1)
+  - React context for multi-connection state management (Phase 2)
+  - Sidebar swarm switcher and header connection name display (Phase 3)
+  - Config page multi-connection management with URL param modal (Phase 4)
+  - Health indicator dots in swarm switcher (Phase 5)
+
+## [1.44.5] - 2026-03-17
+
+### Added
+- OpenAPI 3.1 spec at `/openapi.json` (~83KB, ~60 REST endpoints) generated from route registry (#184)
+- Scalar interactive API docs at `/docs` — pre-authentication API explorer (#184)
+- `MODEL_OVERRIDE` and `CAPABILITIES` env vars for content agents in `docker-compose.example.yml` (#165)
+  - `content-writer`: `MODEL_OVERRIDE=opus`, capability: `content-writing`
+  - `content-reviewer`: `MODEL_OVERRIDE=sonnet`, capability: `content-review` (uses Gemini via OpenRouter)
+  - `content-strategist`: `MODEL_OVERRIDE=sonnet`, capability: `content-strategy`
+
+### Changed
+- `route()` factory replaces all raw `matchRoute()` calls — typed route definitions with Zod schemas for params, query, and body validation (#184)
+- Lead agent now posts task results back to originating Slack threads (#183)
+- Worker agents now post start/completion/failure updates to originating Slack threads (#183)
+
+### Fixed
+- Slack thread follow-ups route to lead when assigned agent is offline (#183)
+- `parentTaskId` continuity preserved for follow-up tasks (#183)
 - ARM compatibility for Docker Compose — added `platform: linux/amd64` to all services to fix `no matching manifest for linux/arm64/v8` on Apple Silicon Macs (#180)
 
 ### Added

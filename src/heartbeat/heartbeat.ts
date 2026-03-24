@@ -15,8 +15,12 @@ import {
   releaseStaleReviewingTasks,
   updateAgentStatus,
 } from "../be/db";
+import { resolveTemplate } from "../prompts/resolver";
 import type { AgentTask } from "../types";
-import { recoverStuckWorkflowRuns } from "../workflows/recovery";
+import { getExecutorRegistry } from "../workflows";
+import { recoverIncompleteRuns } from "../workflows/recovery";
+// Side-effect import: registers heartbeat event templates in the in-memory registry
+import "./templates";
 
 // ============================================================================
 // Configuration (env var overrides)
@@ -214,7 +218,12 @@ async function cleanupStaleResources(findings: HeartbeatFindings): Promise<void>
   findings.staleCleanup.inboxProcessing = releaseStaleProcessingInbox(
     STALE_CLEANUP_THRESHOLD_MINUTES,
   );
-  findings.staleCleanup.workflowRuns = await recoverStuckWorkflowRuns();
+  try {
+    findings.staleCleanup.workflowRuns = await recoverIncompleteRuns(getExecutorRegistry());
+  } catch {
+    // Workflow engine may not be initialized yet — skip recovery
+    findings.staleCleanup.workflowRuns = 0;
+  }
 }
 
 // ============================================================================
@@ -250,29 +259,35 @@ function escalateToLead(findings: HeartbeatFindings): void {
     return;
   }
 
-  const sections: string[] = [
-    "Task Type: Triage\nGoal: Investigate heartbeat findings that need human reasoning\n",
-  ];
-
+  // Build stalled tasks section
+  let stalledTasksSection = "";
   if (findings.stalledTasks.length > 0) {
-    sections.push("## Stalled Tasks");
+    const lines: string[] = ["## Stalled Tasks"];
     for (const task of findings.stalledTasks) {
       const agentSlice = task.agentId?.slice(0, 8) ?? "unassigned";
-      sections.push(
+      lines.push(
         `- Task ${task.id.slice(0, 8)} (agent: ${agentSlice}): last updated ${task.lastUpdatedAt}`,
       );
     }
-    sections.push(
+    lines.push(
       "\nCheck if these tasks are genuinely stuck or just working without calling store-progress. " +
         "If stuck, consider cancelling and reassigning.",
     );
+    stalledTasksSection = lines.join("\n");
   }
 
-  sections.push(`\n${HEARTBEAT_ESCALATION_MARKER} ${escalationKey}`);
+  const escalationMarker = `\n${HEARTBEAT_ESCALATION_MARKER} ${escalationKey}`;
 
-  const taskDescription = sections.join("\n");
+  const result = resolveTemplate("heartbeat.escalation.stalled", {
+    stalled_tasks_section: stalledTasksSection,
+    escalation_marker: escalationMarker,
+  });
 
-  createTaskExtended(taskDescription, {
+  if (result.skipped) {
+    return;
+  }
+
+  createTaskExtended(result.text, {
     agentId: lead.id,
     taskType: "heartbeat",
     tags: ["heartbeat", "triage", "auto-generated"],

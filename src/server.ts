@@ -5,6 +5,7 @@ import { registerCancelTaskTool } from "./tools/cancel-task";
 import { registerContextDiffTool } from "./tools/context-diff";
 import { registerContextHistoryTool } from "./tools/context-history";
 import { registerCreateChannelTool } from "./tools/create-channel";
+import { registerDbQueryTool } from "./tools/db-query";
 import { registerDeleteChannelTool } from "./tools/delete-channel";
 // Epics capability
 import {
@@ -30,6 +31,14 @@ import { registerMemorySearchTool } from "./tools/memory-search";
 import { registerMyAgentInfoTool } from "./tools/my-agent-info";
 import { registerPollTaskTool } from "./tools/poll-task";
 import { registerPostMessageTool } from "./tools/post-message";
+// Prompt template tools
+import {
+  registerDeletePromptTemplateTool,
+  registerGetPromptTemplateTool,
+  registerListPromptTemplatesTool,
+  registerPreviewPromptTemplateTool,
+  registerSetPromptTemplateTool,
+} from "./tools/prompt-templates";
 import { registerReadMessagesTool } from "./tools/read-messages";
 import { registerRegisterAgentMailInboxTool } from "./tools/register-agentmail-inbox";
 // Services capability
@@ -59,6 +68,15 @@ import {
 } from "./tools/swarm-config";
 // Task pool capability
 import { registerTaskActionTool } from "./tools/task-action";
+// Tracker capability
+import {
+  registerTrackerLinkEpicTool,
+  registerTrackerLinkTaskTool,
+  registerTrackerMapAgentTool,
+  registerTrackerStatusTool,
+  registerTrackerSyncStatusTool,
+  registerTrackerUnlinkTool,
+} from "./tools/tracker";
 import { registerUnregisterServiceTool } from "./tools/unregister-service";
 // Profiles capability
 import { registerUpdateProfileTool } from "./tools/update-profile";
@@ -121,11 +139,21 @@ export function createServer() {
   registerMyAgentInfoTool(server);
   registerCancelTaskTool(server);
 
+  // Debug tools - always registered (self-guards with lead check)
+  registerDbQueryTool(server);
+
   // Swarm config tools - always registered (config management is fundamental)
   registerSetConfigTool(server);
   registerGetConfigTool(server);
   registerListConfigTool(server);
   registerDeleteConfigTool(server);
+
+  // Prompt template tools - always registered (prompt management is fundamental)
+  registerListPromptTemplatesTool(server);
+  registerGetPromptTemplateTool(server);
+  registerSetPromptTemplateTool(server);
+  registerDeletePromptTemplateTool(server);
+  registerPreviewPromptTemplateTool(server);
 
   // Slack integration tools (always registered, will no-op if Slack not configured)
   registerSlackReplyTool(server);
@@ -193,6 +221,14 @@ export function createServer() {
     registerMemoryGetTool(server);
     registerInjectLearningTool(server);
   }
+
+  // Tracker capability - external issue tracker integration
+  registerTrackerStatusTool(server);
+  registerTrackerLinkTaskTool(server);
+  registerTrackerLinkEpicTool(server);
+  registerTrackerUnlinkTool(server);
+  registerTrackerSyncStatusTool(server);
+  registerTrackerMapAgentTool(server);
 
   // Workflows capability - DAG-based automation workflows
   if (hasCapability("workflows")) {
