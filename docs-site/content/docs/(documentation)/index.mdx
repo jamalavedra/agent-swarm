@@ -1,9 +1,7 @@
 ---
 title: Overview
-description: Multi-agent orchestration for AI coding assistants
+description: Build and orchestrate teams of AI coding agents that coordinate autonomously — task delegation, compounding memory, and full-stack integrations with Slack, GitHub, and more
 ---
-
-# Agent Swarm
 
 Agent Swarm lets you run a team of AI coding agents that coordinate autonomously. A **lead agent** receives tasks (from you, Slack, or GitHub), breaks them down, and delegates to **worker agents** running in Docker containers. Workers execute tasks, report progress, and ship code — all without manual intervention.
 
@@ -27,6 +25,14 @@ Built by [desplega.sh](https://desplega.sh) — build by builders, for builders.
 - **[Linear integration](/docs/guides/linear-integration)** — Bidirectional ticket tracker sync with AgentSession lifecycle
 - **Portless local dev** — Friendly domain URLs for local development
 - **Onboard wizard** — Interactive CLI to set up a new swarm from scratch with Docker Compose
+- **Skill system** — Reusable procedural knowledge that agents can create, share, install, and publish
+- **Human-in-the-Loop** — Workflow nodes that pause for human approval or input via the dashboard
+- **Approval requests UI** — Dashboard interface for reviewing and responding to HITL requests
+- **MCP server management** — Register, install, and manage MCP servers for agents with scope cascade (agent → swarm → global)
+- **Context usage tracking** — Monitor context window usage and compaction events per task
+- **Slack HITL notifications** — Dispatch Slack notifications when approval requests are created
+- **Unified user identity** — Canonical user registry with cross-platform resolution (Slack, GitHub, GitLab, Linear, email)
+- **Per-repo guidelines** — Configurable PR checks, merge policy, and review guidance per repository
 
 ## How It Works
 
@@ -59,7 +65,8 @@ Agent Swarm currently supports **[Claude Code](https://docs.anthropic.com/en/doc
 - [Getting Started](/docs/getting-started) — Set up your first swarm
 - [Architecture Overview](/docs/architecture/overview) — Understand how the system works
 - [Core Concepts](/docs/concepts/task-lifecycle) — Learn about tasks, agents, and coordination
+- [API Reference](/docs/api-reference) — REST API endpoints for agents, tasks, workflows, and more
 
 ---
 
-_Last updated: March 24, 2026 — v1.51.2_
+_Last updated: April 12, 2026 — v1.65.0_

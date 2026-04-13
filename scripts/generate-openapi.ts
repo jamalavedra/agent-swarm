@@ -2,16 +2,23 @@ import { generateOpenApiSpec } from "../src/http/openapi";
 // Import all handler files to trigger route() registrations
 import "../src/http/active-sessions";
 import "../src/http/agents";
+import "../src/http/approval-requests";
 import "../src/http/config";
+import "../src/http/context";
 import "../src/http/db-query";
 import "../src/http/ecosystem";
-import "../src/http/epics";
+
+import "../src/http/api-keys";
+import "../src/http/events";
+import "../src/http/heartbeat";
 import "../src/http/memory";
 import "../src/http/prompt-templates";
 import "../src/http/poll";
 import "../src/http/repos";
 import "../src/http/schedules";
 import "../src/http/session-data";
+import "../src/http/skills";
+import "../src/http/mcp-servers";
 import "../src/http/stats";
 import "../src/http/tasks";
 import "../src/http/trackers/linear";

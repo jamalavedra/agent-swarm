@@ -41,17 +41,19 @@ export const registerUpdateProfileTool = (server: McpServer) => {
           ),
         soulMd: z
           .string()
+          .min(200)
           .max(65536)
           .optional()
           .describe(
-            "Soul content: persona and behavioral directives. Updates both DB and /workspace/SOUL.md.",
+            "Soul content: persona and behavioral directives. Updates both DB and /workspace/SOUL.md. Must be at least 200 characters to prevent accidental corruption.",
           ),
         identityMd: z
           .string()
+          .min(200)
           .max(65536)
           .optional()
           .describe(
-            "Identity content: expertise and working style. Updates both DB and /workspace/IDENTITY.md.",
+            "Identity content: expertise and working style. Updates both DB and /workspace/IDENTITY.md. Must be at least 200 characters to prevent accidental corruption.",
           ),
         setupScript: z
           .string()
@@ -66,6 +68,13 @@ export const registerUpdateProfileTool = (server: McpServer) => {
           .optional()
           .describe(
             "Environment-specific operational knowledge. Repos, services, SSH hosts, APIs, device names — anything specific to your setup. Synced to /workspace/TOOLS.md.",
+          ),
+        heartbeatMd: z
+          .string()
+          .max(65536)
+          .optional()
+          .describe(
+            "Heartbeat checklist content (HEARTBEAT.md). Checked periodically — add standing orders for the lead to review. Synced to /workspace/HEARTBEAT.md.",
           ),
       }),
       outputSchema: z.object({
@@ -87,6 +96,7 @@ export const registerUpdateProfileTool = (server: McpServer) => {
         identityMd,
         setupScript,
         toolsMd,
+        heartbeatMd,
       },
       requestInfo,
       _meta,
@@ -159,20 +169,21 @@ export const registerUpdateProfileTool = (server: McpServer) => {
         soulMd === undefined &&
         identityMd === undefined &&
         setupScript === undefined &&
-        toolsMd === undefined
+        toolsMd === undefined &&
+        heartbeatMd === undefined
       ) {
         return {
           content: [
             {
               type: "text",
-              text: "At least one field (name, description, role, capabilities, claudeMd, soulMd, identityMd, setupScript, or toolsMd) must be provided.",
+              text: "At least one field (name, description, role, capabilities, claudeMd, soulMd, identityMd, setupScript, toolsMd, or heartbeatMd) must be provided.",
             },
           ],
           structuredContent: {
             yourAgentId: requestInfo.agentId,
             success: false,
             message:
-              "At least one field (name, description, role, capabilities, claudeMd, soulMd, identityMd, setupScript, or toolsMd) must be provided.",
+              "At least one field (name, description, role, capabilities, claudeMd, soulMd, identityMd, setupScript, toolsMd, or heartbeatMd) must be provided.",
           },
         };
       }
@@ -207,6 +218,7 @@ export const registerUpdateProfileTool = (server: McpServer) => {
             identityMd,
             setupScript,
             toolsMd,
+            heartbeatMd,
           },
           {
             changeSource: isUpdatingSelf ? "self_edit" : "lead_coaching",
@@ -245,6 +257,13 @@ export const registerUpdateProfileTool = (server: McpServer) => {
               /* ignore */
             }
           }
+          if (heartbeatMd !== undefined) {
+            try {
+              await Bun.write("/workspace/HEARTBEAT.md", heartbeatMd);
+            } catch {
+              /* ignore */
+            }
+          }
         }
 
         if (!agent) {
@@ -268,6 +287,7 @@ export const registerUpdateProfileTool = (server: McpServer) => {
         if (identityMd !== undefined) updatedFields.push("identityMd");
         if (setupScript !== undefined) updatedFields.push("setupScript");
         if (toolsMd !== undefined) updatedFields.push("toolsMd");
+        if (heartbeatMd !== undefined) updatedFields.push("heartbeatMd");
 
         const targetLabel = isUpdatingSelf ? "own" : `agent ${targetAgentId}`;
         return {

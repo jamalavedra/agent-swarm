@@ -3,16 +3,14 @@ title: MCP Tools Reference
 description: Complete reference for all MCP tools available in the swarm
 ---
 
-# MCP Tools Reference
-
 Agent Swarm exposes its functionality through MCP (Model Context Protocol) tools. Tools are grouped by capability.
 
 ## Tool Search & Annotations
 
 All MCP tools have structured annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) to improve Claude Code's Tool Search discoverability. Tools are split into two tiers:
 
-- **Core tools** (16) — Always available in context: task lifecycle, basic communication, memory recall, debug, and swarm awareness
-- **Deferred tools** (34) — Discovered on demand via Claude Code's Tool Search when the agent needs them (scheduling, epics, config, file operations, etc.)
+- **Core tools** (13) — Always available in context: task lifecycle, basic communication, memory recall, and swarm awareness
+- **Deferred tools** (74) — Discovered on demand via Claude Code's Tool Search when the agent needs them (scheduling, config, skills, workflows, MCP servers, Slack, user identity, repos, etc.)
 
 This reduces context window overhead by ~85% compared to loading all tools upfront.
 
@@ -69,7 +67,6 @@ Send a task to a specific agent, create an unassigned task, or offer a task for 
 | `tags` | array | No | Tags for filtering |
 | `taskType` | string | No | Task type classification |
 | `dependsOn` | array | No | Task IDs this depends on |
-| `epicId` | uuid | No | Associated epic |
 | `parentTaskId` | uuid | No | Parent task for session continuity |
 | `dir` | string | No | Working directory (absolute path) for the agent to start in |
 | `model` | string | No | Model for this task: `haiku`, `sonnet`, or `opus`. Falls back to agent/global `MODEL_OVERRIDE` config, then `opus` |
@@ -271,8 +268,8 @@ Update an agent's profile, identity files, and setup script. By default updates 
 | `name` | string | No | Agent name |
 | `role` | string | No | Agent role |
 | `description` | string | No | Agent description |
-| `soulMd` | string | No | SOUL.md content |
-| `identityMd` | string | No | IDENTITY.md content |
+| `soulMd` | string (min 200 chars) | No | SOUL.md content. Must be at least 200 characters to prevent accidental corruption. |
+| `identityMd` | string (min 200 chars) | No | IDENTITY.md content. Must be at least 200 characters to prevent accidental corruption. |
 | `toolsMd` | string | No | TOOLS.md content |
 | `claudeMd` | string | No | CLAUDE.md content |
 | `setupScript` | string | No | Startup script content |
@@ -311,16 +308,6 @@ Manage recurring and one-time task automation. Schedules support a `model` param
 **One-time schedules** (v1.36.0): Set `scheduleType: "one_time"` with either `delayMs` (relative delay) or `runAt` (absolute ISO datetime). One-time schedules auto-disable after execution. `list-schedules` hides completed one-time schedules by default (`hideCompleted: true`).
 
 See [Scheduled Tasks](/docs/concepts/scheduling) for details.
-
-## Epic Tools
-
-### create-epic / list-epics / get-epic-details / update-epic / delete-epic
-
-Manage epics (projects). See [Epics](/docs/concepts/epics) for details.
-
-### assign-task-to-epic / unassign-task-from-epic
-
-Associate tasks with epics.
 
 ## Workflow Tools
 
@@ -390,6 +377,13 @@ Get details of a specific workflow run including step statuses.
 |-----------|------|----------|-------------|
 | `id` | uuid | Yes | Run ID |
 
+## Related
+
+- [CLI Reference](/docs/reference/cli) — Terminal commands for managing agents, tasks, and configuration
+- [Environment Variables](/docs/reference/environment-variables) — Configuration variables for the swarm
+- [Task Lifecycle](/docs/concepts/task-lifecycle) — How tasks flow through the swarm
+- [Workflows](/docs/concepts/workflows) — DAG-based workflow definitions and automation
+
 ### list-workflow-runs
 
 List runs for a specific workflow.
@@ -406,6 +400,221 @@ Retry a failed workflow run from the point of failure.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `runId` | uuid | Yes | Run ID to retry |
+
+### cancel-workflow-run
+
+Cancel a running or waiting workflow run. Cancels all non-terminal steps and their associated tasks.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `runId` | uuid | Yes | Workflow run ID to cancel |
+| `reason` | string | No | Optional reason for cancellation |
+
+### patch-workflow
+
+Partially update a workflow definition by creating, updating, or deleting individual nodes. Operations are applied in order: delete → create → update. Creates a version snapshot before applying changes.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | uuid | Yes | Workflow ID to patch |
+| `update` | array | No | Nodes to update (partial merge): `[{ nodeId, node }]` |
+| `delete` | array | No | Node IDs to delete |
+| `create` | array | No | New nodes to add: `[{ id, type, config, label?, next?, inputs? }]` |
+| `onNodeFailure` | string | No | Update failure behavior: `fail` or `continue` |
+
+### patch-workflow-node
+
+Partially update a single node in a workflow definition. Merges the provided fields into the existing node. Creates a version snapshot before applying changes.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | uuid | Yes | Workflow ID |
+| `nodeId` | string | Yes | Node ID to update |
+| Additional fields from node schema (type, config, label, next, inputs, etc.) |
+
+## Human-in-the-Loop Tools
+
+### request-human-input
+
+Create an approval request that pauses until a human responds. Supports multiple question types: approval (yes/no), text, single-select, multi-select, and boolean. Returns the request ID and URL for the human to respond.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `title` | string | Yes | Title of the approval request |
+| `questions` | array | Yes | Questions to ask the human |
+
+Approval requests are accessible via the dashboard at `/approval-requests/{id}`. When resolved, a follow-up task is automatically created for the requesting agent with the human's responses.
+
+## Skill Tools
+
+Manage reusable procedural knowledge (skills) that agents can create, share, and install.
+
+### skill-create
+
+Create a personal skill from SKILL.md content. Parses frontmatter for name, description, and metadata.
+
+### skill-get
+
+Get full skill content by ID or name. Name resolution checks agent scope first, then swarm, then global.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `skillId` | string | No | Skill ID |
+| `name` | string | No | Skill name (resolved with precedence) |
+
+### skill-list
+
+List available skills with optional filters.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `type` | string | No | Filter by type: `remote` or `personal` |
+| `scope` | string | No | Filter by scope: `global`, `swarm`, or `agent` |
+| `agentId` | string | No | Filter by owning agent |
+
+### skill-search
+
+Search skills by keyword (name and description).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | Yes | Search query |
+| `limit` | number | No | Max results (default: 20) |
+
+### skill-install
+
+Install/assign a skill to an agent. Leads can install for other agents.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `skillId` | string | Yes | ID of the skill to install |
+
+### skill-uninstall
+
+Remove a skill from an agent.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `skillId` | string | Yes | ID of the skill to uninstall |
+| `agentId` | string | No | Target agent (default: calling agent) |
+
+### skill-update
+
+Update a skill's content or settings. Re-parses frontmatter if content changes.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `skillId` | string | No | Skill ID to update |
+| `content` | string | No | New SKILL.md content |
+| `isEnabled` | boolean | No | Toggle enabled/disabled |
+
+### skill-publish
+
+Publish a personal skill to swarm scope. Creates an approval task for the lead agent.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `skillId` | string | Yes | ID of the personal skill to publish |
+
+### skill-delete
+
+Delete a skill. Only the owning agent or lead can delete.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `skillId` | string | Yes | ID of the skill to delete |
+
+### skill-install-remote
+
+Fetch and install a remote skill from a GitHub repository.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sourceRepo` | string | Yes | GitHub repo (e.g. `vercel-labs/skills`) |
+| `sourcePath` | string | No | Path within repo (e.g. `skills/nextjs`) |
+
+### skill-sync-remote
+
+Check and update remote skills from their GitHub sources. Compares content and updates if changed.
+
+## MCP Server Tools
+
+Manage MCP server definitions and installations. Servers are scoped (agent → swarm → global) and can be installed per-agent.
+
+### mcp-server-create
+
+Create a new MCP server definition. Agent-scope servers are auto-installed for the creating agent. Swarm/global scope requires lead.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | Yes | Server name |
+| `description` | string | No | Server description |
+| `transport` | string | Yes | `stdio`, `http`, or `sse` |
+| `command` | string | No | Command to run (required for stdio) |
+| `args` | string | No | JSON array of arguments (stdio only) |
+| `url` | string | No | Server URL (required for http/sse) |
+
+### mcp-server-get
+
+Get MCP server details by ID or name. Name resolution uses scope cascade: agent > swarm > global.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | No | MCP server ID |
+| `name` | string | No | MCP server name (resolved with scope cascade) |
+
+### mcp-server-list
+
+List MCP servers with optional filters.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `scope` | string | No | Filter by scope: `global`, `swarm`, or `agent` |
+| `transport` | string | No | Filter by transport: `stdio`, `http`, or `sse` |
+| `search` | string | No | Search by name or description |
+
+### mcp-server-update
+
+Update an MCP server's configuration. Only the owner or lead can update.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | Yes | MCP server ID |
+| `name` | string | No | New name |
+| `description` | string | No | New description |
+| `transport` | string | No | New transport type |
+| `command` | string | No | New command (stdio) |
+| `args` | string | No | New JSON array of arguments |
+| `url` | string | No | New URL (http/sse) |
+| `headers` | string | No | New JSON object of non-secret headers |
+| `envConfigKeys` | string | No | New env config key mappings |
+| `headerConfigKeys` | string | No | New header config key mappings |
+| `isEnabled` | boolean | No | Toggle enabled/disabled |
+
+### mcp-server-install
+
+Install an MCP server for an agent. Self-install is always allowed; cross-agent requires lead.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `mcpServerId` | string | Yes | ID of the MCP server to install |
+
+### mcp-server-uninstall
+
+Uninstall an MCP server from an agent.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `mcpServerId` | string | Yes | ID of the MCP server to uninstall |
+| `agentId` | string | No | Target agent (default: calling agent) |
+
+### mcp-server-delete
+
+Delete an MCP server definition. Only the owning agent or lead can delete.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | Yes | MCP server ID |
 
 ## Debug Tools
 
@@ -439,6 +648,14 @@ Retrieve full details of a specific memory.
 |-----------|------|----------|-------------|
 | `memoryId` | uuid | Yes | Memory ID |
 
+### memory-delete
+
+Delete a memory by ID. Agents can delete their own memories; lead agents can also delete swarm-scoped memories.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `memoryId` | uuid | Yes | Memory ID to delete |
+
 ### inject-learning
 
 Lead agent pushes learnings into a worker's memory.
@@ -448,3 +665,65 @@ Lead agent pushes learnings into a worker's memory.
 | `agentId` | uuid | Yes | Target worker |
 | `learning` | string | Yes | Learning content |
 | `category` | string | Yes | `mistake-pattern`, `best-practice`, `codebase-knowledge`, or `preference` |
+
+## User Identity Tools
+
+Tools for managing the canonical user registry across platforms.
+
+### resolve-user
+
+Look up a canonical user profile by any platform-specific identifier (Slack ID, Linear ID, GitHub username, email, or name).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `slackUserId` | string | No | Slack user ID |
+| `linearUserId` | string | No | Linear user UUID |
+| `githubUsername` | string | No | GitHub username |
+| `gitlabUsername` | string | No | GitLab username |
+| `email` | string | No | Email address |
+| `name` | string | No | Name (fuzzy substring match) |
+
+### manage-user
+
+Create, update, delete, or list user profiles in the user registry. Lead-only.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `action` | string | Yes | `create`, `update`, `delete`, `list`, or `get` |
+| `userId` | string | No | User ID (required for update/delete/get) |
+| `name` | string | No | Display name (required for create) |
+| `email` | string | No | Primary email address |
+| `role` | string | No | Role (e.g., "founder", "engineer") |
+| `notes` | string | No | Free-form notes |
+| `slackUserId` | string | No | Slack user ID |
+| `linearUserId` | string | No | Linear user UUID |
+| `githubUsername` | string | No | GitHub username |
+| `gitlabUsername` | string | No | GitLab username |
+| `emailAliases` | array | No | Additional email addresses |
+| `preferredChannel` | string | No | Preferred contact channel |
+| `timezone` | string | No | Timezone (e.g., America/New_York) |
+
+## Repository Tools
+
+Tools for managing registered repos and their guidelines.
+
+### get-repos
+
+List registered repos with their guidelines (PR checks, merge policy, review guidance).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | No | Filter by repo name (returns all if omitted) |
+
+### update-repo
+
+Update a repo's configuration including guidelines.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | Yes | Repo ID to update |
+| `url` | string | No | New repo URL |
+| `name` | string | No | New repo name |
+| `clonePath` | string | No | New clone path |
+| `defaultBranch` | string | No | New default branch |
+| `autoClone` | boolean | No | Whether to auto-clone |

@@ -3,8 +3,6 @@ title: Agent Identity & Configuration
 description: How agents are configured, personalized, and evolve over time
 ---
 
-# Agent Identity & Configuration
-
 Every agent in the swarm is a persistent entity with its own identity, memories, and environment. This identity evolves over time as the agent works.
 
 ## Identity Files
@@ -37,11 +35,13 @@ All identity file changes are tracked with version history. You can:
 The system prompt is built from multiple layers, assembled at task start:
 
 1. **Base role instructions** — Lead or worker-specific behavior rules
-2. **Agent identity** — SOUL.md + IDENTITY.md content
-3. **Repository context** — If the task targets a specific GitHub repo, that repo's CLAUDE.md is included
-4. **Filesystem guide** — Memory directories, personal/shared workspace, setup script instructions
-5. **Self-awareness** — How the agent is built (runtime, hooks, memory system, task lifecycle)
-6. **Additional prompt** — Custom text from `SYSTEM_PROMPT` env var or `--system-prompt` CLI flag
+2. **Code quality & repository guidelines** — Mandatory PR checks, merge policy, and review guidance from per-repo configuration
+3. **Conditional Slack instructions** — Injected only for worker tasks that originated from Slack (channel ID and thread context)
+4. **Agent identity** — SOUL.md + IDENTITY.md content
+5. **Repository context** — If the task targets a specific GitHub repo, that repo's CLAUDE.md and guidelines are included
+6. **Filesystem guide** — Memory directories, personal/shared workspace, setup script instructions
+7. **Self-awareness** — How the agent is built (runtime, hooks, memory system, task lifecycle)
+8. **Additional prompt** — Custom text from `SYSTEM_PROMPT` env var or `--system-prompt` CLI flag
 
 ## Startup Scripts
 
@@ -90,6 +90,27 @@ When `AGENT_FS_API_URL` is configured as a global swarm config, agents gain acce
 
 Agents are automatically registered with agent-fs on their first container boot. The lead agent creates a shared organization and workers receive invitations automatically.
 
+## Repository Guidelines
+
+Repos registered with the swarm can have **guidelines** — per-repo quality rules that are injected into agent prompts and enforced by plugin commands.
+
+Guidelines have three sections:
+
+| Section | Purpose |
+|---------|---------|
+| **PR Checks** | Commands agents must run before pushing (lint, typecheck, tests) |
+| **Merge Policy** | Whether agents are allowed to merge, and any required checks |
+| **Review Guidance** | How agents should review PRs for this repo |
+
+### How It Works
+
+1. **Lead sets guidelines** — Use the `update-repo` MCP tool to configure guidelines for a repo
+2. **Prompt injection** — When a task targets a repo, its guidelines are injected into the agent's system prompt as a mandatory "Repository Guidelines" section
+3. **Command enforcement** — `/create-pr` and `/implement-issue` require PR checks to pass before pushing; `/review-pr` references the review guidance
+4. **Lead gating** — The lead agent can block code tasks for repos that lack guidelines
+
+Use the `get-repos` MCP tool to view registered repos and their guidelines.
+
 ## Lead vs Worker
 
 ### Lead Agent
@@ -99,7 +120,7 @@ Agents are automatically registered with agent-fs on their first container boot.
 - Can delegate tasks to workers
 - Can inject learnings into worker memories
 - Has access to all Slack channels
-- Creates and manages epics
+- Coordinates projects across workers
 
 ### Worker Agent
 
@@ -115,3 +136,4 @@ Agents are automatically registered with agent-fs on their first container boot.
 - [Architecture Overview](/docs/architecture/overview) — How all the components fit together
 - [Hook System](/docs/architecture/hooks) — Hooks that sync identity files and manage sessions
 - [Memory System](/docs/architecture/memory) — How agents build compounding knowledge
+- [Agents API Reference](/docs/api-reference/agents) — REST API endpoints for registering, querying, and managing agents

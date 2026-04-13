@@ -3,8 +3,6 @@ title: Task Lifecycle
 description: How tasks flow through the swarm from creation to completion
 ---
 
-# Task Lifecycle
-
 Tasks are the fundamental unit of work in Agent Swarm. Understanding the task lifecycle is essential for working with the system effectively.
 
 ## Task States
@@ -103,7 +101,6 @@ A task with dependencies won't be offered or claimable until all dependencies ar
 | `tags` | Labels for filtering (e.g., `['urgent', 'frontend']`) |
 | `taskType` | Classification (e.g., `bug`, `feature`, `review`) |
 | `dependsOn` | Array of task IDs that must complete first |
-| `epicId` | Optional association with an epic |
 | `parentTaskId` | For session continuity — child task resumes parent's Claude session |
 | `dir` | Working directory (absolute path) for the agent to start in. Falls back to repo clone path or default cwd |
 | `model` | Model override: `haiku`, `sonnet`, or `opus`. Priority: task > `MODEL_OVERRIDE` config > `opus` |
@@ -140,9 +137,15 @@ When a worker container receives SIGTERM:
 
 This enables zero-downtime deployments.
 
+## Stalled Task Auto-Remediation
+
+The heartbeat system automatically detects and recovers stalled tasks — tasks that remain `in_progress` but whose worker has become unresponsive. When the lead agent starts up, it triggers an immediate heartbeat sweep to catch any tasks that stalled while the swarm was down.
+
+Stalled task detection uses the heartbeat's code-level triage: if a task has been `in_progress` for longer than expected without progress updates and its assigned worker is offline, the heartbeat can reassign or fail the task as appropriate.
+
 ## Related
 
-- [Epics](/docs/concepts/epics) — Organizing related tasks into larger projects
 - [Scheduled Tasks](/docs/concepts/scheduling) — Automate recurring task creation
 - [Architecture Overview](/docs/architecture/overview) — How the task system fits into the overall architecture
 - [Deployment Guide](/docs/guides/deployment) — Graceful shutdown and task resume in production
+- [Tasks API Reference](/docs/api-reference/tasks) — REST API endpoints for creating, querying, and managing tasks

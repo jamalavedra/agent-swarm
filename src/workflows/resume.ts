@@ -1,5 +1,7 @@
 import {
+  cancelTask,
   getCompletedStepNodeIds,
+  getTaskByWorkflowRunStepId,
   getWorkflow,
   getWorkflowRun,
   getWorkflowRunStep,
@@ -8,6 +10,7 @@ import {
   updateWorkflowRunStep,
 } from "../be/db";
 import { checkpointStep } from "./checkpoint";
+import { getSuccessors } from "./definition";
 import { findReadyNodes, walkGraph } from "./engine";
 import type { WorkflowEventBus } from "./event-bus";
 import type { ExecutorRegistry } from "./executors/registry";
@@ -19,6 +22,14 @@ interface TaskEvent {
   workflowRunId?: string;
   workflowRunStepId?: string;
   failureReason?: string;
+}
+
+interface ApprovalEvent {
+  requestId: string;
+  status: "approved" | "rejected" | "timeout";
+  responses: Record<string, unknown> | null;
+  workflowRunId?: string;
+  workflowRunStepId?: string;
 }
 
 /**
@@ -55,6 +66,16 @@ export function setupWorkflowResumeListener(
       await handleTaskFailure(event, "Task was cancelled", registry);
     } catch (err) {
       console.error("[workflows] Handle task cancellation error:", err);
+    }
+  });
+
+  eventBus.on("approval.resolved", async (data: unknown) => {
+    const event = data as ApprovalEvent;
+    if (!event.workflowRunId || !event.workflowRunStepId) return;
+    try {
+      await resumeFromApprovalResolution(event, registry);
+    } catch (err) {
+      console.error("[workflows] Resume from approval resolution failed:", err);
     }
   });
 }
@@ -102,14 +123,14 @@ async function resumeFromTaskCompletion(
   // Set run back to running
   updateWorkflowRun(run.id, { status: "running" });
 
-  // Use convergence-aware node detection instead of blindly passing successors.
-  // This prevents duplicate step creation for convergence nodes (e.g., fan-out → merge).
-  // findReadyNodes checks ALL predecessors are completed before marking a node ready.
-  const completedNodeIds = new Set(getCompletedStepNodeIds(run.id));
-  const readyNodes = findReadyNodes(workflow.definition, completedNodeIds);
+  // Use direct successor-based routing (same as resumeFromApprovalResolution).
+  // findReadyNodes is NOT loop-aware — it excludes nodes with any completed step,
+  // which breaks loop workflows where a node needs re-execution on a new iteration.
+  // walkGraph handles convergence internally via activeEdges reconstruction.
+  const successors = getSuccessors(workflow.definition, step.nodeId);
 
-  if (readyNodes.length > 0) {
-    await walkGraph(workflow.definition, run.id, ctx, readyNodes, registry, workflow.id);
+  if (successors.length > 0) {
+    await walkGraph(workflow.definition, run.id, ctx, successors, registry, workflow.id);
   } else {
     finalizeOrWait(run.id);
   }
@@ -119,7 +140,7 @@ async function resumeFromTaskCompletion(
  * If no nodes are ready and no steps are still waiting, finalize the run.
  * Otherwise set it back to waiting for the next task completion.
  */
-function finalizeOrWait(runId: string): void {
+export function finalizeOrWait(runId: string): void {
   const steps = getWorkflowRunStepsByRunId(runId);
   const hasWaiting = steps.some((s) => s.status === "waiting");
   if (hasWaiting) {
@@ -168,11 +189,12 @@ async function handleTaskFailure(
   checkpointStep(run.id, step.id, step.nodeId, { output: stepOutput }, ctx);
 
   updateWorkflowRun(run.id, { status: "running" });
-  const completedNodeIds = new Set(getCompletedStepNodeIds(run.id));
-  const readyNodes = findReadyNodes(workflow.definition, completedNodeIds);
 
-  if (readyNodes.length > 0) {
-    await walkGraph(workflow.definition, run.id, ctx, readyNodes, registry, workflow.id);
+  // Use direct successor-based routing (loop-aware).
+  const successors = getSuccessors(workflow.definition, step.nodeId);
+
+  if (successors.length > 0) {
+    await walkGraph(workflow.definition, run.id, ctx, successors, registry, workflow.id);
   } else {
     finalizeOrWait(run.id);
   }
@@ -226,4 +248,96 @@ export async function retryFailedRun(runId: string, registry: ExecutorRegistry):
     ? readyNodes
     : [failedNode, ...readyNodes];
   await walkGraph(workflow.definition, runId, ctx, nodesToRun, registry, workflow.id);
+}
+
+/**
+ * Cancel a workflow run and all its non-terminal steps.
+ * Also cancels any in-progress tasks spawned by waiting/running steps.
+ */
+export function cancelWorkflowRun(runId: string, reason?: string): void {
+  const run = getWorkflowRun(runId);
+  if (!run) throw new Error("Workflow run not found");
+
+  const terminalStatuses = ["completed", "failed", "cancelled", "skipped"];
+  if (terminalStatuses.includes(run.status)) {
+    throw new Error(`Cannot cancel run in '${run.status}' state`);
+  }
+
+  const now = new Date().toISOString();
+  const cancelReason = reason ?? "Cancelled by user";
+
+  // Cancel non-terminal steps and their associated tasks
+  const steps = getWorkflowRunStepsByRunId(runId);
+  for (const step of steps) {
+    if (terminalStatuses.includes(step.status)) continue;
+
+    // Cancel any task linked to this step
+    const task = getTaskByWorkflowRunStepId(step.id);
+    if (task) {
+      cancelTask(task.id, cancelReason);
+    }
+
+    updateWorkflowRunStep(step.id, {
+      status: "cancelled",
+      error: cancelReason,
+      finishedAt: now,
+    });
+  }
+
+  // Mark the run itself as cancelled
+  updateWorkflowRun(runId, {
+    status: "cancelled",
+    error: cancelReason,
+    finishedAt: now,
+  });
+}
+
+/**
+ * Resume a workflow after a linked approval request is resolved.
+ *
+ * 1. Verify run and step are in "waiting" state
+ * 2. Checkpoint step completion with approval response data
+ * 3. Route to the appropriate port (approved/rejected/timeout)
+ * 4. Continue the graph walk
+ */
+async function resumeFromApprovalResolution(
+  event: ApprovalEvent,
+  registry: ExecutorRegistry,
+): Promise<void> {
+  const run = getWorkflowRun(event.workflowRunId!);
+  if (!run || (run.status !== "waiting" && run.status !== "running")) return;
+
+  const step = getWorkflowRunStep(event.workflowRunStepId!);
+  if (!step || step.status !== "waiting") return;
+
+  const workflow = getWorkflow(run.workflowId);
+  if (!workflow) return;
+
+  const ctx = (run.context ?? {}) as Record<string, unknown>;
+
+  // Determine output port based on approval status
+  const nextPort =
+    event.status === "timeout" ? "timeout" : event.status === "rejected" ? "rejected" : "approved";
+
+  const stepOutput = {
+    requestId: event.requestId,
+    status: event.status,
+    responses: event.responses,
+  };
+
+  checkpointStep(run.id, step.id, step.nodeId, { output: stepOutput, nextPort }, ctx);
+  updateWorkflowRun(run.id, { status: "running" });
+
+  // Use port-based routing to determine the correct successors.
+  // findReadyNodes without activeEdges would return ALL structural successors
+  // (e.g. both "success" and "generate-question"), ignoring the port selection.
+  // Instead, compute the port-specific successors and let walkGraph handle
+  // convergence checks via its internal activeEdges reconstruction.
+  const successors = getSuccessors(workflow.definition, step.nodeId, nextPort);
+
+  if (successors.length > 0) {
+    await walkGraph(workflow.definition, run.id, ctx, successors, registry, workflow.id);
+  } else {
+    finalizeOrWait(run.id);
+  }
 }

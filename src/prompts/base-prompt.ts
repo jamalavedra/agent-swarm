@@ -37,7 +37,19 @@ export type BasePromptArgs = {
     claudeMd?: string | null;
     clonePath: string;
     warning?: string | null;
+    guidelines?: {
+      prChecks: string[];
+      mergeChecks: string[];
+      allowMerge?: boolean;
+      review: string[];
+    } | null;
   };
+  /** Slack context from the current task, if present */
+  slackContext?: { channelId: string; threadTs?: string };
+  /** Pre-fetched skill summaries for the installed skills section */
+  skillsSummary?: { name: string; description: string }[];
+  /** Pre-fetched MCP server summaries for the installed MCP servers section */
+  mcpServersSummary?: string;
 };
 
 export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
@@ -49,6 +61,15 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
   const compositeEventType = role === "lead" ? "system.session.lead" : "system.session.worker";
   const compositeResult = await resolveTemplateAsync(compositeEventType, vars);
   let prompt = compositeResult.text;
+
+  // Conditionally inject Slack instructions for workers with Slack-originated tasks
+  if (role !== "lead" && args.slackContext) {
+    const slackResult = await resolveTemplateAsync("system.agent.worker.slack", {
+      slackChannelId: args.slackContext.channelId,
+      slackThreadTs: args.slackContext.threadTs ?? "",
+    });
+    prompt += slackResult.text;
+  }
 
   // Inject agent identity (soul + identity + name/description) if available
   if (args.soulMd || args.identityMd || args.name) {
@@ -68,6 +89,17 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
     }
   }
 
+  // Installed skills section (progressive disclosure — name + description only)
+  if (args.skillsSummary && args.skillsSummary.length > 0) {
+    const summaries = args.skillsSummary.map((s) => `- /${s.name}: ${s.description}`).join("\n");
+    prompt += `\n\n## Installed Skills\n\nThe following skills are available. Use the Skill tool to invoke them by name.\n\n${summaries}\n`;
+  }
+
+  // Installed MCP servers section
+  if (args.mcpServersSummary) {
+    prompt += `\n\n## Installed MCP Servers\n\nThe following MCP servers are configured for your use:\n${args.mcpServersSummary}\n`;
+  }
+
   // Repo context (protected, never truncated)
   if (args.repoContext) {
     prompt += "\n\n## Repository Context\n\n";
@@ -83,6 +115,41 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
       prompt += `${args.repoContext.claudeMd}\n`;
     } else if (!args.repoContext.warning) {
       prompt += `Repository is cloned at \`${args.repoContext.clonePath}\` but has no CLAUDE.md file.\n`;
+    }
+
+    // Inject repo guidelines
+    const g = args.repoContext.guidelines;
+    if (g === null || g === undefined) {
+      prompt += `\n### Repository Guidelines\n\nNo repository guidelines defined. If you need to push code, ask the lead or user to define guidelines first.\n`;
+    } else {
+      const hasAnyContent =
+        g.prChecks.length > 0 || g.mergeChecks.length > 0 || g.review.length > 0 || g.allowMerge;
+      if (hasAnyContent) {
+        prompt += `\n### Repository Guidelines (MANDATORY)\n\n`;
+        if (g.prChecks.length > 0) {
+          prompt += `**PR Checks — Run ALL before pushing code or creating a PR:**\n`;
+          g.prChecks.forEach((check, i) => {
+            prompt += `${i + 1}. \`${check}\`\n`;
+          });
+          prompt += `If ANY check fails, fix the issue before pushing. Do NOT push code with failing checks.\nDo NOT use \`--no-verify\` or any flag that bypasses git hooks.\n\n`;
+        }
+        prompt += `**Merge Policy:**\n`;
+        prompt += `- Auto-merge: ${g.allowMerge ? "Allowed" : "Not allowed (default)"}\n`;
+        if (g.mergeChecks.length > 0) {
+          prompt += `- Before merging, verify:\n`;
+          g.mergeChecks.forEach((check) => {
+            prompt += `  - ${check}\n`;
+          });
+        }
+        prompt += `\n`;
+        if (g.review.length > 0) {
+          prompt += `**Review Guidance:**\n`;
+          g.review.forEach((item) => {
+            prompt += `- ${item}\n`;
+          });
+          prompt += `\n`;
+        }
+      }
     }
   }
 

@@ -15,11 +15,15 @@
   - [store-progress](#store-progress)
   - [my-agent-info](#my-agent-info)
   - [cancel-task](#cancel-task)
+  - [resolve-user](#resolve-user)
+  - [manage-user](#manage-user)
   - [db-query](#db-query)
   - [set-config](#set-config)
   - [get-config](#get-config)
   - [list-config](#list-config)
   - [delete-config](#delete-config)
+  - [get-repos](#get-repos)
+  - [update-repo](#update-repo)
   - [list-prompt-templates](#list-prompt-templates)
   - [get-prompt-template](#get-prompt-template)
   - [set-prompt-template](#set-prompt-template)
@@ -31,7 +35,7 @@
   - [slack-list-channels](#slack-list-channels)
   - [slack-upload-file](#slack-upload-file)
   - [slack-download-file](#slack-download-file)
-  - [register-agent-mail-inbox](#register-agent-mail-inbox)
+  - [register-agentmail-inbox](#register-agentmail-inbox)
 - [Task Pool Tools](#task-pool-tools)
   - [task-action](#task-action)
 - [Messaging Tools](#messaging-tools)
@@ -55,28 +59,25 @@
   - [update-schedule](#update-schedule)
   - [delete-schedule](#delete-schedule)
   - [run-schedule-now](#run-schedule-now)
-- [Epics Tools](#epics-tools)
-  - [create-epic](#create-epic)
-  - [list-epics](#list-epics)
-  - [get-epic-details](#get-epic-details)
-  - [update-epic](#update-epic)
-  - [delete-epic](#delete-epic)
-  - [assign-task-to-epic](#assign-task-to-epic)
-  - [unassign-task-from-epic](#unassign-task-from-epic)
 - [Memory Tools](#memory-tools)
   - [memory-search](#memory-search)
   - [memory-get](#memory-get)
+  - [memory-delete](#memory-delete)
   - [inject-learning](#inject-learning)
 - [Workflows Tools](#workflows-tools)
   - [create-workflow](#create-workflow)
   - [list-workflows](#list-workflows)
   - [get-workflow](#get-workflow)
   - [update-workflow](#update-workflow)
+  - [patch-workflow](#patch-workflow)
+  - [patch-workflow-node](#patch-workflow-node)
   - [delete-workflow](#delete-workflow)
   - [trigger-workflow](#trigger-workflow)
   - [list-workflow-runs](#list-workflow-runs)
   - [get-workflow-run](#get-workflow-run)
   - [retry-workflow-run](#retry-workflow-run)
+  - [cancel-workflow-run](#cancel-workflow-run)
+  - [request-human-input](#request-human-input)
 
 ---
 
@@ -139,7 +140,6 @@ Sends a task to a specific agent, creates an unassigned task for the pool, or of
 |-----------|------|----------|---------|-------------|
 | `task` | `string` | Yes | - | The task description to send. |
 | `dependsOn` | `array` | No | - | Task IDs this task depends on. |
-| `epicId` | `string` | No | - | Epic to associate this task with. |
 | `slackUserId` | `string` | No | - | Slack user ID of the original requester. |
 
 ### get-task-details
@@ -182,6 +182,43 @@ Cancel a task that is pending or in progress. Only the lead or task creator can 
 |-----------|------|----------|---------|-------------|
 | `taskId` | `uuid` | Yes | - | The ID of the task to cancel. |
 | `reason` | `string` | No | - | Reason for cancellation. |
+
+### resolve-user
+
+**Resolve user identity**
+
+Look up a canonical user profile by any platform-specific identifier (Slack ID, Linear ID, GitHub username, email, or name). Returns the full user profile or null.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `slackUserId` | `string` | No | - | Slack user ID (e.g., U08NR6QD6CS) |
+| `linearUserId` | `string` | No | - | Linear user UUID |
+| `githubUsername` | `string` | No | - | GitHub username |
+| `gitlabUsername` | `string` | No | - | GitLab username |
+| `email` | `string` | No | - | Email address |
+| `name` | `string` | No | - | Name (fuzzy substring match, lowest priority) |
+
+### manage-user
+
+**Manage user profiles**
+
+Create, update, delete, or list user profiles in the user registry. Lead-only.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `action` | `create \| update \| delete \| list \| get` | Yes | - | Action to perform |
+| `userId` | `string` | No | - | User ID (required for update/delete/get) |
+| `name` | `string` | No | - | Display name (required for create) |
+| `email` | `string` | No | - | Primary email address |
+| `role` | `string` | No | - | Role (e.g., "founder", "engineer |
+| `notes` | `string` | No | - | Free-form notes |
+| `slackUserId` | `string` | No | - | Slack user ID |
+| `linearUserId` | `string` | No | - | Linear user UUID |
+| `githubUsername` | `string` | No | - | GitHub username |
+| `gitlabUsername` | `string` | No | - | GitLab username |
+| `emailAliases` | `array` | No | - | Additional email addresses |
+| `preferredChannel` | `string` | No | - | Preferred contact channel |
+| `timezone` | `string` | No | - | Timezone (e.g., America/New_York) |
 
 ### db-query
 
@@ -232,6 +269,31 @@ Delete a swarm configuration entry by its ID. Use list-config to find config IDs
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `id` | `string` | Yes | - | The config entry ID to delete. |
+
+### get-repos
+
+**Get Repos**
+
+List registered repos with their guidelines (PR checks, merge policy, review guidance). Use the optional name filter to check a specific repo. The lead should use this to verify a repo has guidelines before routing tasks.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | `string` | No | - | Filter by repo name. If omitted, returns all repos. |
+
+### update-repo
+
+**Update Repo**
+
+Update a repo's configuration including guidelines (PR checks, merge policy, review guidance). The lead uses this to set guidelines after asking the user. Pass null for guidelines to clear them.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | The repo ID to update. |
+| `url` | `string` | No | - | New repo URL. |
+| `name` | `string` | No | - | New repo name. |
+| `clonePath` | `string` | No | - | New clone path. |
+| `defaultBranch` | `string` | No | - | New default branch. |
+| `autoClone` | `boolean` | No | - | Whether to auto-clone. |
 
 ### list-prompt-templates
 
@@ -340,13 +402,17 @@ Download a file from Slack by file ID or URL. Files are saved to the agent's dow
 
 *No parameters*
 
-### register-agent-mail-inbox
+### register-agentmail-inbox
 
-*Documentation not available*
+**Register AgentMail Inbox**
+
+Register an AgentMail inbox ID to route incoming emails to this agent. When emails arrive at this inbox, they will be routed to you as tasks (for workers) or inbox messages (for leads). Use action 'register' to add a mapping, 'unregister' to remove one, or 'list' to see your current mappings.
+
+*No parameters*
 
 ## Task Pool Tools
 
-*Epics*
+*Messaging*
 
 ### task-action
 
@@ -571,115 +637,6 @@ Immediately execute a scheduled task, creating a task right away. Does not affec
 | `scheduleId` | `string` | No | - | Schedule ID to run |
 | `name` | `string` | No | - | Schedule name to run (alternative to ID) |
 
-## Epics Tools
-
-*Epics*
-
-### create-epic
-
-**Create Epic**
-
-Create a new epic (project) to organize related tasks.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `name` | `string` | Yes | - | Unique name for the epic |
-| `goal` | `string` | Yes | - | The goal/objective of this epic |
-| `description` | `string` | No | - | Detailed description |
-| `prd` | `string` | No | - | Product Requirements Document (markdown) |
-| `plan` | `string` | No | - | Implementation plan (markdown) |
-| `priority` | `number` | No | 50 | - |
-| `tags` | `array` | No | - | Tags for filtering |
-| `leadAgentId` | `string` | No | - | Lead agent for this epic |
-| `researchDocPath` | `string` | No | - | Path to research document |
-| `planDocPath` | `string` | No | - | Path to plan document |
-| `slackChannelId` | `string` | No | - | - |
-| `slackThreadTs` | `string` | No | - | - |
-| `vcsRepo` | `string` | No | - | - |
-| `vcsMilestone` | `string` | No | - | - |
-
-### list-epics
-
-**List Epics**
-
-List epics with optional filters. Returns epics with progress information.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `search` | `string` | No | - | Search in name, description, or goal |
-| `leadAgentId` | `string` | No | - | Filter by lead agent |
-| `createdByAgentId` | `string` | No | - | Filter by creator |
-
-### get-epic-details
-
-**Get Epic Details**
-
-Get detailed information about a specific epic, including progress and associated tasks.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `epicId` | `string` | No | - | The ID of the epic |
-| `name` | `string` | No | - | The name of the epic (alternative to ID) |
-
-### update-epic
-
-**Update Epic**
-
-Update an existing epic. Only the creator, lead agent, or swarm lead can update.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `epicId` | `string` | No | - | The ID of the epic to update |
-| `name` | `string` | No | - | Epic name (alternative to ID for lookup) |
-| `newName` | `string` | No | - | New name for the epic |
-| `description` | `string` | No | - | New description |
-| `goal` | `string` | No | - | New goal |
-| `prd` | `string` | No | - | New PRD (markdown) |
-| `plan` | `string` | No | - | New plan (markdown) |
-| `priority` | `number` | No | - | New priority |
-| `tags` | `array` | No | - | New tags |
-| `leadAgentId` | `string` | No | - | New lead agent |
-| `researchDocPath` | `string` | No | - | - |
-| `planDocPath` | `string` | No | - | - |
-| `slackChannelId` | `string` | No | - | - |
-| `slackThreadTs` | `string` | No | - | - |
-| `vcsRepo` | `string` | No | - | - |
-| `vcsMilestone` | `string` | No | - | - |
-| `nextSteps` | `string` | No | - | Notes on what to do next for this epic |
-
-### delete-epic
-
-**Delete Epic**
-
-Delete an epic. Only the creator or swarm lead can delete. Tasks are unassigned, not deleted.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `epicId` | `string` | No | - | The ID of the epic to delete |
-| `name` | `string` | No | - | Epic name (alternative to ID) |
-
-### assign-task-to-epic
-
-**Assign Task to Epic**
-
-Assign an existing task to an epic.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `taskId` | `string` | Yes | - | The ID of the task to assign |
-| `epicId` | `string` | No | - | The ID of the epic |
-| `epicName` | `string` | No | - | Epic name (alternative to ID) |
-
-### unassign-task-from-epic
-
-**Unassign Task from Epic**
-
-Remove a task from its epic. The task is kept but no longer associated.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `taskId` | `string` | Yes | - | The ID of the task to unassign |
-
 ## Memory Tools
 
 *Memory*
@@ -704,6 +661,16 @@ Retrieve the full content of a specific memory by its ID. Use memory-search to f
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `memoryId` | `uuid` | Yes | - | The ID of the memory to retrieve. |
+
+### memory-delete
+
+**Delete a memory**
+
+Delete a specific memory by its ID. Agents can delete their own memories; lead agents can also delete swarm-scoped memories.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `memoryId` | `uuid` | Yes | - | The ID of the memory to delete. |
 
 ### inject-learning
 
@@ -765,6 +732,28 @@ Update an existing workflow's name, description, definition, triggers, cooldown,
 | `triggers` | `array` | No | - | New trigger configurations |
 | `enabled` | `boolean` | No | - | Enable or disable the workflow |
 
+### patch-workflow
+
+**Patch Workflow Definition**
+
+Partially update a workflow definition by creating, updating, or deleting individual nodes. " + "Operations are applied in order: delete → create → update. " + "Creates a version snapshot before applying changes.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Workflow ID to patch |
+| `delete` | `array` | No | - | Node IDs to delete |
+
+### patch-workflow-node
+
+**Patch Workflow Node**
+
+Partially update a single node in a workflow definition. " + "Merges the provided fields into the existing node. " + "Creates a version snapshot before applying changes.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Workflow ID |
+| `nodeId` | `string` | Yes | - | Node ID to update |
+
 ### delete-workflow
 
 **Delete Workflow**
@@ -815,30 +804,120 @@ Retry a failed workflow run from the beginning. The run must be in 'failed' stat
 |-----------|------|----------|---------|-------------|
 | `runId` | `string` | Yes | - | Workflow run ID to retry |
 
+### cancel-workflow-run
+
+**Cancel Workflow Run**
+
+Cancel a running or waiting workflow run. Cancels all non-terminal steps and their associated tasks.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `runId` | `string` | Yes | - | Workflow run ID to cancel |
+| `reason` | `string` | No | - | Optional reason for cancellation |
+
+### request-human-input
+
+**Request human input**
+
+Create an approval request that pauses until a human responds. " + "Supports multiple question types: approval (yes/no), text, single-select, " + "multi-select, and boolean. Returns the request ID and URL for the human to respond.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `title` | `string` | Yes | - | Title of the approval request |
+| `questions` | `array` | Yes | - | Questions to ask the human |
+
 ## Other Tools
 
 *Tools not assigned to a capability group*
 
-### register-agentmail-inbox
+### mcp-server-update
 
-**Register AgentMail Inbox**
+**Update MCP Server**
 
-Register an AgentMail inbox ID to route incoming emails to this agent. When emails arrive at this inbox, they will be routed to you as tasks (for workers) or inbox messages (for leads). Use action 'register' to add a mapping, 'unregister' to remove one, or 'list' to see your current mappings.
-
-*No parameters*
-
-### tracker-link-epic
-
-**Link Epic to Tracker**
-
-Link a swarm epic to an external tracker issue or project.
+Update an MCP server's configuration. Only the owner or lead can update.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `provider` | `string` | Yes | - | Tracker provider (e.g. 'linear |
-| `swarmEpicId` | `string` | Yes | - | The swarm epic ID to link |
-| `externalId` | `string` | Yes | - | The external issue/project ID in the tracker |
-| `externalUrl` | `string` | No | - | URL to the external issue/project |
+| `id` | `string` | Yes | - | ID of the MCP server to update |
+| `name` | `string` | No | - | New name |
+| `description` | `string` | No | - | New description |
+| `transport` | `stdio \| http \| sse` | No | - | New transport type |
+| `command` | `string` | No | - | New command (stdio) |
+| `args` | `string` | No | - | New JSON array of arguments (stdio) |
+| `url` | `string` | No | - | New URL (http/sse) |
+| `headers` | `string` | No | - | New JSON object of non-secret headers |
+| `envConfigKeys` | `string` | No | - | New env config key mappings |
+| `headerConfigKeys` | `string` | No | - | New header config key mappings |
+| `isEnabled` | `boolean` | No | - | Toggle enabled/disabled |
+
+### mcp-server-create
+
+**Create MCP Server**
+
+Create a new MCP server definition. Agent-scope servers are auto-installed for the creating agent. Swarm/global scope requires lead.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | `string` | Yes | - | Server name |
+| `description` | `string` | No | - | Server description |
+| `transport` | `stdio \| http \| sse` | Yes | - | Transport type |
+| `command` | `string` | No | - | Command to run (required for stdio transport) |
+| `args` | `string` | No | - | JSON array of command arguments (stdio only) |
+| `url` | `string` | No | - | Server URL (required for http/sse transport) |
+
+### mcp-server-install
+
+**Install MCP Server**
+
+Install an MCP server for an agent. Self-install is always allowed; cross-agent install requires lead.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `mcpServerId` | `string` | Yes | - | ID of the MCP server to install |
+
+### mcp-server-list
+
+**List MCP Servers**
+
+List MCP servers with optional filters. Use installedOnly to see servers installed for the calling agent.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `scope` | `global \| swarm \| agent` | No | - | Filter by scope |
+| `transport` | `stdio \| http \| sse` | No | - | Filter by transport type |
+| `search` | `string` | No | - | Search by name or description |
+
+### mcp-server-uninstall
+
+**Uninstall MCP Server**
+
+Uninstall an MCP server from an agent. Self-uninstall is always allowed; cross-agent requires lead.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `mcpServerId` | `string` | Yes | - | ID of the MCP server to uninstall |
+| `agentId` | `string` | No | - | Target agent (default: calling agent) |
+
+### mcp-server-get
+
+**Get MCP Server**
+
+Get MCP server details by ID or name. Name resolution uses scope cascade: agent > swarm > global.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | No | - | MCP server ID |
+| `name` | `string` | No | - | MCP server name (resolved with scope cascade) |
+
+### mcp-server-delete
+
+**Delete MCP Server**
+
+Delete an MCP server definition. Only the owning agent or lead can delete.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | ID of the MCP server to delete |
 
 ### tracker-map-agent
 
@@ -875,7 +954,7 @@ Show all tracker sync mappings with their state.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `provider` | `string` | No | - | Filter by provider (e.g. 'linear |
-| `entityType` | `task \| epic` | No | - | Filter by entity type |
+| `entityType` | `task` | No | - | Filter by entity type |
 
 ### tracker-status
 
@@ -894,4 +973,118 @@ Remove a tracker sync mapping by ID.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `syncId` | `string` | Yes | - | The tracker sync mapping ID to remove |
+
+### skill-install-remote
+
+**Install Remote Skill**
+
+Fetch and install a remote skill from a GitHub repository. Fetches SKILL.md via GitHub raw content API.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `sourceRepo` | `string` | Yes | - | GitHub repo (e.g. "vercel-labs/skills |
+| `sourcePath` | `string` | No | - | Path within repo (e.g. "skills/nextjs |
+
+### skill-update
+
+**Update Skill**
+
+Update a skill's content or settings. Re-parses frontmatter if content changes.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `skillId` | `string` | No | - | Skill ID to update |
+| `content` | `string` | No | - | New SKILL.md content (re-parses frontmatter) |
+| `isEnabled` | `boolean` | No | - | Toggle enabled/disabled |
+
+### skill-create
+
+**Create Skill**
+
+Create a personal skill from SKILL.md content. Parses frontmatter for name, description, and metadata.
+
+*No parameters*
+
+### skill-get
+
+**Get Skill**
+
+Get full skill content by ID or name. Name resolution checks agent scope first, then swarm, then global.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `skillId` | `string` | No | - | Skill ID |
+| `name` | `string` | No | - | Skill name (resolved with precedence) |
+
+### skill-search
+
+**Search Skills**
+
+Search skills by keyword (name and description).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `query` | `string` | Yes | - | Search query |
+| `limit` | `number` | No | 20 | - |
+
+### skill-sync-remote
+
+**Sync Remote Skills**
+
+Check and update remote skills from their GitHub sources. Compares content and updates if changed.
+
+*No parameters*
+
+### skill-install
+
+**Install Skill**
+
+Install/assign a skill to an agent. Leads can install for other agents.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `skillId` | `string` | Yes | - | ID of the skill to install |
+
+### skill-publish
+
+**Publish Skill**
+
+Publish a personal skill to swarm scope. Creates an approval task for the lead agent.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `skillId` | `string` | Yes | - | ID of the personal skill to publish |
+
+### skill-uninstall
+
+**Uninstall Skill**
+
+Remove a skill from an agent.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `skillId` | `string` | Yes | - | ID of the skill to uninstall |
+| `agentId` | `string` | No | - | Target agent (default: calling agent) |
+
+### skill-delete
+
+**Delete Skill**
+
+Delete a skill. Only the owning agent or lead can delete.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `skillId` | `string` | Yes | - | ID of the skill to delete |
+
+### skill-list
+
+**List Skills**
+
+List available skills with optional filters.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `type` | `remote \| personal` | No | - | Filter by type |
+| `scope` | `global \| swarm \| agent` | No | - | Filter by scope |
+| `agentId` | `string` | No | - | Filter by owning agent |
 

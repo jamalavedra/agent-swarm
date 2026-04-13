@@ -2,7 +2,9 @@ import {
   createWorkflowRun,
   createWorkflowRunStep,
   getCompletedStepNodeIds,
+  getLatestStepForNode,
   getStepByIdempotencyKey,
+  getStepCountForNode,
   getWorkflowRun,
   getWorkflowRunStepsByRunId,
   updateWorkflowRun,
@@ -17,10 +19,11 @@ import type { ExecutorRegistry } from "./executors/registry";
 import { resolveInputs } from "./input";
 import { validateJsonSchema } from "./json-schema-validator";
 import { deepInterpolate } from "./template";
-import { runStepValidation } from "./validation";
+import { runStepValidation, type ValidationRunResult } from "./validation";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_ITERATIONS = Number(process.env.WORKFLOW_MAX_ITERATIONS) || 100;
+const MAX_STEPS_PER_RUN = Number(process.env.WORKFLOW_MAX_STEPS_PER_RUN) || 500;
 
 /**
  * Error thrown when trigger data fails validation against a workflow's triggerSchema.
@@ -132,10 +135,11 @@ export async function walkGraph(
 
   // For memoized re-walks, inject stored outputs into context and
   // reconstruct active edges from completed steps' stored nextPort.
+  // Use the LATEST step per node to support loops (a node may have
+  // multiple completed steps from different iterations).
   if (completedNodeIds.size > 0) {
     for (const nodeId of completedNodeIds) {
-      const key = `${runId}:${nodeId}`;
-      const step = getStepByIdempotencyKey(key);
+      const step = getLatestStepForNode(runId, nodeId);
       if (step?.output !== undefined) {
         // Bug 5 fix: Validate stored output against executor schema on recovery
         const node = def.nodes.find((n) => n.id === nodeId);
@@ -163,20 +167,56 @@ export async function walkGraph(
     }
   }
 
-  // Seed with start nodes that haven't been completed yet AND whose
-  // predecessors are all completed (convergence gate). This prevents callers
-  // like resumeFromTaskCompletion() and retryFailedRun() from executing a
-  // convergence node before all its fan-out predecessors are done.
+  // Circuit breaker: fail the run if total steps exceed the per-run limit.
+  // This prevents runaway workflows (e.g. infinite loop-backs) from consuming
+  // unbounded resources. Checked here so it covers initial walks AND async
+  // resumes (resumeFromTaskCompletion, handleTaskFailure, retry-poller).
+  const allSteps = getWorkflowRunStepsByRunId(runId);
+  if (allSteps.length >= MAX_STEPS_PER_RUN) {
+    updateWorkflowRun(runId, {
+      status: "failed",
+      error: `Circuit breaker: run exceeded ${MAX_STEPS_PER_RUN} total steps (WORKFLOW_MAX_STEPS_PER_RUN)`,
+      finishedAt: new Date().toISOString(),
+    });
+    return;
+  }
+
+  // Also reconstruct active edges from "waiting" steps. A waiting step
+  // means the node was reached (its predecessor completed and routed to it),
+  // so its structural outgoing edges are active paths that convergence
+  // nodes must wait for. Without this, fan-out convergence gates fire
+  // prematurely — e.g. if 1-of-3 parallel tasks completes, the merge node
+  // would see only 1 active predecessor and trigger immediately.
+  for (const step of allSteps) {
+    if (step.status !== "waiting") continue;
+    const successors = getSuccessors(def, step.nodeId);
+    for (const succ of successors) {
+      activeEdges.add(`${step.nodeId}→${succ.id}`);
+    }
+  }
+
+  // Seed with start nodes whose predecessors are all completed (convergence gate).
+  // For entry nodes (no predecessors), skip if already completed — these are
+  // re-walk/recovery scenarios where memoization should apply.
+  // For non-entry nodes, allow re-execution even if completed — these are loop
+  // targets from port-based routing that need new iterations.
   let pendingNodes = startNodes.filter((n) => {
-    if (completedNodeIds.has(n.id)) return false;
     const preds = getAllPredecessors(def, n.id);
-    if (preds.length === 0) return true; // Entry node — always ready
-    // Check all predecessors with active edges are completed
+    if (preds.length === 0) {
+      // True entry node — skip if already completed (memoization on re-walk)
+      return !completedNodeIds.has(n.id);
+    }
+    // Non-entry node — allow through even if completed (loop target).
+    // Check predecessors are ready.
     const activePreds = preds.filter((predId) => activeEdges.has(`${predId}→${n.id}`));
     // If no active edges yet (first walk), check ALL structural predecessors
     const predsToCheck = activePreds.length > 0 ? activePreds : preds;
     return predsToCheck.every((p) => completedNodeIds.has(p));
   });
+
+  // Track nodes executed in THIS walk to prevent re-execution within the same
+  // walkGraph call, while still allowing loop targets from prior walks.
+  const executedInThisWalk = new Set<string>();
 
   while (pendingNodes.length > 0) {
     nodeExecutionCount += pendingNodes.length;
@@ -204,13 +244,16 @@ export async function walkGraph(
     // Collect successors and check for errors/pauses
     const nextBatch = new Map<string, WorkflowNode>();
     let hasWaiting = false;
-    let hasFailed = false;
 
     for (let i = 0; i < results.length; i++) {
       const result = results[i]!;
       if (result.outcome === "failed") {
-        hasFailed = true;
-        break;
+        // Check if the run was already marked failed in DB (e.g., executor error).
+        // If so, stop immediately. If not (mustPass validation), skip this
+        // node's successors but continue processing other branches.
+        const currentRun = getWorkflowRun(runId);
+        if (currentRun?.status === "failed") return;
+        continue;
       }
       if (result.outcome === "waiting") {
         hasWaiting = true;
@@ -219,6 +262,7 @@ export async function walkGraph(
       // Mark this node as completed
       const sourceNodeId = pendingNodes[i]!.id;
       completedNodeIds.add(sourceNodeId);
+      executedInThisWalk.add(sourceNodeId);
       // Record active edges and queue successors
       for (const succ of result.successors) {
         activeEdges.add(`${sourceNodeId}→${succ.id}`);
@@ -226,15 +270,17 @@ export async function walkGraph(
       }
     }
 
-    if (hasFailed) return; // Run already marked failed in executeStep
     if (hasWaiting) return; // Run paused, will be resumed by event
 
     // Convergence check — only wait for predecessors with active edges to
     // this node, not all structural predecessors. This prevents deadlocks
     // when conditional branches skip nodes.
+    // Use executedInThisWalk (not completedNodeIds) to gate dedup — this
+    // allows loop targets from prior walks to re-execute while preventing
+    // double execution within the same walk.
     const readyNext: WorkflowNode[] = [];
     for (const [nodeId, node] of nextBatch) {
-      if (completedNodeIds.has(nodeId)) continue; // Already done
+      if (executedInThisWalk.has(nodeId)) continue; // Already done in this walk
 
       const allPreds = getAllPredecessors(def, nodeId);
       const activePreds = allPreds.filter((predId) => activeEdges.has(`${predId}→${nodeId}`));
@@ -249,19 +295,55 @@ export async function walkGraph(
   }
 
   // No more nodes to execute — check if the run should be completed.
-  // If any step has a pending retry (failed with nextRetryAt), the run
-  // should stay in "running" state for the retry poller to pick up.
+  // Stay in current state if any steps are still waiting (async tasks
+  // pending) or have pending retries.
   const run = getWorkflowRun(runId);
   if (run && run.status === "running") {
-    const allSteps = getWorkflowRunStepsByRunId(runId);
-    const hasPendingRetries = allSteps.some((s) => s.status === "failed" && s.nextRetryAt != null);
+    const finalSteps = getWorkflowRunStepsByRunId(runId);
+    const hasWaitingSteps = finalSteps.some((s) => s.status === "waiting");
+    const hasPendingRetries = finalSteps.some(
+      (s) => s.status === "failed" && s.nextRetryAt != null,
+    );
+    const failedSteps = finalSteps.filter((s) => s.status === "failed" && s.nextRetryAt == null);
+    // Exclude entry/trigger nodes when checking for completed steps — a trigger
+    // completing doesn't mean a meaningful branch succeeded. Without this filter,
+    // a linear workflow (trigger → mustPass validator → action) would be marked
+    // as partial-failure instead of failed when the validator fails.
+    const entryNodeIds = new Set(findEntryNodes(def).map((n) => n.id));
+    const hasCompletedSteps = finalSteps.some(
+      (s) => s.status === "completed" && !entryNodeIds.has(s.nodeId),
+    );
 
-    if (!hasPendingRetries) {
-      updateWorkflowRun(runId, {
-        status: "completed",
-        context: ctx,
-        finishedAt: new Date().toISOString(),
-      });
+    if (hasWaitingSteps) {
+      // Async tasks still in progress — set back to waiting for next event
+      updateWorkflowRun(runId, { status: "waiting" });
+    } else if (!hasPendingRetries) {
+      if (failedSteps.length > 0 && !hasCompletedSteps) {
+        // All branches failed — mark run as failed
+        const failedNodeIds = failedSteps.map((s) => s.nodeId).join(", ");
+        updateWorkflowRun(runId, {
+          status: "failed",
+          error: `All branches failed. Failed nodes: ${failedNodeIds}`,
+          context: ctx,
+          finishedAt: new Date().toISOString(),
+        });
+      } else if (failedSteps.length > 0) {
+        // Partial failure — some branches succeeded, some failed.
+        // Mark as completed with error noting partial failure.
+        const failedNodeIds = failedSteps.map((s) => s.nodeId).join(", ");
+        updateWorkflowRun(runId, {
+          status: "completed",
+          error: `Partial failure: nodes [${failedNodeIds}] failed (mustPass validation), but other branches completed successfully`,
+          context: ctx,
+          finishedAt: new Date().toISOString(),
+        });
+      } else {
+        updateWorkflowRun(runId, {
+          status: "completed",
+          context: ctx,
+          finishedAt: new Date().toISOString(),
+        });
+      }
     }
   }
 }
@@ -301,9 +383,12 @@ async function executeStep(
   registry: ExecutorRegistry,
   workflowId?: string,
 ): Promise<StepResult> {
-  const idempotencyKey = `${runId}:${node.id}`;
+  // Use iteration-aware idempotency key to support loops.
+  // Count existing steps for this node to determine the current iteration.
+  const iteration = getStepCountForNode(runId, node.id);
+  const idempotencyKey = `${runId}:${node.id}:${iteration}`;
 
-  // 1. Memoization / deduplication check
+  // 1. Memoization / deduplication check (within same iteration)
   const existingStep = getStepByIdempotencyKey(idempotencyKey);
   if (existingStep) {
     if (existingStep.status === "completed") {
@@ -401,7 +486,8 @@ async function executeStep(
     dryRun: false,
   };
 
-  const timeoutMs = DEFAULT_TIMEOUT_MS;
+  const timeoutMs =
+    typeof node.config?.timeoutMs === "number" ? node.config.timeoutMs : DEFAULT_TIMEOUT_MS;
 
   let result: Awaited<ReturnType<typeof executor.run>>;
   try {
@@ -472,13 +558,14 @@ async function executeStep(
   }
 
   // 7. Run validation if configured
+  let validationResult: ValidationRunResult | undefined;
   if (node.validation) {
-    const validationResult = await runStepValidation(registry, node, result.output, ctx, meta);
+    validationResult = await runStepValidation(registry, node, result.output, ctx, meta);
 
     if (validationResult.outcome === "halt") {
       const errorMsg = "Validation failed (mustPass)";
-      checkpointStepFailure(runId, stepId, errorMsg, 0);
-      throw new Error(errorMsg);
+      checkpointStepFailure(runId, stepId, errorMsg, 0, undefined, { markRunFailed: false });
+      return { outcome: "failed", successors: [] };
     }
 
     if (validationResult.outcome === "retry") {
@@ -501,10 +588,23 @@ async function executeStep(
     }
   }
 
-  // 8. Checkpoint success
+  // 8. Set nextPort from validation result for record-based routing
+  // When validation determines pass/fail and the node uses port-based `next`,
+  // route to the correct port instead of activating all ports.
+  if (
+    validationResult?.passed !== undefined &&
+    !result.nextPort &&
+    node.next &&
+    typeof node.next === "object" &&
+    !Array.isArray(node.next)
+  ) {
+    result.nextPort = validationResult.passed ? "pass" : "fail";
+  }
+
+  // 9. Checkpoint success
   checkpointStep(runId, stepId, node.id, result, ctx);
 
-  // 9. Determine successors based on nextPort
+  // 10. Determine successors based on nextPort
   // If executor returned a specific port, use it. Otherwise, get all successors
   // (fan-out behavior for non-branching nodes with record-based `next`).
   const successors = result.nextPort
@@ -548,8 +648,10 @@ export function findReadyNodes(
   }
 
   // A node is ready if:
-  // 1. It hasn't been completed yet
+  // 1. It hasn't been completed yet (for non-loop discovery)
   // 2. All its relevant predecessors are completed
+  // Note: Loop targets bypass findReadyNodes — they are passed directly
+  // as startNodes to walkGraph via port-based routing.
   return def.nodes.filter((node) => {
     if (completedNodeIds.has(node.id)) return false;
     const preds = predecessors.get(node.id);

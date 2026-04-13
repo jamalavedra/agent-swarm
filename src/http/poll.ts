@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { ensure } from "@desplega.ai/business-use";
 import { z } from "zod";
 import {
   claimMentions,
@@ -7,17 +8,17 @@ import {
   getAgentById,
   getAllChannelActivityCursors,
   getDb,
-  getEpicsWithProgressUpdates,
   getInboxSummary,
   getOfferedTasksForAgent,
   getPendingTaskForAgent,
   getUnassignedTaskIds,
+  getUserById,
   hasCapacity,
-  markEpicsProgressNotified,
   startTask,
   upsertChannelActivityCursor,
 } from "../be/db";
 import { fetchChannelActivity } from "../slack/channel-activity";
+import { telemetry } from "../telemetry";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
@@ -27,7 +28,7 @@ const pollTriggers = route({
   method: "get",
   path: "/api/poll",
   pattern: ["api", "poll"],
-  summary: "Poll for triggers (tasks, mentions, epic updates)",
+  summary: "Poll for triggers (tasks, mentions)",
   tags: ["Poll"],
   auth: { apiKey: true, agentId: true },
   responses: {
@@ -128,11 +129,42 @@ export async function handlePoll(
           if (pendingTask) {
             // Mark task as in_progress immediately to prevent duplicate polling
             startTask(pendingTask.id);
+
+            ensure({
+              id: "started",
+              flow: "task",
+              runId: pendingTask.id,
+              depIds: ["created"],
+              data: {
+                taskId: pendingTask.id,
+                agentId: myAgentId,
+                previousStatus: pendingTask.status,
+              },
+              validator: (data) => data.previousStatus === "pending",
+              // biome-ignore lint/correctness/noEmptyPattern: data unused, ctx needed
+              filter: ({}, ctx) => ctx.deps.length > 0,
+              conditions: [{ timeout_ms: 300_000 }], // 5 min: polling interval + queue wait
+            });
+
+            telemetry.taskEvent("started", {
+              taskId: pendingTask.id,
+              source: pendingTask.source,
+              agentId: myAgentId,
+            });
+
+            // Resolve requesting user if available
+            const requestedByUser = pendingTask.requestedByUserId
+              ? getUserById(pendingTask.requestedByUserId)
+              : undefined;
+
             return {
               trigger: {
                 type: "task_assigned",
                 taskId: pendingTask.id,
                 task: { ...pendingTask, status: "in_progress" },
+                ...(requestedByUser && {
+                  requestedBy: { name: requestedByUser.name, email: requestedByUser.email },
+                }),
               },
             };
           }
@@ -156,29 +188,11 @@ export async function handlePoll(
 
         if (agent.isLead) {
           // === LEAD-SPECIFIC TRIGGERS ===
-
           // NOTE: tasks_finished trigger has been replaced by follow-up task creation
           // in store-progress. When a worker completes/fails a task, a follow-up task
           // is created and assigned to the lead, which is picked up via the normal
           // task_assigned trigger above. This is more reliable and visible than the
           // old poll-based notification approach.
-
-          // Check for epic progress updates (tasks completed/failed for active epics)
-          // This trigger helps lead plan next steps for epics - similar to ralph loop
-          const epicsWithUpdates = getEpicsWithProgressUpdates();
-          if (epicsWithUpdates.length > 0) {
-            // Atomically mark as notified within this transaction
-            const epicIds = epicsWithUpdates.map((e) => e.epic.id);
-            markEpicsProgressNotified(epicIds);
-
-            return {
-              trigger: {
-                type: "epic_progress_changed",
-                count: epicsWithUpdates.length,
-                epics: epicsWithUpdates,
-              },
-            };
-          }
         } else {
           // === WORKER-SPECIFIC TRIGGERS ===
 
@@ -192,6 +206,11 @@ export async function handlePoll(
             for (const candidateId of unassignedIds) {
               const claimed = claimTask(candidateId, myAgentId);
               if (claimed) {
+                telemetry.taskEvent("claimed", {
+                  taskId: claimed.id,
+                  source: claimed.source,
+                  agentId: myAgentId,
+                });
                 return {
                   trigger: {
                     type: "task_assigned",

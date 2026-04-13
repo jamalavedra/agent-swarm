@@ -2,6 +2,8 @@
   "title": "Guides",
   "pages": [
     "deployment",
+    "harness-configuration",
+    "provider-auth",
     "slack-integration",
     "github-integration",
     "gitlab-integration",

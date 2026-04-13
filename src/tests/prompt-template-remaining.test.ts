@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { closeDb, initDb } from "../be/db";
-import { getAllTemplateDefinitions, getTemplateDefinition } from "../prompts/registry";
+import { getAllTemplateDefinitions } from "../prompts/registry";
 import { resolveTemplate } from "../prompts/resolver";
 
 // Side-effect imports: register all templates from each source
@@ -21,10 +21,10 @@ const TEST_DB_PATH = "./test-prompt-remaining.sqlite";
  * Needed because other test files may call clearTemplateDefinitions() in parallel.
  */
 async function ensureTemplatesRegistered(): Promise<void> {
-  // Check if templates are still registered (another test may have cleared them)
-  if (getTemplateDefinition("gitlab.merge_request.opened")) return;
-
-  // Force re-evaluation by importing with cache-busting query param
+  // Always re-import all template modules unconditionally.
+  // Other test files (prompt-template-resolver, prompt-template-session) call
+  // clearTemplateDefinitions() in beforeEach/beforeAll, and since Bun shares
+  // module state across parallel test files, a single-template check is racy.
   const ts = Date.now();
   await import(`../gitlab/templates?t=${ts}`);
   await import(`../agentmail/templates?t=${ts}`);
@@ -99,7 +99,7 @@ describe("template registration — all sources", () => {
   test("Heartbeat template is registered (1 event)", () => {
     const all = getAllTemplateDefinitions();
     const eventTypes = all.map((d) => d.eventType);
-    expect(eventTypes).toContain("heartbeat.escalation.stalled");
+    expect(eventTypes).toContain("heartbeat.checklist");
   });
 
   test("Task lifecycle templates are registered (2 task_lifecycle)", () => {
@@ -109,14 +109,13 @@ describe("template registration — all sources", () => {
     expect(eventTypes).toContain("task.worker.failed");
   });
 
-  test("Runner trigger templates are registered (8 task_lifecycle)", () => {
+  test("Runner trigger templates are registered (7 task_lifecycle)", () => {
     const all = getAllTemplateDefinitions();
     const eventTypes = all.map((d) => d.eventType);
     expect(eventTypes).toContain("task.trigger.assigned");
     expect(eventTypes).toContain("task.trigger.offered");
     expect(eventTypes).toContain("task.trigger.unread_mentions");
     expect(eventTypes).toContain("task.trigger.pool_available");
-    expect(eventTypes).toContain("task.trigger.epic_progress");
     expect(eventTypes).toContain("task.trigger.channel_activity");
     expect(eventTypes).toContain("task.resumption.with_progress");
     expect(eventTypes).toContain("task.resumption.no_progress");

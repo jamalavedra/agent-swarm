@@ -102,6 +102,7 @@ export const AgentTaskSchema = z.object({
   slackChannelId: z.string().optional(),
   slackThreadTs: z.string().optional(),
   slackUserId: z.string().optional(),
+  slackReplySent: z.boolean().default(false),
 
   // VCS metadata (GitHub / GitLab — provider-agnostic)
   vcsProvider: z.enum(["github", "gitlab"]).optional(),
@@ -111,6 +112,8 @@ export const AgentTaskSchema = z.object({
   vcsCommentId: z.number().int().optional(),
   vcsAuthor: z.string().optional(),
   vcsUrl: z.string().optional(),
+  vcsInstallationId: z.number().int().optional(),
+  vcsNodeId: z.string().optional(),
 
   // AgentMail-specific metadata (optional)
   agentmailInboxId: z.string().optional(),
@@ -120,9 +123,6 @@ export const AgentTaskSchema = z.object({
   // Mention-to-task metadata (optional)
   mentionMessageId: z.uuid().optional(),
   mentionChannelId: z.uuid().optional(),
-
-  // Epic association (optional)
-  epicId: z.uuid().optional(),
 
   // Working directory (optional — must be an absolute path for the agent process)
   dir: z.string().min(1).startsWith("/").optional(),
@@ -143,7 +143,46 @@ export const AgentTaskSchema = z.object({
 
   // Structured output schema (optional — JSON Schema that task output must conform to)
   outputSchema: z.record(z.string(), z.unknown()).optional(),
+
+  // Pause tracking
+  wasPaused: z.boolean().default(false),
+
+  // Context usage aggregates
+  compactionCount: z.number().int().min(0).optional(),
+  peakContextPercent: z.number().min(0).max(100).optional(),
+  totalContextTokensUsed: z.number().int().min(0).optional(),
+  contextWindowSize: z.number().int().min(0).optional(),
+
+  // Credential tracking
+  credentialKeySuffix: z.string().optional(),
+  credentialKeyType: z.string().optional(),
+
+  // User identity — canonical user who requested this task
+  requestedByUserId: z.string().optional(),
 });
+
+// ============================================================================
+// User Identity Types
+// ============================================================================
+
+export const UserSchema = z.object({
+  id: z.string(),
+  name: z.string().min(1),
+  email: z.string().optional(),
+  role: z.string().optional(),
+  notes: z.string().optional(),
+  slackUserId: z.string().optional(),
+  linearUserId: z.string().optional(),
+  githubUsername: z.string().optional(),
+  gitlabUsername: z.string().optional(),
+  emailAliases: z.array(z.string()).default([]),
+  preferredChannel: z.string().default("slack"),
+  timezone: z.string().optional(),
+  createdAt: z.iso.datetime(),
+  lastUpdatedAt: z.iso.datetime(),
+});
+
+export type User = z.infer<typeof UserSchema>;
 
 export const AgentStatusSchema = z.enum(["idle", "busy", "offline"]);
 
@@ -169,9 +208,11 @@ export const AgentSchema = z.object({
   setupScript: z.string().max(65536).optional(),
   // Tools/environment reference: Operational knowledge (synced to /workspace/TOOLS.md)
   toolsMd: z.string().max(65536).optional(),
+  // Heartbeat checklist: Standing orders checked periodically (synced to /workspace/HEARTBEAT.md)
+  heartbeatMd: z.string().max(65536).optional(),
 
   // Concurrency limit (defaults to 1 for backwards compatibility)
-  maxTasks: z.number().int().min(1).max(20).optional(),
+  maxTasks: z.number().int().min(1).max(100).optional(),
 
   // Polling limit tracking (consecutive empty polls)
   emptyPollCount: z.number().int().min(0).optional(),
@@ -212,6 +253,7 @@ export const VersionableFieldSchema = z.enum([
   "toolsMd",
   "claudeMd",
   "setupScript",
+  "heartbeatMd",
 ]);
 
 export const ContextVersionSchema = z.object({
@@ -364,6 +406,76 @@ export const SessionCostSchema = z.object({
 export type SessionCost = z.infer<typeof SessionCostSchema>;
 
 // ============================================================================
+// Events
+// ============================================================================
+
+export const EventCategorySchema = z.enum([
+  "tool",
+  "skill",
+  "session",
+  "api",
+  "task",
+  "workflow",
+  "system",
+]);
+
+export const EventStatusSchema = z.enum(["ok", "error", "timeout", "skipped"]);
+
+export const EventSourceSchema = z.enum(["worker", "api", "hook", "scheduler", "cli"]);
+
+export const EventNameSchema = z.enum([
+  // Tool events
+  "tool.start",
+  "tool.end",
+  // Skill events
+  "skill.invoke",
+  "skill.complete",
+  // Session events
+  "session.start",
+  "session.end",
+  "session.resume",
+  "session.cost",
+  // API events
+  "api.request",
+  "api.error",
+  // Task events
+  "task.poll",
+  "task.assign",
+  "task.timeout",
+  // Workflow events
+  "workflow.step.start",
+  "workflow.step.end",
+  "workflow.run.start",
+  "workflow.run.end",
+  // System events
+  "system.boot",
+  "system.migration",
+  "system.error",
+]);
+
+export const SwarmEventSchema = z.object({
+  id: z.uuid(),
+  category: EventCategorySchema,
+  event: EventNameSchema,
+  status: EventStatusSchema,
+  source: EventSourceSchema,
+  agentId: z.string().optional(),
+  taskId: z.string().optional(),
+  sessionId: z.string().optional(),
+  parentEventId: z.string().optional(),
+  numericValue: z.number().optional(),
+  durationMs: z.number().int().optional(),
+  data: z.record(z.string(), z.unknown()).optional(),
+  createdAt: z.iso.datetime(),
+});
+
+export type EventCategory = z.infer<typeof EventCategorySchema>;
+export type EventStatus = z.infer<typeof EventStatusSchema>;
+export type EventSource = z.infer<typeof EventSourceSchema>;
+export type EventName = z.infer<typeof EventNameSchema>;
+export type SwarmEvent = z.infer<typeof SwarmEventSchema>;
+
+// ============================================================================
 // Scheduled Task Types
 // ============================================================================
 
@@ -405,62 +517,6 @@ export const ScheduledTaskSchema = z
 export type ScheduledTask = z.infer<typeof ScheduledTaskSchema>;
 
 // ============================================================================
-// Epic Types
-// ============================================================================
-
-export const EpicStatusSchema = z.enum([
-  "draft", // Epic is being defined
-  "active", // Epic is in progress
-  "paused", // Epic is temporarily paused
-  "completed", // All tasks completed
-  "cancelled", // Epic was cancelled
-]);
-
-export const EpicSchema = z.object({
-  id: z.uuid(),
-  name: z.string().min(1).max(200),
-  description: z.string().optional(),
-  goal: z.string().min(1),
-  prd: z.string().optional(), // Product Requirements Document
-  plan: z.string().optional(), // Implementation plan
-  status: EpicStatusSchema.default("draft"),
-  priority: z.number().int().min(0).max(100).default(50),
-  tags: z.array(z.string()).default([]),
-  createdByAgentId: z.uuid().optional(),
-  leadAgentId: z.uuid().optional(),
-  channelId: z.uuid().optional(), // Internal messaging channel for this epic
-  researchDocPath: z.string().optional(),
-  planDocPath: z.string().optional(),
-  slackChannelId: z.string().optional(),
-  slackThreadTs: z.string().optional(),
-  vcsProvider: z.enum(["github", "gitlab"]).optional(),
-  vcsRepo: z.string().optional(),
-  vcsMilestone: z.string().optional(),
-  nextSteps: z.string().optional(), // Lead's notes on what to do next for this epic
-  createdAt: z.iso.datetime(),
-  lastUpdatedAt: z.iso.datetime(),
-  startedAt: z.iso.datetime().optional(),
-  completedAt: z.iso.datetime().optional(),
-});
-
-export type EpicStatus = z.infer<typeof EpicStatusSchema>;
-export type Epic = z.infer<typeof EpicSchema>;
-
-// Epic with computed progress
-export const EpicWithProgressSchema = EpicSchema.extend({
-  taskStats: z.object({
-    total: z.number(),
-    completed: z.number(),
-    failed: z.number(),
-    inProgress: z.number(),
-    pending: z.number(),
-  }),
-  progress: z.number().min(0).max(100), // Percentage
-});
-
-export type EpicWithProgress = z.infer<typeof EpicWithProgressSchema>;
-
-// ============================================================================
 // Swarm Config Types (Centralized Environment/Config Management)
 // ============================================================================
 
@@ -486,6 +542,15 @@ export type SwarmConfig = z.infer<typeof SwarmConfigSchema>;
 // Swarm Repos Types (Centralized Repository Management)
 // ============================================================================
 
+export const RepoGuidelinesSchema = z.object({
+  prChecks: z.array(z.string()),
+  mergeChecks: z.array(z.string()),
+  allowMerge: z.boolean().optional().default(false),
+  review: z.array(z.string()),
+});
+
+export type RepoGuidelines = z.infer<typeof RepoGuidelinesSchema>;
+
 export const SwarmRepoSchema = z.object({
   id: z.string().uuid(),
   url: z.string().min(1),
@@ -493,6 +558,7 @@ export const SwarmRepoSchema = z.object({
   clonePath: z.string().min(1),
   defaultBranch: z.string().default("main"),
   autoClone: z.boolean().default(true),
+  guidelines: RepoGuidelinesSchema.nullable().optional(),
   createdAt: z.string(),
   lastUpdatedAt: z.string(),
 });
@@ -526,6 +592,9 @@ export const AgentMemorySchema = z.object({
   tags: z.array(z.string()),
   createdAt: z.string(),
   accessedAt: z.string(),
+  expiresAt: z.string().nullable().optional(),
+  accessCount: z.number().int().min(0).default(0).optional(),
+  embeddingModel: z.string().nullable().optional(),
 });
 
 export type AgentMemoryScope = z.infer<typeof AgentMemoryScopeSchema>;
@@ -667,6 +736,38 @@ export const WorkflowDefinitionSchema = z.object({
 });
 export type WorkflowDefinition = z.infer<typeof WorkflowDefinitionSchema>;
 
+// --- Workflow Patch Schemas ---
+
+/** Partial node update — all fields optional, id is NOT included (comes from path/nodeId) */
+export const WorkflowNodePatchSchema = WorkflowNodeSchema.partial().omit({ id: true });
+export type WorkflowNodePatch = z.infer<typeof WorkflowNodePatchSchema>;
+
+/** Bulk workflow definition patch */
+export const WorkflowDefinitionPatchSchema = z.object({
+  update: z
+    .array(
+      z.object({
+        nodeId: z.string().describe("ID of the node to update"),
+        node: WorkflowNodePatchSchema.describe("Partial node data to merge"),
+      }),
+    )
+    .optional()
+    .describe("Nodes to update (partial merge)"),
+  delete: z.array(z.string()).optional().describe("Node IDs to delete"),
+  create: z.array(WorkflowNodeSchema).optional().describe("New nodes to add"),
+  onNodeFailure: z
+    .enum(["fail", "continue"])
+    .optional()
+    .describe("Update the definition-level onNodeFailure behavior"),
+});
+export type WorkflowDefinitionPatch = z.infer<typeof WorkflowDefinitionPatchSchema>;
+
+/** Result of applying a patch — collects all errors instead of throwing on the first */
+export interface PatchResult {
+  definition: WorkflowDefinition;
+  errors: string[];
+}
+
 // --- Trigger Configuration ---
 
 export const TriggerConfigSchema = z.discriminatedUnion("type", [
@@ -784,6 +885,7 @@ export const WorkflowRunStatusSchema = z.enum([
   "completed",
   "failed",
   "skipped",
+  "cancelled",
 ]);
 export type WorkflowRunStatus = z.infer<typeof WorkflowRunStatusSchema>;
 
@@ -809,6 +911,7 @@ export const WorkflowRunStepStatusSchema = z.enum([
   "completed",
   "failed",
   "skipped",
+  "cancelled",
 ]);
 export type WorkflowRunStepStatus = z.infer<typeof WorkflowRunStepStatusSchema>;
 
@@ -869,3 +972,134 @@ export const PromptTemplateHistorySchema = z.object({
   changeReason: z.string().nullable(),
 });
 export type PromptTemplateHistory = z.infer<typeof PromptTemplateHistorySchema>;
+
+// ============================================================================
+// Skill Types
+// ============================================================================
+
+export const SkillTypeSchema = z.enum(["remote", "personal"]);
+export type SkillType = z.infer<typeof SkillTypeSchema>;
+
+export const SkillScopeSchema = z.enum(["global", "swarm", "agent"]);
+export type SkillScope = z.infer<typeof SkillScopeSchema>;
+
+export const SkillSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  content: z.string(),
+  type: SkillTypeSchema,
+  scope: SkillScopeSchema,
+  ownerAgentId: z.string().nullable(),
+  sourceUrl: z.string().nullable(),
+  sourceRepo: z.string().nullable(),
+  sourcePath: z.string().nullable(),
+  sourceBranch: z.string(),
+  sourceHash: z.string().nullable(),
+  isComplex: z.boolean(),
+  allowedTools: z.string().nullable(),
+  model: z.string().nullable(),
+  effort: z.string().nullable(),
+  context: z.string().nullable(),
+  agent: z.string().nullable(),
+  disableModelInvocation: z.boolean(),
+  userInvocable: z.boolean(),
+  version: z.number(),
+  isEnabled: z.boolean(),
+  createdAt: z.string(),
+  lastUpdatedAt: z.string(),
+  lastFetchedAt: z.string().nullable(),
+});
+export type Skill = z.infer<typeof SkillSchema>;
+
+export const AgentSkillSchema = z.object({
+  id: z.string(),
+  agentId: z.string(),
+  skillId: z.string(),
+  isActive: z.boolean(),
+  installedAt: z.string(),
+});
+export type AgentSkill = z.infer<typeof AgentSkillSchema>;
+
+export const SkillWithInstallInfoSchema = SkillSchema.extend({
+  isActive: z.boolean(),
+  installedAt: z.string(),
+});
+export type SkillWithInstallInfo = z.infer<typeof SkillWithInstallInfoSchema>;
+
+// ── MCP Servers ──────────────────────────────────────────────────────────
+
+export const McpServerTransportSchema = z.enum(["stdio", "http", "sse"]);
+export type McpServerTransport = z.infer<typeof McpServerTransportSchema>;
+
+export const McpServerScopeSchema = z.enum(["global", "swarm", "agent"]);
+export type McpServerScope = z.infer<typeof McpServerScopeSchema>;
+
+export const McpServerSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().nullable(),
+  scope: McpServerScopeSchema,
+  ownerAgentId: z.string().nullable(),
+  transport: McpServerTransportSchema,
+  command: z.string().nullable(),
+  args: z.string().nullable(),
+  url: z.string().nullable(),
+  headers: z.string().nullable(),
+  envConfigKeys: z.string().nullable(),
+  headerConfigKeys: z.string().nullable(),
+  isEnabled: z.boolean(),
+  version: z.number(),
+  createdAt: z.string(),
+  lastUpdatedAt: z.string(),
+});
+export type McpServer = z.infer<typeof McpServerSchema>;
+
+export const AgentMcpServerSchema = z.object({
+  id: z.string(),
+  agentId: z.string(),
+  mcpServerId: z.string(),
+  isActive: z.boolean(),
+  installedAt: z.string(),
+});
+export type AgentMcpServer = z.infer<typeof AgentMcpServerSchema>;
+
+export const McpServerWithInstallInfoSchema = McpServerSchema.extend({
+  isActive: z.boolean(),
+  installedAt: z.string(),
+});
+export type McpServerWithInstallInfo = z.infer<typeof McpServerWithInstallInfoSchema>;
+
+// ============================================================================
+// Context Usage Tracking Types
+// ============================================================================
+
+export const ContextSnapshotEventTypeSchema = z.enum(["progress", "compaction", "completion"]);
+export type ContextSnapshotEventType = z.infer<typeof ContextSnapshotEventTypeSchema>;
+
+export const ContextSnapshotSchema = z.object({
+  id: z.uuid(),
+  taskId: z.uuid(),
+  agentId: z.uuid(),
+  sessionId: z.string(),
+
+  // Context window state
+  contextUsedTokens: z.number().int().min(0).optional(),
+  contextTotalTokens: z.number().int().min(0).optional(),
+  contextPercent: z.number().min(0).max(100).optional(),
+
+  // Event metadata
+  eventType: ContextSnapshotEventTypeSchema,
+
+  // Compaction-specific (null for non-compaction)
+  compactTrigger: z.enum(["auto", "manual"]).optional(),
+  preCompactTokens: z.number().int().min(0).optional(),
+
+  // Cumulative counters at this point
+  cumulativeInputTokens: z.number().int().min(0).default(0),
+  cumulativeOutputTokens: z.number().int().min(0).default(0),
+
+  createdAt: z.iso.datetime(),
+});
+
+export type ContextSnapshot = z.infer<typeof ContextSnapshotSchema>;

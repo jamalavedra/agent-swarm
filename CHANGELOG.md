@@ -4,6 +4,248 @@ All notable changes to Agent Swarm are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+## [1.65.0] - 2026-04-12
+
+### Added
+- Memory TTL support — memories can now have an `expiresAt` field; expired memories are automatically excluded from search results (#327)
+- Memory staleness management with access tracking — `accessCount` field tracks how often a memory is retrieved, enabling recency-aware reranking (#327)
+- `memory-delete` MCP tool for explicit memory removal (#327)
+- Memory provider abstraction layer (`EmbeddingProvider`, `MemoryStore` interfaces) for pluggable storage and embedding backends (#327)
+- Memory reranker combining vector similarity, recency decay, and access frequency into a unified relevance score (#327)
+
+### Changed
+- Memory system refactored from monolithic `db.ts` functions into modular `src/be/memory/` provider architecture with SQLite+sqlite-vec store and OpenAI embedding provider (#327)
+- `memory-search` now uses the reranker pipeline for improved result quality (#327)
+- `inject-learning` and `store-progress` updated to support new memory metadata fields (#327)
+
+## [1.64.1] - 2026-04-11
+
+### Added
+- Anonymized telemetry integration — tracks high-level task lifecycle events (created, started, completed, failed, cancelled), server start, and worker session start/end. Opt-out via `ANONYMIZED_TELEMETRY=false` (#325)
+
+### Fixed
+- Rate limit detection now matches "hit your limit" error messages in addition to existing patterns (#324)
+- Workflow `mustPass` validation failures now cancel only the failed branch's downstream nodes instead of the entire workflow run; parallel/sibling branches continue executing (#322)
+- Published package now includes `tsconfig.json`
+
+## [1.64.0] - 2026-04-10
+
+### Changed
+- Release cut after merging the latest `main`, carrying forward the Codex ChatGPT OAuth support, provider-auth documentation, and telemetry updates already landed on this branch.
+
+## [1.63.1] - 2026-04-10
+
+### Added
+- `agent-swarm codex-login` now supports an interactive ChatGPT OAuth flow for Codex workers: it prompts for the target swarm API URL, uses best-effort masked API key input, stores credentials as the global `codex_oauth` config entry, and documents the laptop-to-Docker-Compose restore flow for deployed swarms.
+
+### Fixed
+- Codex Docker workers now convert stored `codex_oauth` credentials into the real `~/.codex/auth.json` format expected by the Codex CLI, so ChatGPT OAuth works after container boot without `OPENAI_API_KEY`.
+- Codex tasks authenticated through ChatGPT OAuth now stamp `credentialKeyType=CODEX_OAUTH`, so the API Keys dashboard and cost tracking surfaces show OAuth-backed Codex usage alongside other credential types.
+
+## [1.63.0] - 2026-04-09
+
+### Added
+- **Codex provider** — Run agents with OpenAI Codex via `HARNESS_PROVIDER=codex`. Wraps `@openai/codex-sdk` 0.118 to drive the `codex app-server` JSON-RPC protocol. Includes per-session MCP config (Streamable HTTP), slash-command skill inlining, AGENTS.md system-prompt injection, AbortController-based cancellation, tool-loop detection, heartbeat/activity reporting, and a typed model catalogue (gpt-5.4 default). Auth via `OPENAI_API_KEY` or `~/.codex/auth.json` (#100)
+- Docker worker image installs the Codex CLI (`@openai/codex@0.118.0`) alongside Claude and pi-mono and ships a baseline `~/.codex/config.toml`; entrypoint validates codex auth, bootstraps `~/.codex/auth.json` from `OPENAI_API_KEY` via `codex login --with-api-key` at boot (idempotent), and mirrors slash-command skills into `~/.codex/skills/<name>/SKILL.md` (#100)
+- Per-model pricing table for Codex models in `src/providers/codex-models.ts` (gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.2-codex) sourced from developers.openai.com/api/docs/pricing — codex tasks now record real `totalCostUsd` in `session_costs` and contribute to dashboard cost summaries (#100)
+- `name` and `provider` columns on the `api_key_status` table — pooled credentials now carry an auto-derived harness provider (claude/pi/codex) and an optional human-friendly label settable from the dashboard. New `PATCH /api/keys/name` endpoint and the API Keys page in the dashboard gains a Name column (click to rename via Dialog) and a Provider dropdown filter (#100)
+- Provider-aware credential pooling — `resolveCredentialPools` accepts a `provider` hint and only pools env vars relevant to the active harness, so a codex worker no longer stamps a stale `CLAUDE_CODE_OAUTH_TOKEN` on its task records (#100)
+- Codex `[context-overflow]` failure rewrite — when a codex turn hits the context window, the failure message is rewritten with a clear prefix and points users at Linear DES-143 for the auto-compaction follow-up. Codex `reasoning`, `todo_list`, and `agent_message` deltas now flow as `custom` ProviderEvents (`codex.reasoning`, `codex.todo_list`, `codex.message_delta`) so future UI surfaces can render them without raw_log scraping (#100)
+- `scripts/e2e-docker-provider.ts` now supports `--provider codex` and `--provider all` (claude+pi+codex) for end-to-end Docker testing (#100)
+- Codex log support in the dashboard's session log viewer — `parseSessionLogs` dispatches on `cli === "codex"` and maps Codex's `item.completed` events (`agent_message`, `mcp_tool_call`, `command_execution`, `reasoning`, `file_change`, `web_search`, `todo_list`) to the same ContentBlock schema used by claude/pi (#100)
+- Slack message deduplication with `slackReplySent` flag — when agents post results via `slack-reply`, the task completion message shows a minimal one-liner instead of duplicating the full output (#314)
+- Tree-based Slack status messages — parent tasks render child task progress in a visual tree with status icons, indentation, and overflow handling (#314)
+- Slack thread buffer (`ADDITIVE_SLACK=true`) — non-mention thread replies are captured, debounced, and batched into a single follow-up task with dependency chaining (#314)
+- `!now` command in Slack threads to flush the additive buffer immediately without dependency chaining (#314)
+- `SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION` env var — when `true`, thread follow-up routing and additive buffering require an explicit @mention (#313)
+- `slackChannelId`, `slackThreadTs`, `slackUserId` parameters on `send-task` MCP tool for explicit Slack context propagation (#314)
+- GitHub eyes reaction (👀) automatically added when agents pick up GitHub-sourced tasks — supports issue comments, PR review comments, PR reviews, and issue/PR bodies (#310)
+- Discoverability Optimizer agent template added to `docker-compose.example.yml` (#311)
+
+### Fixed
+- Codex adapter `peakContextPercent` no longer clamps to 100% on chatty turns — the SDK reports `input_tokens` as per-turn-cumulative across every model invocation (with cached portions counted at every roundtrip), which routinely exceeds the model's context window even when no individual call did. New formula uses `(input - cached + output) / window` as a peak proxy (#100)
+- Codex adapter `contextPercent` is now emitted on the same 0-100 scale as claude/pi (was 0-1 fraction), so the dashboard's `Peak %` cell renders correctly via `.toFixed(0)` (#100)
+- Dashboard `model` badge falls back to `costs[0]?.model` when `task.model` is null — codex tasks created without an explicit model in the POST body now display the actual model used (recorded by the runner in `session_costs`) (#100)
+- DataGrid wrapper auto-detects editable columns and only suppresses cell focus when none are present — read-only tables are unaffected, editable columns can now take focus (#100)
+- Codex SDK binary path resolved via `CODEX_PATH_OVERRIDE` env var (`/usr/bin/codex` in the Docker image) — the bundled SDK can no longer `require.resolve("@openai/codex")` from inside a Bun-compiled executable, so the override sidesteps the failure (#100)
+
+### Changed
+- Slack completion messages now conditionally show minimal or full output based on whether the agent already posted via `slack-reply` (#314)
+- Buffer flush messages show dependency status ("queued pending completion" vs "batched into task") (#314)
+
+## [1.59.3] - 2026-04-08
+
+### Fixed
+- Slack assistant thread: `file_share` messages now correctly route to the lead agent instead of being silently dropped (DES-138, #304)
+- Slack assistant `setStatus`/`setTitle` calls wrapped with error handling to prevent crashes in non-assistant threads
+
+### Changed
+- `registerRegisterAgentMailInboxTool` renamed to `registerRegisterAgentmailInboxTool` for naming consistency
+- Docker Compose example updated: content reviewer worker now uses `pi` harness provider with `moonshotai/kimi-k2.5` model via OpenRouter
+- MCP.md regenerated to reflect tool registration changes
+
+## [1.59.2] - 2026-04-07
+
+### Changed
+- Slack tools (`slack-reply`, `slack-read`) moved from core to deferred — only loaded when task has Slack context (#298)
+- Slack prompt instructions now conditionally injected via `system.agent.worker.slack` template only for Slack-originated tasks (#298)
+- New `system.agent.code_quality` template added to all session composites for repository guidelines enforcement (#298)
+- Repository guidelines (PR checks, merge policy, review guidance) now injected into system prompt from per-repo configuration (#298)
+- `get-repos` and `update-repo` tools added to deferred tools set (#294)
+
+### Fixed
+- Repos edit modal and added repository detail page in dashboard UI (#301)
+- Task table sort state now preserved across data refreshes (#300)
+- Schedule UI showing wrong "Runs At" time for future dates (#299)
+- Slack template variables now use `VariableDefinition` type for proper validation (#298)
+
+## [1.59.0] - 2026-04-04
+
+### Added
+- Unified user identity system — canonical user registry with cross-platform resolution across Slack, GitHub, GitLab, Linear, and email (DES-51, #287)
+- `resolve-user` MCP tool for looking up user profiles by any platform identifier
+- `manage-user` MCP tool for lead-only CRUD operations on user profiles
+- Per-repo guidelines system — configurable PR checks, merge policy, and review guidance per repository (#294)
+- `get-repos` and `update-repo` MCP tools for lead repo management with guidelines
+- Requesting user identity surfaced in task details and agent prompts (#292)
+- User management skill for creating and managing user profiles across platforms
+
+### Changed
+- Slack, GitHub, GitLab, and AgentMail handlers now resolve requesting user identity and attach it to tasks
+- UX principles template generalized — replaced Desplega-specific references with placeholders
+
+### Fixed
+- Heartbeat system: aggressive reboot sweep and boot triage improvements
+- `allowMerge` edge case in repo guidelines and removed type duplication
+- `requestedBy` added to Trigger interface, removing double cast workaround
+
+## [1.57.5] - 2026-04-02
+
+### Added
+- Auto-generated `llms.txt` for AI discoverability on the landing page (#283)
+
+### Changed
+- Runner structured output fallback refactored with discriminated union `FallbackResult` type for clearer error handling
+- Dockerfile worker: updated plugin install commands and bumped `qa-use` to v2.11.0
+
+### Fixed
+- Workflow engine routes to correct port after validation instead of broadcasting to all ports (#280)
+- Workflow script nodes now parse JSON stdout correctly for interpolation (#279)
+- PostToolUse hook now validates minimum content length (100 chars) for SOUL.md/IDENTITY.md sync to prevent accidental profile corruption (#278)
+- Bun test failure and typecheck error in test infrastructure (#281)
+
+## [1.57.0] - 2026-03-31
+
+### Added
+- API key rate limit tracking and automatic rotation — tracks per-key rate limits, extracts reset times from Claude error messages, and rotates to available keys (#274)
+- API Keys dashboard page with summary cards for monitoring rate limit status
+- API key reference documentation and OpenAPI spec updates
+
+### Changed
+- `update-profile` tool now enforces minimum 200 character length for `soulMd` and `identityMd` fields to prevent accidental profile corruption (#272)
+- Rate-limit availability fetch moved into `resolveCredentialPools` helper for cleaner code organization
+
+### Fixed
+- Profile min-length validation added server-side after repeated client-side failures (#272)
+- Rate limit reset time extraction from Claude error messages
+
+## [1.56.5] - 2026-03-30
+
+### Changed
+- GitHub event handling restricted to explicit human actions — PR closed/synchronize, reviews, CI checks are now suppressed by default to prevent cascade auto-merge behavior
+
+## [1.56.3] - 2026-03-30
+
+### Changed
+- GitHub event handling restricted to explicit human actions — PR closed/synchronize, reviews, CI checks are now suppressed by default to prevent cascade auto-merge behavior
+- New `GITHUB_EVENT_LABELS` env var (default: `swarm-review`) — label-based triggers for PR and issue events
+- Heartbeat system rewritten with checklist-based approach and improved stall detection
+- Session templates support added to hook system for dynamic prompt injection
+- `maxTasks` schema limit increased to 100 in `get-swarm` output validation (DES-20)
+
+## [1.55.0] - 2026-03-29
+
+### Added
+- `patch-workflow` MCP tool — partially update workflow definitions by creating, updating, or deleting individual nodes with automatic version snapshots
+- `patch-workflow-node` MCP tool — partially update a single node in a workflow definition with automatic version snapshots
+- `cancel-workflow-run` MCP tool — cancel running or waiting workflow runs, including all non-terminal steps and associated tasks (#265)
+- Per-node `timeoutMs` support in workflow config — set custom timeouts for individual workflow nodes (#261)
+
+### Removed
+- Epics system deprecated — all epic MCP tools removed (`create-epic`, `get-epic-details`, `list-epics`, `update-epic`, `delete-epic`, `assign-task-to-epic`, `unassign-task-from-epic`, `tracker-link-epic`). Use workflows for multi-task orchestration instead
+- `epicId` parameter removed from `send-task` and `store-progress` tools
+
+### Fixed
+- Workflow engine safeguards — cooldown periods, circuit breaker, and rate-limit detection to prevent runaway execution (#264)
+- `validate` executor strict JSON schema disabled for OpenRouter compatibility (#263)
+- `raw-llm` executor strict JSON schema disabled for OpenRouter compatibility (#262)
+
+## [1.54.1] - 2026-03-27
+
+### Added
+- Stalled task auto-remediation and lead startup self-check — lead agent now triggers a heartbeat sweep on startup to detect and recover stalled tasks (DES-19, #256)
+- `jq` added to API server Docker image for script node JSON parsing (#254)
+
+### Fixed
+- HITL loop resume — use successor routing instead of `findReadyNodes` for correct workflow loop re-entry (#257)
+- Workflow engine loop support — iteration-aware idempotency keys allow workflows with cycles to re-execute nodes correctly (#255)
+- HITL port-based routing for workflow resume — use port routing instead of direct node targeting (#253)
+- Task details prompt expansion overflow — prevent large task descriptions from exceeding prompt limits (#258)
+- Create follow-up tasks for already-tracked Linear issues (#252)
+- Preserve context usage value on task completion (#251)
+- Tool call progress normalization — handle case-insensitive tool names from different providers (pi-mono vs Claude)
+- Store-progress dependency tracking for paused/resumed tasks
+
+### Changed
+- Deployment guide rewritten with step-by-step quick start, expanded volume architecture, and adding-workers instructions
+- OpenAPI spec updated with HITL port-routing unit tests
+
+## [1.53.0] - 2026-03-26
+
+### Added
+- MCP server management for agents — 7 new tools (`mcp-server-create`, `mcp-server-get`, `mcp-server-list`, `mcp-server-update`, `mcp-server-install`, `mcp-server-uninstall`, `mcp-server-delete`) with scope cascade (agent → swarm → global) and auto-injection into worker Docker containers (#248)
+- Context usage tracking — monitor context window utilization and compaction events per task with `POST/GET /api/tasks/:id/context` endpoints, context extraction from Claude adapter and pi-mono, and visual indicators in task details (#247)
+- Generic events table for tool/skill/session tracking (#246)
+- Configurable DB seeding script with faker.js for realistic test data (DES-11, #245)
+- Slack notifications dispatched when HITL approval requests are created (#241)
+- Auto VCS PR number tracking for tasks
+- Session log viewer UI redesign with markdown rendering, JSON tree, and visual polish
+- Skill-check step added to `work-on-task` command (#249)
+
+### Fixed
+- `tracker-status` tool crash with undefined `req.requestInfo` (#243)
+- Linear OAuth token auto-refresh (#244)
+- Flaky CI test failures from shared mutable state race conditions
+- Mock `slack/app` in workflow executor tests to prevent CI flake
+- Use `tsc -b` for new-ui typecheck in CI and pre-push hook
+
+### Changed
+- Opus/Sonnet context window updated to 1M tokens
+
+## [1.52.0] - 2026-03-25
+
+### Added
+- Skill system — full lifecycle for reusable procedural knowledge: create, install, publish, search, sync remote skills from GitHub repositories (#229)
+  - Phases 1-6: data layer, API, filesystem bridge, system prompt injection, UI, and OpenAPI spec
+  - 12 new MCP tools: `skill-create`, `skill-get`, `skill-list`, `skill-search`, `skill-install`, `skill-uninstall`, `skill-update`, `skill-publish`, `skill-delete`, `skill-install-remote`, `skill-sync-remote`
+  - Scope resolution: agent → swarm → global
+- Human-in-the-Loop (HITL) workflow executor — pause workflows for human approval or input via the dashboard (#228)
+  - `request-human-input` MCP tool with support for approval, text, single-select, multi-select, and boolean question types
+  - Approval requests UI at `/approval-requests/{id}`
+  - Follow-up task auto-creation when approval requests are resolved (#234)
+- Business-use instrumentation — track core system invariants across API + worker architecture via `@desplega.ai/business-use` (#237)
+  - Task lifecycle, agent registration, and API boot flows
+  - Optional: enters no-op mode when `BUSINESS_USE_API_KEY` is not set
+
+### Fixed
+- Server-side fallback for `sourceTaskId` on HITL approval requests (#238)
+- Walk up directory tree to find `.mcp.json` for `X-Source-Task-Id` injection (#236)
+- Explicit Slack metadata on HITL follow-up tasks (#235)
+- Correct approval request URL path from `/requests/` to `/approval-requests/` (#233)
+- Prevent runner crash when repo clone fails (#232)
+
 ## [1.51.0] - 2026-03-23
 
 ### Added

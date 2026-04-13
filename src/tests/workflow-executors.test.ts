@@ -1,6 +1,12 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { closeDb, initDb } from "../be/db";
+
+// Mock slack/app to avoid dynamic import issues in parallel test execution
+mock.module("../slack/app", () => ({
+  getSlackApp: () => null,
+}));
+
 import type { ExecutorMeta } from "../types";
 import type { ExecutorDependencies, ExecutorInput } from "../workflows/executors/base";
 import { CodeMatchExecutor, CodeMatchOutputSchema } from "../workflows/executors/code-match";
@@ -363,6 +369,7 @@ describe("NotifyExecutor", () => {
     const result = await executor.run(
       input({ channel: "slack", target: "#general", template: "hi" }, {}),
     );
+    expect(result.status).toBe("success");
     const out = result.output as { sent: boolean };
     expect(out.sent).toBe(false);
   });
@@ -690,7 +697,7 @@ describe("ValidateExecutor", () => {
 // ─── Registry Wiring ─────────────────────────────────────────
 
 describe("createExecutorRegistry", () => {
-  test("registers all 8 executors (7 instant + 1 async)", () => {
+  test("registers all 9 executors (7 instant + 2 async)", () => {
     const registry = createExecutorRegistry(mockDeps);
     const types = registry.types();
 
@@ -702,7 +709,8 @@ describe("createExecutorRegistry", () => {
     expect(types).toContain("vcs");
     expect(types).toContain("validate");
     expect(types).toContain("agent-task");
-    expect(types).toHaveLength(8);
+    expect(types).toContain("human-in-the-loop");
+    expect(types).toHaveLength(9);
   });
 
   test("instant executors have mode instant, async executors have mode async", () => {
@@ -720,6 +728,7 @@ describe("createExecutorRegistry", () => {
       expect(registry.get(type).mode).toBe("instant");
     }
     expect(registry.get("agent-task").mode).toBe("async");
+    expect(registry.get("human-in-the-loop").mode).toBe("async");
   });
 
   test("get() retrieves the correct executor by type", () => {
