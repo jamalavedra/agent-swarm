@@ -4,10 +4,24 @@ import { ArrowRight, Calendar, Clock } from "lucide-react";
 
 export const metadata: Metadata = {
   title: "Blog — Agent Swarm",
-  description: "Updates, technical deep dives, and stories from the Agent Swarm team.",
+  description:
+    "Technical deep dives on multi-agent AI systems: DAG workflow engines, persistent agent identity, task state machines, and autonomous coding agent architecture.",
+  keywords: [
+    "agent swarm blog",
+    "multi-agent AI",
+    "autonomous coding agents",
+    "DAG workflow engine",
+    "AI agent identity",
+    "SOUL.md",
+    "task state machine",
+    "AI orchestration",
+    "Claude Code",
+    "AI coding agents",
+  ],
   openGraph: {
     title: "Blog — Agent Swarm",
-    description: "Updates, technical deep dives, and stories from the Agent Swarm team.",
+    description:
+      "Technical deep dives on multi-agent AI systems: DAG workflow engines, persistent agent identity, task state machines, and autonomous coding agent architecture.",
     url: "https://agent-swarm.dev/blog",
     siteName: "Agent Swarm",
     type: "website",
@@ -23,7 +37,8 @@ export const metadata: Metadata = {
   twitter: {
     card: "summary_large_image",
     title: "Blog — Agent Swarm",
-    description: "Updates, technical deep dives, and stories from the Agent Swarm team.",
+    description:
+      "Technical deep dives on multi-agent AI systems: DAG workflow engines, persistent agent identity, task state machines, and autonomous coding agent architecture.",
     images: ["https://agent-swarm.dev/og-image.png"],
   },
   alternates: {
@@ -41,6 +56,16 @@ interface BlogPost {
 }
 
 const posts: BlogPost[] = [
+  {
+    slug: "deep-dive-context-compaction-design",
+    title:
+      "Stop Fighting Context Window Limits — Design for Compaction Instead",
+    description:
+      "Why chasing infinite context windows is wrong. Our agents perform better with intentional compaction. Here's the architecture that makes it work.",
+    date: "January 21, 2025",
+    readTime: "12 min read",
+    tags: ["context compaction", "context windows", "agent architecture", "PreCompact hook"],
+  },
   {
     slug: "deep-dive-dag-workflow-engine-pause-resume",
     title:
