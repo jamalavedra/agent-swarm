@@ -6,6 +6,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Composite index on `agent_tasks(slackChannelId, slackThreadTs, status)` (migration 040) to speed up Slack thread lookups used by the follow-up re-delegation guard (#345)
+- Hero wireframe video back in `README.md` plus reproducible Remotion source in `assets/video-source/` (two compositions: daily-evolution and slack-to-pr) (#350)
+
+### Changed
+- Removed hardcoded seed users from migration 031; added `scripts/backfill-seed-users.sql` for manual re-seeding (#343)
+- Lead agent session template now references `manage-user` tool for registering unknown users from Slack (#343)
+- Lead session prompt and `task.worker.completed` / `task.worker.failed` templates updated to explicitly forbid re-delegating follow-up results back to a worker (#345)
+
+### Fixed
+- Duplicate Slack responses caused by the lead re-delegating follow-up tasks: `send-task` now blocks re-delegation when the thread already has a completed task within the last 48 hours, and the follow-up template discourages it at the prompt layer (#345)
+
+## [1.67.2] - 2026-04-17
+
+### Added
+- `sqlite-vec` native extension bundled in Docker server image for vector similarity search; new `SQLITE_VEC_EXTENSION_PATH` env var points at the extension inside the container
+
+### Changed
+- Bumped bundled Claude Code CLI version in `Dockerfile.worker` from 2.1.109 to 2.1.112
+
+## [1.67.1] - 2026-04-15
+
+### Fixed
+- `SECRETS_ENCRYPTION_KEY` / `SECRETS_ENCRYPTION_KEY_FILE` / on-disk `.encryption-key` now also accept a 64-character hex-encoded 32-byte key (e.g. `openssl rand -hex 32`) in addition to the existing base64 format. Existing base64 keys keep working unchanged.
+- Invalid-key errors now include the exact generation commands (`openssl rand -base64 32` or `openssl rand -hex 32`) and call out the common `openssl rand -base64 39` mistake, instead of just reporting the byte count.
+
+### Docs
+- New **Encryption Key** section in the Docker Compose deployment guide covering resolution order, generation, backup, common mistakes, and first-time migration from plaintext
+- `SECRETS_ENCRYPTION_KEY` and `SECRETS_ENCRYPTION_KEY_FILE` added to the Environment Variables reference
+
+## [1.67.0] - 2026-04-14
+
+### Added
+- Encrypted-at-rest storage for `swarm_config` `isSecret=1` rows using AES-256-GCM
+- New `SECRETS_ENCRYPTION_KEY` / `SECRETS_ENCRYPTION_KEY_FILE` env vars for providing the master key (otherwise auto-generated at `<data-dir>/.encryption-key` only when the DB does not yet contain encrypted secret rows — e.g. a fresh DB or first upgrade from plaintext-only secrets)
+- Auto-migration of legacy plaintext secrets to ciphertext on first boot after upgrade
+
+### Security
+- `swarm_config` API now rejects reserved keys `API_KEY` and `SECRETS_ENCRYPTION_KEY` (case-insensitive) at the HTTP, MCP, and DB layers — these remain environment-only and can no longer be stored in the SQLite config store
+- Secrets are no longer stored as plaintext in `agent-swarm-db.sqlite`; on-disk rows carry only base64-encoded AES-256-GCM payloads of `iv || ciphertext || authTag`
+
+### Operator notes
+- Upgrade is transparent as long as the same encryption key remains available across restarts; legacy plaintext secrets are auto-migrated on first boot after upgrade
+- Existing databases that already contain encrypted secret rows now fail closed if the encryption key is missing, instead of silently auto-generating a different key
+- **First-time migration safety:** If upgrading from plaintext without `SECRETS_ENCRYPTION_KEY` set, a one-time plaintext backup is created at `<db-path>.backup.secrets-YYYY-MM-DD.env` before encryption. **Delete this file after verifying your encryption key is backed up.**
+- **Back up and preserve the actual encryption key material alongside your SQLite DB** — whether it comes from `SECRETS_ENCRYPTION_KEY`, `SECRETS_ENCRYPTION_KEY_FILE`, or an auto-generated `.encryption-key`. Losing that key means losing all encrypted secrets with no recovery path
+- Do not switch between env/file/auto-generated key sources unless the underlying base64 key value is identical
+- Key rotation is not yet supported (follow-up release)
+
 ## [1.66.0] - 2026-04-13
 
 ### Added

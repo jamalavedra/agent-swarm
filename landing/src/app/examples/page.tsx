@@ -15,7 +15,7 @@ export const metadata: Metadata = {
     type: "website",
     images: [
       {
-        url: "https://agent-swarm.dev/og-image.png",
+        url: "https://agent-swarm.dev/api/og?title=Examples+%E2%80%94+Real+Agent+Swarm+Sessions&subtitle=Real+session+transcripts+showing+autonomous+AI+agent+coordination+in+action",
         width: 1200,
         height: 630,
         alt: "Examples — Real Agent Swarm Sessions",
@@ -26,8 +26,20 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Examples — Real Agent Swarm Sessions",
     description: "Real session transcripts showing autonomous AI agent coordination in action.",
-    images: ["https://agent-swarm.dev/og-image.png"],
+    images: [
+      "https://agent-swarm.dev/api/og?title=Examples+%E2%80%94+Real+Agent+Swarm+Sessions&subtitle=Real+session+transcripts+showing+autonomous+AI+agent+coordination+in+action",
+    ],
   },
+  keywords: [
+    "AI agent examples",
+    "agent swarm demos",
+    "autonomous agent use cases",
+    "multi-agent AI examples",
+    "Claude Code automation examples",
+    "AI agent session transcripts",
+    "agent swarm showcase",
+    "AI coding agent demos",
+  ],
   alternates: {
     canonical: "/examples",
   },
