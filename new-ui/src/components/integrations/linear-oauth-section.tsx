@@ -89,8 +89,10 @@ export function LinearOAuthSection() {
         <Alert>
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>
-            Failed to load Linear connection status:{" "}
-            {error instanceof Error ? error.message : "unknown error"}.
+            <p>
+              Failed to load Linear connection status:{" "}
+              {error instanceof Error ? error.message : "unknown error"}.
+            </p>
           </AlertDescription>
         </Alert>
       </section>
@@ -108,10 +110,12 @@ export function LinearOAuthSection() {
         <Alert>
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>
-            Linear integration isn't enabled on this server yet. Fill in{" "}
-            <CodeChip>LINEAR_CLIENT_ID</CodeChip>, <CodeChip>LINEAR_CLIENT_SECRET</CodeChip>, and{" "}
-            <CodeChip>LINEAR_SIGNING_SECRET</CodeChip> below, save, and restart the API to enable
-            OAuth.
+            <p>
+              Linear integration isn't enabled on this server yet. Fill in{" "}
+              <CodeChip>LINEAR_CLIENT_ID</CodeChip>, <CodeChip>LINEAR_CLIENT_SECRET</CodeChip>, and{" "}
+              <CodeChip>LINEAR_SIGNING_SECRET</CodeChip> below, save, and restart the API to enable
+              OAuth.
+            </p>
           </AlertDescription>
         </Alert>
       </section>

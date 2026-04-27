@@ -87,8 +87,10 @@ export function JiraOAuthSection() {
         <Alert>
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>
-            Failed to load Jira connection status:{" "}
-            {error instanceof Error ? error.message : "unknown error"}.
+            <p>
+              Failed to load Jira connection status:{" "}
+              {error instanceof Error ? error.message : "unknown error"}.
+            </p>
           </AlertDescription>
         </Alert>
       </section>
@@ -106,10 +108,12 @@ export function JiraOAuthSection() {
         <Alert>
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>
-            Jira integration isn't enabled on this server yet. Fill in{" "}
-            <CodeChip>JIRA_CLIENT_ID</CodeChip>, <CodeChip>JIRA_CLIENT_SECRET</CodeChip>, and{" "}
-            <CodeChip>JIRA_WEBHOOK_TOKEN</CodeChip> below, save, and restart the API to enable
-            OAuth.
+            <p>
+              Jira integration isn't enabled on this server yet. Fill in{" "}
+              <CodeChip>JIRA_CLIENT_ID</CodeChip>, <CodeChip>JIRA_CLIENT_SECRET</CodeChip>, and{" "}
+              <CodeChip>JIRA_WEBHOOK_TOKEN</CodeChip> below, save, and restart the API to enable
+              OAuth.
+            </p>
           </AlertDescription>
         </Alert>
       </section>
