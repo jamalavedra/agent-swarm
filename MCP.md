@@ -32,6 +32,7 @@
   - [slack-reply](#slack-reply)
   - [slack-read](#slack-read)
   - [slack-post](#slack-post)
+  - [slack-start-thread](#slack-start-thread)
   - [slack-list-channels](#slack-list-channels)
   - [slack-upload-file](#slack-upload-file)
   - [slack-download-file](#slack-download-file)
@@ -369,9 +370,20 @@ Read messages from a Slack thread or channel. Use inboxMessageId or taskId to re
 
 ### slack-post
 
-**Post new message to Slack channel**
+**Post message to Slack channel**
 
-Post a new message to a Slack channel. This creates a new message (not a thread reply). Requires lead privileges.
+Post a message to a Slack channel. By default creates a new top-level message; pass `threadTs` to post as a threaded reply under an existing message (obtain the ts from `slack-start-thread`). Requires lead privileges.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `channelId` | `string` | Yes | - | The Slack channel ID to post to. |
+| `message` | `string` | Yes | - | The message content to post. |
+
+### slack-start-thread
+
+**Start a new Slack thread**
+
+Post a new top-level message to a Slack channel and return its ts so the caller can thread replies under it. Pass the returned `ts` as `threadTs` on subsequent `slack-post` calls to keep replies in the same thread. Requires lead privileges.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -927,7 +939,7 @@ Map a swarm agent to an external tracker user (for assignment sync).
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `provider` | `string` | Yes | - | Tracker provider (e.g. 'linear |
+| `provider` | `string` | Yes | - | Tracker provider (e.g. 'linear', 'jira |
 | `agentId` | `string` | Yes | - | The swarm agent ID |
 | `externalUserId` | `string` | Yes | - | The external user ID in the tracker |
 | `agentName` | `string` | Yes | - | Display name for the agent mapping |
@@ -940,7 +952,7 @@ Link a swarm task to an external tracker issue.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `provider` | `string` | Yes | - | Tracker provider (e.g. 'linear |
+| `provider` | `string` | Yes | - | Tracker provider (e.g. 'linear', 'jira |
 | `swarmTaskId` | `string` | Yes | - | The swarm task ID to link |
 | `externalId` | `string` | Yes | - | The external issue ID in the tracker |
 | `externalUrl` | `string` | No | - | URL to the external issue |
@@ -953,7 +965,7 @@ Show all tracker sync mappings with their state.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `provider` | `string` | No | - | Filter by provider (e.g. 'linear |
+| `provider` | `string` | No | - | Filter by provider (e.g. 'linear', 'jira |
 | `entityType` | `task` | No | - | Filter by entity type |
 
 ### tracker-status

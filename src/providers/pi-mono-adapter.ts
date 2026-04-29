@@ -22,6 +22,7 @@ import {
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
 import { type TSchema, Type } from "@sinclair/typebox";
+import { scrubSecrets } from "../utils/secret-scrubber";
 import { createSwarmHooksExtension } from "./pi-mono-extension";
 import { McpHttpClient } from "./pi-mono-mcp-client";
 import type {
@@ -154,7 +155,7 @@ class PiMonoSession implements ProviderSession {
     this._sessionId = agentSession.sessionId;
 
     // Emit session_init immediately
-    this.emit({ type: "session_init", sessionId: this._sessionId });
+    this.emit({ type: "session_init", sessionId: this._sessionId, provider: "pi" });
 
     // Subscribe to agent events and normalize
     this.agentSession.subscribe((event) => this.handleAgentEvent(event));
@@ -164,17 +165,24 @@ class PiMonoSession implements ProviderSession {
   }
 
   private emit(event: ProviderEvent): void {
+    // Scrub secrets from raw_log / raw_stderr content before egress (log file
+    // write, listener dispatch, downstream session-logs push + pretty-print).
+    const scrubbed: ProviderEvent =
+      event.type === "raw_log" || event.type === "raw_stderr"
+        ? { ...event, content: scrubSecrets(event.content) }
+        : event;
+
     // Log all events
     this.logFileHandle.write(
-      `${JSON.stringify({ ...event, timestamp: new Date().toISOString() })}\n`,
+      `${JSON.stringify({ ...scrubbed, timestamp: new Date().toISOString() })}\n`,
     );
 
     if (this.listeners.length > 0) {
       for (const listener of this.listeners) {
-        listener(event);
+        listener(scrubbed);
       }
     } else {
-      this.eventQueue.push(event);
+      this.eventQueue.push(scrubbed);
     }
   }
 
@@ -356,6 +364,7 @@ class PiMonoSession implements ProviderSession {
       numTurns: stats.userMessages + stats.assistantMessages,
       model: this.agentSession.model?.name ?? this.config.model,
       isError: false,
+      provider: "pi",
     };
   }
 
@@ -383,6 +392,7 @@ class PiMonoSession implements ProviderSession {
 
 export class PiMonoAdapter implements ProviderAdapter {
   readonly name = "pi";
+  readonly traits = { hasMcp: true, hasLocalEnvironment: true };
   private lastCwd = ".";
 
   async createSession(config: ProviderSessionConfig): Promise<ProviderSession> {

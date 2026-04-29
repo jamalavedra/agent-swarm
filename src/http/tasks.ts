@@ -4,7 +4,6 @@ import { z } from "zod";
 import {
   cancelTask,
   completeTask,
-  createTaskExtended,
   failTask,
   getAllTasks,
   getDb,
@@ -19,7 +18,9 @@ import {
   updateTaskProgress,
   updateTaskVcs,
 } from "../be/db";
+import { createTaskWithSiblingAwareness } from "../tasks/sibling-awareness";
 import { telemetry } from "../telemetry";
+import { ProviderNameSchema } from "../types";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
@@ -63,6 +64,7 @@ const createTask = route({
     parentTaskId: z.string().optional(),
     source: z.string().optional(),
     outputSchema: z.record(z.string(), z.unknown()).optional(),
+    contextKey: z.string().optional(),
   }),
   responses: {
     201: { description: "Task created" },
@@ -77,7 +79,22 @@ const updateClaudeSession = route({
   summary: "Update Claude session ID for a task",
   tags: ["Tasks"],
   params: z.object({ id: z.string() }),
-  body: z.object({ claudeSessionId: z.string().min(1) }),
+  body: z.union([
+    z.object({
+      claudeSessionId: z.string().min(1),
+      provider: z.literal("devin"),
+      providerMeta: z.object({
+        sessionUrl: z.string(),
+        maxAcuLimit: z.number().optional(),
+        acuCostUsd: z.number().optional(),
+      }),
+    }),
+    z.object({
+      claudeSessionId: z.string().min(1),
+      provider: ProviderNameSchema.exclude(["devin"]).optional(),
+      providerMeta: z.object({}).optional(),
+    }),
+  ]),
   responses: {
     200: { description: "Session ID updated" },
     404: { description: "Task not found" },
@@ -240,7 +257,7 @@ export async function handleTasks(
     if (!parsed) return true;
 
     try {
-      const task = createTaskExtended(parsed.body.task, {
+      const task = createTaskWithSiblingAwareness(parsed.body.task, {
         agentId: parsed.body.agentId || undefined,
         creatorAgentId: myAgentId || undefined,
         taskType: parsed.body.taskType || undefined,
@@ -252,6 +269,7 @@ export async function handleTasks(
         parentTaskId: parsed.body.parentTaskId || undefined,
         source: (parsed.body.source as import("../types").AgentTaskSource) || "api",
         outputSchema: parsed.body.outputSchema || undefined,
+        contextKey: parsed.body.contextKey || undefined,
       });
 
       ensure({
@@ -289,7 +307,12 @@ export async function handleTasks(
   if (updateClaudeSession.match(req.method, pathSegments)) {
     const parsed = await updateClaudeSession.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
-    const task = updateTaskClaudeSessionId(parsed.params.id, parsed.body.claudeSessionId);
+    const task = updateTaskClaudeSessionId(
+      parsed.params.id,
+      parsed.body.claudeSessionId,
+      parsed.body.provider,
+      parsed.body.providerMeta,
+    );
     if (!task) {
       jsonError(res, "Task not found", 404);
       return true;

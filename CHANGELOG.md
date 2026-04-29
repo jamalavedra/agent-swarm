@@ -6,7 +6,112 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.72.0] - 2026-04-28
+
 ### Added
+- **Claude Managed Agents harness provider** (`HARNESS_PROVIDER=claude-managed`). Sessions execute in Anthropic's managed cloud sandbox; the worker becomes a thin SSE relay that maps `client.beta.sessions.events.stream` events to the swarm's `ProviderEvent` union — no LLM process, no local CLI, no skill filesystem on the worker. New one-time `claude-managed-setup` CLI creates an Anthropic-side Environment, uploads `plugin/commands/*.md` skills via `client.beta.skills.create`, creates an Agent referencing those skills, and persists `MANAGED_AGENT_ID` + `MANAGED_ENVIRONMENT_ID` to `swarm_config` (encrypted). New env vars: `MANAGED_AGENT_ID`, `MANAGED_ENVIRONMENT_ID`, `MANAGED_AGENT_MODEL` (default `claude-sonnet-4-6`), `MANAGED_GITHUB_VAULT_ID`, `MANAGED_GITHUB_TOKEN`. `MCP_BASE_URL` must be HTTPS-public (Anthropic's sandbox calls `/mcp` from the cloud) — adapter and entrypoint fail-fast otherwise. Cost computation accounts for token rates **plus** Anthropic's $0.08/session-hour runtime fee. New-UI Integrations dashboard surfaces the same config (Phase 7). Provider design rationale + SDK quirks documented in [`/docs/guides/harness-providers#claude-managed-agents`](/docs/guides/harness-providers) (#384)
+- **Devin harness provider** (`HARNESS_PROVIDER=devin`). New env vars: `DEVIN_API_KEY` (cog_*), `DEVIN_ORG_ID` (org_*), `DEVIN_POLL_INTERVAL_MS` (default 15s), `DEVIN_ACU_COST_USD` (default $2.25), `DEVIN_API_BASE_URL`, `DEVIN_MAX_ACU_LIMIT`. Standalone `.env.docker-devin.example` template added (#378)
+- **Per-agent + global daily cost budgets** with refusal-at-claim. New tables `agent_budgets`, `swarm_budgets`, and `agent_pricing` (migrations 046 + 047). New routes `GET /api/budgets`, `PUT /api/budgets/{agentId}`, `GET /api/pricing` plus session-cost recompute on Codex sessions. Workers honor budgets in `poll-task` / `task-action` claim gates — refused claims emit a Slack notification via `budget-refusal-notify`. Backoff timing for refused-budget retries lives in `src/utils/budget-backoff.ts` (#385)
+- **Budgets + spend dashboard at `/budgets`** in the new-UI (DES-278). New router page, sidebar entry, `useBudgets` hook, and `useIntegrationsMeta` API client wiring. Surfaces global + per-agent budgets, current spend, and refusal events (#386)
+- New CLI command `claude-managed-setup` (run from your laptop) — bootstraps the Anthropic-side Agent + Environment and persists IDs to `swarm_config`. `--force` recreates from scratch
+- New CLI command `codex-login` — interactive ChatGPT OAuth bootstrap for Codex workers (refactored out of the in-tree Codex setup)
+
+### Changed
+- `package.json` version bump to `1.72.0`; regenerated `openapi.json` and `docs-site/content/docs/api-reference/**`
+- `runner.ts` claim path now consults the budget-admission gate before promoting `pending` → `in_progress`; refusal records a session-cost row with `cost_source = "refusal"`
+- README "Multi-provider" line now lists Claude Code, Codex, pi-mono, **Devin**, and **Claude Managed Agents**
+
+## [1.71.2] - 2026-04-28
+
+### Fixed
+- `initJira()` / `initLinear()` now prefer `MCP_BASE_URL` over the localhost default when `JIRA_REDIRECT_URI` / `LINEAR_REDIRECT_URI` are unset. The previous fallback was being persisted into `oauth_apps.redirectUri` and used verbatim by the OAuth authorize flow, so prod was sending users back to `http://localhost:3013/...` after Atlassian/Linear consent — even though the UI displayed the correct request-derived URL. Existing rows are healed automatically by `upsertOAuthApp` on next boot
+
+## [1.71.1] - 2026-04-27
+
+### Added
+- `DELETE /api/trackers/jira/disconnect` and `DELETE /api/trackers/linear/disconnect` — Jira disconnect deletes registered webhooks, OAuth tokens, and metadata; Linear revokes upstream and drops tokens. Both endpoints surface in the Integrations UI as a "Disconnect" button next to the OAuth status
+- `/status` responses for both Jira and Linear now include the computed `redirectUri` so the OAuth cards can render it with a copy button. The `JIRA_REDIRECT_URI` / `LINEAR_REDIRECT_URI` form fields were removed (env vars still work as overrides)
+
+### Changed
+- OAuth flow opens in a new tab via `window.open` so the dashboard context survives the round-trip; status auto-refreshes on focus
+- Webhook/redirect base URL is now derived from the inbound request when `MCP_BASE_URL` is unset; boot warns when `MCP_BASE_URL == APP_URL` (the prod misconfig)
+
+### Fixed
+- Jira/Linear "not configured" alert chips no longer wrap mid-pill on narrow viewports (`whitespace-nowrap` + extracted `CodeChip` helper)
+- shadcn `AlertDescription` rendered each `<code>` chip on its own grid row because of `display: grid; gap-1`. Wrapping inline content in a single `<p>` collapses children into one grid item so chips flow inline as intended
+
+## [1.71.0] - 2026-04-27
+
+### Added
+- **Jira Cloud integration** — full OAuth 3LO authorization code flow against `api.atlassian.com`, cloudId resolution via `/oauth/token/accessible-resources`, and a typed `jiraFetch()` that prepends `/ex/jira/{cloudId}`, refreshes on 401, and respects 429 `Retry-After`. New routes: `GET /authorize`, `GET /callback`, `GET /status`, `POST /webhook/:token`, `POST /api/trackers/jira/webhook-register`, `DELETE /api/trackers/jira/webhook/:id`. Inbound: assignee→bot transitions and @-mention comments create swarm tasks; outbound: lifecycle events (`task.created/completed/failed/cancelled`) post unicode-emoji plaintext comments back to the originating issue. Webhook auth uses URL-path token (timing-safe compare) — Atlassian doesn't HMAC-sign OAuth 3LO dynamic webhooks (Errata I8). Webhook keepalive runs every 12h and refreshes any registration with <7d to expiry. New ADF (Atlassian Document Format) recursive walker for inbound comment/issue body parsing. Migration `043_jira_source.sql` adds `jira` to the `agent_tasks` source CHECK constraint. 57 new unit tests across `jira-metadata`, `jira-webhook`, `jira-sync`, `jira-oauth`, `jira-outbound-sync`, `jira-webhook-lifecycle`. Full integration guide at [`/docs/guides/jira-integration`](/docs/guides/jira-integration). New Integrations UI card with cloudId/siteUrl/scope/expiry/webhook count + copyable redirect URL (#382)
+- New tracker provider `jira` is now recognized by `tracker-status`, `tracker-link-task`, `tracker-map-agent`, and `tracker-sync-status` MCP tools
+
+### Fixed
+- `botAccountId` cache moved to a `globalThis`-keyed slot so all module instances share the same value across cache-busting dynamic imports under `bun:test`'s parallel file runner. Fixes a CI-only test-isolation gap in `jira-sync.test.ts`
+- Two test files using `mock.module` on real modules (`jira-oauth.test.ts` mocking `oauth/wrapper`, `jira-webhook.test.ts` mocking `jira/sync`) switched to `spyOn` against namespace imports — `mock.module` overrides leak across the test process and broke victim files when bun:test's parallel-file order put the mocking file first
+
+## [1.70.0] - 2026-04-24
+
+### Added
+- Uniform `contextKey` column on `agent_tasks` populated at every task-ingress site (Slack, AgentMail, GitHub, GitLab, Linear, scheduler, workflow, `send-task`). Schema: `task:slack:{channelId}:{threadTs}`, `task:agentmail:{threadId}`, `task:trackers:github:{owner}:{repo}:{issue|pr}:{number}`, `task:trackers:gitlab:{projectId}:{mr|issue}:{iid}`, `task:trackers:linear:{issueIdentifier}`, `task:schedule:{scheduleId}`, `task:workflow:{workflowRunId}`. Migration 041 adds nullable `contextKey` plus `(contextKey, status)` composite index. Child tasks auto-inherit from parent via `parentTaskId` (#358)
+- Cross-ingress sibling-task awareness (phase 2): reader-side prompt injection surfaces sibling/parent tasks sharing the same `contextKey` so workers see related work across ingress paths. Includes additive `ADDITIVE_SLACK` buffer generalization and Linear hard-refuse UX fix (#359)
+- New harness-providers guide at [`/docs/guides/harness-providers`](/docs/guides/harness-providers) covering the `ProviderAdapter` contract, task↔session lifecycle, raw session-log pipeline, swarm-MCP exposure, system-prompt composition/delivery, skills handling, and a 15-step walkthrough grounded in the claude / pi / codex reference adapters (`docs-site/content/docs/(documentation)/guides/harness-providers.mdx`)
+- `slack-post` gains an optional `threadTs` parameter so the lead can post threaded replies under an existing message, and a sibling `slack-start-thread` tool posts a top-level message and returns `{ channelId, ts }` so subsequent `slack-post` calls can thread under it. Unblocks daily-digest flows where the parent is a summary and the body is an in-thread reply (#373)
+- `GET /api/mcp-oauth/{id}/authorize-url` returns `{ providerUrl }` (Bearer-authed) so the dashboard Connect flow can XHR-then-navigate and keep Bearer auth on the authed endpoint while letting the browser follow the provider redirect directly (#372)
+
+### Fixed
+- `core.ts` HTTP middleware now honors per-route `auth: { apiKey: false }` via a `routeRegistry` lookup instead of a hardcoded exception list, so `/api/mcp-oauth/callback` and other opt-out routes no longer 401 on API_KEY swarms. Unknown paths still fail closed. Adds middleware unit tests (#367, #372)
+- Docker entrypoint no longer inlines MCP credentials (OAuth Bearers, static headers, env-backed secrets) into `/workspace/.mcp.json` at boot; it now only uses installed-server names to seed `settings.json` permission patterns. The per-session merge in `claude-adapter.ts` is extracted into a pure `mergeMcpConfig` and flipped so installed servers from the API **override** on-disk entries, restoring the "resolve at dispatch time" guarantee from 1.69.0 so OAuth re-auth, secret rotation, and install/uninstall propagate without worker restart. 8 new unit tests cover precedence, uninstall propagation, and staleness (#369, #371)
+- MCP OAuth `Authorization` header now normalizes `token_type: "bearer"` to capital `Bearer`, so providers like Amplitude's MCP (which reject the RFC 6749 lowercase form despite RFC 6750 being case-insensitive) accept the token. Non-bearer schemes pass through verbatim (#370)
+- `update-profile` tool now gates `Bun.write("/workspace/SOUL.md" | "/workspace/IDENTITY.md")` on `requestInfo.agentId === process.env.AGENT_ID`, so test-suite fake `WORKER_ID`s no longer overwrite a real container's identity files. Also raises `IDENTITY_FILE_MIN_LENGTH` in `src/hooks/hook.ts` from 100 → 500 as defense-in-depth against the Stop hook syncing short sentinel writes back into the DB (#374)
+
+## [1.69.1] - 2026-04-23
+
+### Added
+- `ENABLE_PROMPT_CACHING_1H=1` is now set by default for every Claude Code session spawned via `ClaudeAdapter`. Opt out via `swarm_config` or environment (`ENABLE_PROMPT_CACHING_1H=0`). Regenerated `openapi.json` + API reference pages for the version bump
+
+## [1.69.0] - 2026-04-22
+
+### Added
+- **OAuth 2.0 MCP support for headless swarms** — end-to-end support for OAuth 2.0-protected MCP servers running inside worker containers. Workers resolve a valid access token at dispatch time (refreshing on expiry), inject it into the provider config, and propagate token-refresh failures back to the task without leaking tokens into logs or prompts (#357)
+- `POST /api/mcp-oauth/{mcpServerId}/authorize` / `GET /api/mcp-oauth/callback` — browser-driven OAuth authorization code flow for user-scoped MCP servers (#357)
+- `POST /api/mcp-oauth/{mcpServerId}/manual-client` — operator-supplied client credentials for MCP servers that don't implement dynamic client registration (#357)
+- `GET /api/mcp-oauth/{mcpServerId}/metadata` / `GET /api/mcp-oauth/{mcpServerId}/status` — metadata discovery (RFC 8414) and per-server OAuth status for the Integrations UI (#357)
+- `POST /api/mcp-oauth/{mcpServerId}/refresh` / `DELETE /api/mcp-oauth/{mcpServerId}` — manual refresh and revocation endpoints (#357)
+- New MCP OAuth panel in the dashboard (`new-ui/src/pages/mcp-servers/[id]/mcp-oauth-panel.tsx`) for authorize / refresh / revoke / manual-client management, with live status from `use-mcp-oauth.ts` (#357)
+- Encrypted-at-rest OAuth token storage via migration `041_mcp_oauth_tokens.sql`, reusing the `swarm_config` AES-256-GCM encryption key; access tokens are never returned over HTTP (#357)
+- Dummy OAuth MCP server reference implementation at `scripts/dummy-oauth-mcp/` for local testing of the full flow (authorization code, PKCE, dynamic client registration, refresh) (#357)
+- 1100+ lines of new test coverage across `src/tests/mcp-oauth-*.test.ts` (queries, resolve-secrets, ensure-token, wrapper) (#357)
+
+## [1.68.0] - 2026-04-22
+
+### Added
+- New `/integrations` dashboard page that lets operators configure third-party integrations (Slack, GitHub, GitLab, Linear, Sentry, AgentMail, Anthropic, OpenRouter, OpenAI, Codex, business-use) without hand-editing `.env`. Frontend-only catalog in `new-ui/src/lib/integrations-catalog.ts`, one form field per known `swarm_config` key, with labels, help text, docs links, and category/search filters (#364)
+- `POST /api/config/reload` — thin wrapper over the existing `/internal/reload-config` so the Integrations UI can apply saved values live (re-inits AgentMail, GitHub, Linear, stops/starts Slack socket mode) without a process restart (#364)
+- `GET /api/config/env-presence?keys=K1,K2,...` — returns `{ presence: { KEY: boolean } }` so the UI can surface which values come from the deployment env vs the DB without ever pushing raw env values to the browser (#364)
+- Per-field **Replace** / **Clear** affordances on the Integrations detail page. Secrets render masked (`••••••`); non-secret values (emails, channel names, flags) edit in place. Save auto-invokes reload and toasts which integrations were re-initialized (#364)
+- Source chips on each field: `db+env` (live), `env (deploy)` (no DB row), `db (pending reload)` — rendered via shadcn Tooltip for fast hover reveal. Collapsible legend on the list page explains every chip (#364)
+
+### Changed
+- Sidebar restructured: Chat and Services hidden (routes still accessible); new **AI** group (Skills, MCP Servers); new **Configuration** group (Integrations, Templates, Approvals, Repos). Breadcrumbs now resolve integration ids to display names (`github` → "GitHub") and include proper-case labels for Integrations and API Keys (#364)
+- Toaster references the correct Tailwind v4 CSS vars (`--color-popover` instead of `--popover`) and pins `!bg-popover` so toasts are opaque instead of translucent (#364)
+
+## [1.67.5] - 2026-04-22
+
+### Added
+- Centralized secret scrubber (`src/utils/secret-scrubber.ts`) that replaces sensitive env values and known-shape tokens (GitHub PATs, Anthropic/OpenAI/OpenRouter `sk-*` keys, Slack `xox*`, JWTs, AWS access keys, Google API keys) with `[REDACTED:<name>]` markers at every text-egress point — adapter log files, `session_logs` writes, pretty-printed stdout, stderr dumps — so credentials never leak into `/workspace/logs/*.jsonl`, the `session_logs` SQLite table, or container stdout shipped to log aggregators (#363)
+- `CLAUDE.md` contributor note directing future code that logs/prints/transports sensitive values to wrap emitted strings with `scrubSecrets()` at the egress point (#363)
+
+## [1.67.4] - 2026-04-21
+
+### Fixed
+- Slack thread follow-ups that `@`-mention a different user/bot (e.g. `@Devin wdyt?`) no longer create spurious tasks for the swarm agent. Both the router thread-follow-up branch (`src/slack/router.ts`) and the `ADDITIVE_SLACK` buffer branch (`src/slack/handlers.ts`) now use a new `hasOtherUserMention()` helper and bail when the message mentions another `<@U...>` and does not mention our bot (#355)
+
+## [1.67.3] - 2026-04-21
+
+### Added
+- `PRAGMA busy_timeout = 5000` on every SQLite connection (`src/be/db.ts`, applied on both fresh-DB and `Database.deserialize` paths) so concurrent writer contention (heartbeat sweep vs. `/ping`, `/close`, agent registration) waits out the lock instead of failing instantly with `SQLITE_BUSY` (#354)
+- Process-level `uncaughtException` / `unhandledRejection` log-and-continue handlers in `src/http/index.ts` as defense-in-depth against a single bad request taking the API pod down (#354)
 - Composite index on `agent_tasks(slackChannelId, slackThreadTs, status)` (migration 040) to speed up Slack thread lookups used by the follow-up re-delegation guard (#345)
 - Hero wireframe video back in `README.md` plus reproducible Remotion source in `assets/video-source/` (two compositions: daily-evolution and slack-to-pr) (#350)
 
@@ -16,6 +121,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Lead session prompt and `task.worker.completed` / `task.worker.failed` templates updated to explicitly forbid re-delegating follow-up results back to a worker (#345)
 
 ### Fixed
+- API server no longer crashes with an unhandled `SQLiteError: database is locked` when heartbeat and HTTP writers race on the `agents` row — `busy_timeout` plus process-level guards together stop a single lock collision from failing every in-flight request (#354)
 - Duplicate Slack responses caused by the lead re-delegating follow-up tasks: `send-task` now blocks re-delegation when the thread already has a completed task within the last 48 hours, and the follow-up template discourages it at the prompt layer (#345)
 
 ## [1.67.2] - 2026-04-17

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Agent Swarm API",
-    "version": "1.67.2",
+    "version": "1.72.0",
     "description": "Multi-agent orchestration API for Claude Code, Codex, and Gemini CLI. Enables task distribution, agent communication, and service discovery.\n\nMCP tools are documented separately in [MCP.md](./MCP.md)."
   },
   "servers": [
@@ -947,6 +947,401 @@
         }
       }
     },
+    "/api/budgets": {
+      "get": {
+        "summary": "List all configured budget rows",
+        "tags": [
+          "Budgets"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Budget list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "budgets": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "scope": {
+                            "type": "string",
+                            "enum": [
+                              "global",
+                              "agent"
+                            ]
+                          },
+                          "scopeId": {
+                            "type": "string"
+                          },
+                          "dailyBudgetUsd": {
+                            "type": "number",
+                            "minimum": 0
+                          },
+                          "createdAt": {
+                            "type": "number"
+                          },
+                          "lastUpdatedAt": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "scope",
+                          "scopeId",
+                          "dailyBudgetUsd",
+                          "createdAt",
+                          "lastUpdatedAt"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "budgets"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/budgets/refusals": {
+      "get": {
+        "summary": "List recent budget refusal notifications",
+        "tags": [
+          "Budgets"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 500
+            },
+            "required": false,
+            "name": "limit",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recent budget refusals (newest first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "refusals": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "taskId": {
+                            "type": "string"
+                          },
+                          "date": {
+                            "type": "string"
+                          },
+                          "agentId": {
+                            "type": "string"
+                          },
+                          "cause": {
+                            "type": "string",
+                            "enum": [
+                              "agent",
+                              "global"
+                            ]
+                          },
+                          "agentSpendUsd": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "agentBudgetUsd": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "globalSpendUsd": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "globalBudgetUsd": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "followUpTaskId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "createdAt": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "taskId",
+                          "date",
+                          "agentId",
+                          "cause",
+                          "createdAt"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "refusals"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/budgets/{scope}/{scopeId}": {
+      "get": {
+        "summary": "Get a single budget row",
+        "tags": [
+          "Budgets"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "global",
+                "agent"
+              ]
+            },
+            "required": true,
+            "name": "scope",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "maxLength": 255,
+              "description": "Scope identifier — empty string for global, agent UUID otherwise"
+            },
+            "required": true,
+            "description": "Scope identifier — empty string for global, agent UUID otherwise",
+            "name": "scopeId",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Budget row",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "scope": {
+                      "type": "string",
+                      "enum": [
+                        "global",
+                        "agent"
+                      ]
+                    },
+                    "scopeId": {
+                      "type": "string"
+                    },
+                    "dailyBudgetUsd": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "createdAt": {
+                      "type": "number"
+                    },
+                    "lastUpdatedAt": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "scope",
+                    "scopeId",
+                    "dailyBudgetUsd",
+                    "createdAt",
+                    "lastUpdatedAt"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Budget not configured"
+          }
+        }
+      },
+      "put": {
+        "summary": "Create or update a budget row",
+        "tags": [
+          "Budgets"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "global",
+                "agent"
+              ]
+            },
+            "required": true,
+            "name": "scope",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "maxLength": 255,
+              "description": "Scope identifier — empty string for global, agent UUID otherwise"
+            },
+            "required": true,
+            "description": "Scope identifier — empty string for global, agent UUID otherwise",
+            "name": "scopeId",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "dailyBudgetUsd": {
+                    "type": "number",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "dailyBudgetUsd"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Budget upserted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "scope": {
+                      "type": "string",
+                      "enum": [
+                        "global",
+                        "agent"
+                      ]
+                    },
+                    "scopeId": {
+                      "type": "string"
+                    },
+                    "dailyBudgetUsd": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "createdAt": {
+                      "type": "number"
+                    },
+                    "lastUpdatedAt": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "scope",
+                    "scopeId",
+                    "dailyBudgetUsd",
+                    "createdAt",
+                    "lastUpdatedAt"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a budget row",
+        "tags": [
+          "Budgets"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "global",
+                "agent"
+              ]
+            },
+            "required": true,
+            "name": "scope",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "maxLength": 255,
+              "description": "Scope identifier — empty string for global, agent UUID otherwise"
+            },
+            "required": true,
+            "description": "Scope identifier — empty string for global, agent UUID otherwise",
+            "name": "scopeId",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Budget deleted"
+          },
+          "404": {
+            "description": "Budget not configured"
+          }
+        }
+      }
+    },
     "/api/config/resolved": {
       "get": {
         "summary": "Get resolved config (merged global + agent + repo scopes)",
@@ -991,6 +1386,69 @@
         "responses": {
           "200": {
             "description": "Resolved config entries"
+          }
+        }
+      }
+    },
+    "/api/config/env-presence": {
+      "get": {
+        "summary": "Check which of the given env var keys are currently set in process.env (presence only, no values)",
+        "tags": [
+          "Config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "keys",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Map of key -> boolean (true iff set in process.env)"
+          },
+          "400": {
+            "description": "Validation error"
+          }
+        }
+      }
+    },
+    "/api/config/reload": {
+      "post": {
+        "summary": "Reload global swarm_config into process.env (override=true) and re-init integrations (Slack, GitHub, Linear, AgentMail)",
+        "tags": [
+          "Config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Reload result"
+          },
+          "500": {
+            "description": "Reload failed"
           }
         }
       }
@@ -2263,6 +2721,34 @@
         }
       }
     },
+    "/api/integrations/claude-managed/test": {
+      "post": {
+        "summary": "Test the claude-managed integration: resolves ANTHROPIC_API_KEY + MANAGED_AGENT_ID from swarm_config and calls beta.agents.retrieve.",
+        "tags": [
+          "Integrations"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Connection result — `{ ok: true, agentName, model }` on success or `{ ok: false, error }` on any failure (missing config, Anthropic API error). Always 200 OK."
+          }
+        }
+      }
+    },
     "/api/memory/index": {
       "post": {
         "summary": "Ingest content into memory system (async embedding)",
@@ -2926,6 +3412,449 @@
           },
           "400": {
             "description": "Invalid request"
+          }
+        }
+      }
+    },
+    "/api/pricing": {
+      "get": {
+        "summary": "List every pricing row across all providers",
+        "tags": [
+          "Pricing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pricing rows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "rows": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "provider": {
+                            "type": "string",
+                            "enum": [
+                              "claude",
+                              "codex",
+                              "pi"
+                            ]
+                          },
+                          "model": {
+                            "type": "string"
+                          },
+                          "tokenClass": {
+                            "type": "string",
+                            "enum": [
+                              "input",
+                              "cached_input",
+                              "output"
+                            ]
+                          },
+                          "effectiveFrom": {
+                            "type": "number",
+                            "minimum": 0
+                          },
+                          "pricePerMillionUsd": {
+                            "type": "number",
+                            "minimum": 0
+                          },
+                          "createdAt": {
+                            "type": "number"
+                          },
+                          "lastUpdatedAt": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "provider",
+                          "model",
+                          "tokenClass",
+                          "effectiveFrom",
+                          "pricePerMillionUsd",
+                          "createdAt",
+                          "lastUpdatedAt"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "rows"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pricing/{provider}/{model}/{tokenClass}": {
+      "get": {
+        "summary": "List pricing history for a (provider, model, tokenClass) triple",
+        "tags": [
+          "Pricing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "pi"
+              ]
+            },
+            "required": true,
+            "name": "provider",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "model",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "input",
+                "cached_input",
+                "output"
+              ]
+            },
+            "required": true,
+            "name": "tokenClass",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pricing rows (latest first)"
+          }
+        }
+      },
+      "post": {
+        "summary": "Append a new pricing row",
+        "tags": [
+          "Pricing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "pi"
+              ]
+            },
+            "required": true,
+            "name": "provider",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "model",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "input",
+                "cached_input",
+                "output"
+              ]
+            },
+            "required": true,
+            "name": "tokenClass",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "pricePerMillionUsd": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "effectiveFrom": {
+                    "type": "number",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "pricePerMillionUsd"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Pricing row inserted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "provider": {
+                      "type": "string",
+                      "enum": [
+                        "claude",
+                        "codex",
+                        "pi"
+                      ]
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "tokenClass": {
+                      "type": "string",
+                      "enum": [
+                        "input",
+                        "cached_input",
+                        "output"
+                      ]
+                    },
+                    "effectiveFrom": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "pricePerMillionUsd": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "createdAt": {
+                      "type": "number"
+                    },
+                    "lastUpdatedAt": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model",
+                    "tokenClass",
+                    "effectiveFrom",
+                    "pricePerMillionUsd",
+                    "createdAt",
+                    "lastUpdatedAt"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "409": {
+            "description": "Duplicate (provider, model, tokenClass, effectiveFrom)"
+          }
+        }
+      }
+    },
+    "/api/pricing/{provider}/{model}/{tokenClass}/active": {
+      "get": {
+        "summary": "Get the currently active pricing row",
+        "tags": [
+          "Pricing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "pi"
+              ]
+            },
+            "required": true,
+            "name": "provider",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "model",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "input",
+                "cached_input",
+                "output"
+              ]
+            },
+            "required": true,
+            "name": "tokenClass",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Active pricing row",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "provider": {
+                      "type": "string",
+                      "enum": [
+                        "claude",
+                        "codex",
+                        "pi"
+                      ]
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "tokenClass": {
+                      "type": "string",
+                      "enum": [
+                        "input",
+                        "cached_input",
+                        "output"
+                      ]
+                    },
+                    "effectiveFrom": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "pricePerMillionUsd": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "createdAt": {
+                      "type": "number"
+                    },
+                    "lastUpdatedAt": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model",
+                    "tokenClass",
+                    "effectiveFrom",
+                    "pricePerMillionUsd",
+                    "createdAt",
+                    "lastUpdatedAt"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No pricing row in effect"
+          }
+        }
+      }
+    },
+    "/api/pricing/{provider}/{model}/{tokenClass}/{effectiveFrom}": {
+      "delete": {
+        "summary": "Delete a pricing row (typo correction)",
+        "tags": [
+          "Pricing"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex",
+                "pi"
+              ]
+            },
+            "required": true,
+            "name": "provider",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "model",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "input",
+                "cached_input",
+                "output"
+              ]
+            },
+            "required": true,
+            "name": "tokenClass",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^\\d+$"
+            },
+            "required": true,
+            "name": "effectiveFrom",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Pricing row deleted"
+          },
+          "404": {
+            "description": "Pricing row not found"
           }
         }
       }
@@ -4086,6 +5015,18 @@
                   },
                   "isError": {
                     "type": "boolean"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "enum": [
+                      "claude",
+                      "codex",
+                      "pi"
+                    ]
+                  },
+                  "createdAt": {
+                    "type": "integer",
+                    "minimum": 0
                   }
                 },
                 "required": [
@@ -4657,6 +5598,409 @@
         "responses": {
           "200": {
             "description": "Agent skills list"
+          }
+        }
+      }
+    },
+    "/api/mcp-oauth/{mcpServerId}/metadata": {
+      "get": {
+        "summary": "Probe OAuth metadata (PRMD + AS) for an MCP server",
+        "tags": [
+          "MCP OAuth"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "mcpServerId",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OAuth metadata or { requiresOAuth: false }"
+          },
+          "400": {
+            "description": "MCP has no URL / invalid transport"
+          },
+          "404": {
+            "description": "MCP server not found"
+          }
+        }
+      }
+    },
+    "/api/mcp-oauth/{mcpServerId}/status": {
+      "get": {
+        "summary": "Get the current OAuth connection status for an MCP server",
+        "tags": [
+          "MCP OAuth"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "mcpServerId",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "userId",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Token status (never includes the token value itself)"
+          },
+          "404": {
+            "description": "MCP server not found"
+          }
+        }
+      }
+    },
+    "/api/mcp-oauth/{mcpServerId}/authorize": {
+      "get": {
+        "summary": "Start an OAuth flow. Redirects to the provider.",
+        "tags": [
+          "MCP OAuth"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "mcpServerId",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "redirect",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "userId",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "scopes",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to authorization server"
+          },
+          "400": {
+            "description": "MCP has no URL / does not require OAuth"
+          },
+          "404": {
+            "description": "MCP server not found"
+          }
+        }
+      }
+    },
+    "/api/mcp-oauth/{mcpServerId}/authorize-url": {
+      "get": {
+        "summary": "Build an OAuth authorize URL. Returns JSON so the browser can navigate without losing the Bearer auth header.",
+        "tags": [
+          "MCP OAuth"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "mcpServerId",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "redirect",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "userId",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "scopes",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{ providerUrl: string }"
+          },
+          "400": {
+            "description": "MCP has no URL / does not require OAuth"
+          },
+          "404": {
+            "description": "MCP server not found"
+          }
+        }
+      }
+    },
+    "/api/mcp-oauth/callback": {
+      "get": {
+        "summary": "OAuth redirect target. Exchanges code -> tokens and redirects back to dashboard.",
+        "tags": [
+          "MCP OAuth"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "code",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "state",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "error",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "error_description",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect back to dashboard with oauth=success or oauth=error"
+          },
+          "400": {
+            "description": "Bad state / missing code"
+          }
+        }
+      }
+    },
+    "/api/mcp-oauth/{mcpServerId}/refresh": {
+      "post": {
+        "summary": "Force-refresh the access token for an MCP server",
+        "tags": [
+          "MCP OAuth"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "mcpServerId",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "userId": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Refreshed token"
+          },
+          "404": {
+            "description": "No token for this MCP server"
+          },
+          "500": {
+            "description": "Refresh failed"
+          }
+        }
+      }
+    },
+    "/api/mcp-oauth/{mcpServerId}": {
+      "delete": {
+        "summary": "Revoke and delete the OAuth token for an MCP server",
+        "tags": [
+          "MCP OAuth"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "mcpServerId",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "userId",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Token revoked/deleted"
+          },
+          "404": {
+            "description": "No token for this MCP server"
+          }
+        }
+      }
+    },
+    "/api/mcp-oauth/{mcpServerId}/manual-client": {
+      "post": {
+        "summary": "Register a pre-existing OAuth client (DCR fallback)",
+        "tags": [
+          "MCP OAuth"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "mcpServerId",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "clientId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "clientSecret": {
+                    "type": "string"
+                  },
+                  "authorizationServerIssuer": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "authorizeUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "tokenUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "revocationUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "scopes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "clientId"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Pending client stored. Call /authorize to start the flow."
+          },
+          "400": {
+            "description": "Bad input"
+          },
+          "404": {
+            "description": "MCP server not found"
           }
         }
       }
@@ -5336,6 +6680,9 @@
                   "outputSchema": {
                     "type": "object",
                     "additionalProperties": {}
+                  },
+                  "contextKey": {
+                    "type": "string"
                   }
                 },
                 "required": [
@@ -5380,15 +6727,69 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "properties": {
-                  "claudeSessionId": {
-                    "type": "string",
-                    "minLength": 1
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "claudeSessionId": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "provider": {
+                        "type": "string",
+                        "enum": [
+                          "devin"
+                        ]
+                      },
+                      "providerMeta": {
+                        "type": "object",
+                        "properties": {
+                          "sessionUrl": {
+                            "type": "string"
+                          },
+                          "maxAcuLimit": {
+                            "type": "number"
+                          },
+                          "acuCostUsd": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "sessionUrl"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "claudeSessionId",
+                      "provider",
+                      "providerMeta"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "claudeSessionId": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "provider": {
+                        "type": "string",
+                        "enum": [
+                          "claude",
+                          "codex",
+                          "pi",
+                          "claude-managed"
+                        ]
+                      },
+                      "providerMeta": {
+                        "type": "object",
+                        "properties": {}
+                      }
+                    },
+                    "required": [
+                      "claudeSessionId"
+                    ]
                   }
-                },
-                "required": [
-                  "claudeSessionId"
                 ]
               }
             }
@@ -5740,6 +7141,210 @@
         }
       }
     },
+    "/api/trackers/jira/authorize": {
+      "get": {
+        "summary": "Redirect to Atlassian OAuth consent screen",
+        "tags": [
+          "Trackers"
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to Atlassian OAuth"
+          },
+          "500": {
+            "description": "Failed to generate authorization URL"
+          },
+          "503": {
+            "description": "Jira integration not configured"
+          }
+        }
+      }
+    },
+    "/api/trackers/jira/callback": {
+      "get": {
+        "summary": "Handle Jira OAuth callback (resolves cloudId via accessible-resources)",
+        "tags": [
+          "Trackers"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "code",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "state",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OAuth complete"
+          },
+          "400": {
+            "description": "Invalid state or code"
+          },
+          "500": {
+            "description": "Token exchange or accessible-resources fetch failed"
+          }
+        }
+      }
+    },
+    "/api/trackers/jira/status": {
+      "get": {
+        "summary": "Jira connection status, cloudId/siteUrl, token expiry, expected webhook URL, scope/token-config flags",
+        "tags": [
+          "Trackers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Connection status"
+          },
+          "503": {
+            "description": "Jira integration not configured"
+          }
+        }
+      }
+    },
+    "/api/trackers/jira/webhook/{token}": {
+      "post": {
+        "summary": "Receive Jira webhook events (URL-token authenticated). Phase 2 stub — Phase 3 fills in dispatch.",
+        "tags": [
+          "Trackers"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "token",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event accepted"
+          },
+          "401": {
+            "description": "Invalid URL token"
+          },
+          "503": {
+            "description": "Jira webhook handler not configured"
+          }
+        }
+      }
+    },
+    "/api/trackers/jira/webhook-register": {
+      "post": {
+        "summary": "Register a Jira dynamic webhook (admin only)",
+        "tags": [
+          "Trackers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "jqlFilter": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "jqlFilter"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Webhook registered"
+          },
+          "400": {
+            "description": "Invalid jqlFilter"
+          },
+          "503": {
+            "description": "Jira not connected or JIRA_WEBHOOK_TOKEN missing"
+          }
+        }
+      }
+    },
+    "/api/trackers/jira/webhook/{id}": {
+      "delete": {
+        "summary": "Delete a Jira dynamic webhook (admin only)",
+        "tags": [
+          "Trackers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Webhook deleted"
+          },
+          "400": {
+            "description": "Invalid webhook id"
+          },
+          "503": {
+            "description": "Jira not connected"
+          }
+        }
+      }
+    },
+    "/api/trackers/jira/disconnect": {
+      "delete": {
+        "summary": "Fully disconnect Jira: delete all webhooks, drop tokens, clear metadata",
+        "tags": [
+          "Trackers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Disconnected"
+          },
+          "503": {
+            "description": "Jira not configured"
+          }
+        }
+      }
+    },
     "/api/trackers/linear/authorize": {
       "get": {
         "summary": "Redirect to Linear OAuth consent screen",
@@ -5832,6 +7437,27 @@
           },
           "503": {
             "description": "Linear integration not configured"
+          }
+        }
+      }
+    },
+    "/api/trackers/linear/disconnect": {
+      "delete": {
+        "summary": "Fully disconnect Linear: revoke OAuth grant + drop tokens",
+        "tags": [
+          "Trackers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Disconnected"
+          },
+          "503": {
+            "description": "Linear not configured"
           }
         }
       }

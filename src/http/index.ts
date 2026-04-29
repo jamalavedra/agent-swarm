@@ -12,6 +12,7 @@ import { closeDb, getSwarmConfigs, upsertSwarmConfig } from "../be/db";
 import { initGitHub } from "../github";
 import { initGitLab } from "../gitlab";
 import { stopHeartbeat } from "../heartbeat";
+import { initJira } from "../jira";
 import { initLinear } from "../linear";
 import { startSlackApp, stopSlackApp } from "../slack";
 import { initTelemetry, telemetry } from "../telemetry";
@@ -20,6 +21,7 @@ import { handleActiveSessions } from "./active-sessions";
 import { handleAgentRegister, handleAgentsRest } from "./agents";
 import { handleApiKeys } from "./api-keys";
 import { handleApprovalRequests } from "./approval-requests";
+import { handleBudgets } from "./budgets";
 import { handleConfig } from "./config";
 import { handleContext } from "./context";
 import { handleCore, loadGlobalConfigsIntoEnv } from "./core";
@@ -27,10 +29,13 @@ import { handleDbQuery } from "./db-query";
 import { handleEcosystem } from "./ecosystem";
 import { handleEvents } from "./events";
 import { handleHeartbeat } from "./heartbeat";
+import { handleIntegrations } from "./integrations";
 import { handleMcp } from "./mcp";
+import { handleMcpOAuth, startMcpOAuthPendingGc, stopMcpOAuthPendingGc } from "./mcp-oauth";
 import { handleMcpServers } from "./mcp-servers";
 import { handleMemory } from "./memory";
 import { handlePoll } from "./poll";
+import { handlePricing } from "./pricing";
 import { handlePromptTemplates } from "./prompt-templates";
 import { handleRepos } from "./repos";
 import { handleSchedules } from "./schedules";
@@ -42,6 +47,15 @@ import { handleTrackers } from "./trackers";
 import { getPathSegments, parseQueryParams, setCorsHeaders } from "./utils";
 import { handleWebhooks } from "./webhooks";
 import { handleWorkflows } from "./workflows";
+
+// Last-line-of-defense: never let a single bad request (e.g. a SQLITE_BUSY
+// thrown out of a transaction callback) kill the API process. Log and keep going.
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] uncaughtException:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] unhandledRejection:", reason);
+});
 
 const port = parseInt(process.env.PORT || process.argv[2] || "3013", 10);
 const apiKey = process.env.API_KEY || "";
@@ -107,19 +121,23 @@ const httpServer = createHttpServer(async (req, res) => {
     () => handleTrackers(req, res, pathSegments),
     () => handleWebhooks(req, res, pathSegments),
     () => handleAgentsRest(req, res, pathSegments, queryParams, myAgentId),
+    () => handleBudgets(req, res, pathSegments, queryParams, myAgentId),
     () => handleContext(req, res, pathSegments, queryParams, myAgentId),
     () => handleTasks(req, res, pathSegments, queryParams, myAgentId),
     () => handleStats(req, res, pathSegments, queryParams),
     () => handleActiveSessions(req, res, pathSegments, queryParams, myAgentId),
+    () => handlePricing(req, res, pathSegments, queryParams, myAgentId),
     () => handleSchedules(req, res, pathSegments, queryParams, myAgentId),
     () => handleWorkflows(req, res, pathSegments, queryParams, myAgentId),
     () => handleApprovalRequests(req, res, pathSegments, queryParams),
     () => handleConfig(req, res, pathSegments, queryParams),
+    () => handleIntegrations(req, res, pathSegments),
     () => handlePromptTemplates(req, res, pathSegments, queryParams),
     () => handleDbQuery(req, res, pathSegments, queryParams),
     () => handleRepos(req, res, pathSegments, queryParams),
     () => handleSkills(req, res, pathSegments, queryParams, myAgentId),
     () => handleMcpServers(req, res, pathSegments, queryParams),
+    () => handleMcpOAuth(req, res, pathSegments, queryParams),
     () => handleMemory(req, res, pathSegments, myAgentId),
     () => handleApiKeys(req, res, pathSegments, queryParams),
     () => handleHeartbeat(req, res, pathSegments),
@@ -171,6 +189,9 @@ async function shutdown() {
     const { stopOAuthKeepalive } = await import("../oauth/keepalive");
     stopOAuthKeepalive();
   }
+
+  // Stop MCP OAuth pending-session garbage collector
+  stopMcpOAuthPendingGc();
 
   // Close all active transports (SSE connections, etc.)
   for (const [id, transport] of Object.entries(transports)) {
@@ -231,13 +252,17 @@ httpServer
       );
     }
 
-    // Initialize anonymized telemetry (opt-out via ANONYMIZED_TELEMETRY=false)
+    // Initialize anonymized telemetry (opt-out via ANONYMIZED_TELEMETRY=false).
+    // The api-server is the sole authority for the install identity — pass
+    // generateIfMissing so it mints a new install ID on first boot. Workers
+    // must NOT mint (see src/commands/runner.ts).
     await initTelemetry(
       "api-server",
       (key) => getSwarmConfigs({ scope: "global", key })?.[0]?.value,
       (key, value) => {
         upsertSwarmConfig({ scope: "global", key, value });
       },
+      { generateIfMissing: true },
     );
     telemetry.server("started", { port });
 
@@ -255,6 +280,9 @@ httpServer
 
     // Initialize Linear tracker integration (if configured)
     initLinear();
+
+    // Initialize Jira tracker integration (if configured)
+    initJira();
 
     // Initialize workflow engine (trigger subscriptions + resume listener)
     initWorkflows();
@@ -281,6 +309,9 @@ httpServer
       const { startOAuthKeepalive } = await import("../oauth/keepalive");
       startOAuthKeepalive();
     }
+
+    // Start MCP OAuth pending-session garbage collector (5-min tick)
+    startMcpOAuthPendingGc();
   })
   .on("error", (err) => {
     console.error("HTTP Server Error:", err);

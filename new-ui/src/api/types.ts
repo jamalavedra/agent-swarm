@@ -78,7 +78,16 @@ export interface AgentTask {
   credentialKeySuffix?: string;
   credentialKeyType?: string;
   swarmVersion?: string;
+  provider?: ProviderName;
+  providerMeta?: DevinProviderMeta | Record<string, never>;
 }
+
+export type ProviderName = "claude" | "codex" | "pi" | "devin";
+export type DevinProviderMeta = {
+  sessionUrl: string;
+  maxAcuLimit?: number;
+  acuCostUsd?: number;
+};
 
 export interface AgentWithTasks extends Agent {
   tasks: AgentTask[];
@@ -676,6 +685,7 @@ export interface AgentSkillsResponse {
 // MCP Servers
 export type McpServerTransport = "stdio" | "http" | "sse";
 export type McpServerScope = "global" | "swarm" | "agent";
+export type McpAuthMethod = "static" | "oauth" | "auto";
 
 export interface McpServer {
   id: string;
@@ -690,10 +700,50 @@ export interface McpServer {
   headers: string | null;
   envConfigKeys: string | null;
   headerConfigKeys: string | null;
+  authMethod: McpAuthMethod;
   isEnabled: boolean;
   version: number;
   createdAt: string;
   lastUpdatedAt: string;
+}
+
+export type McpOAuthStatus = "connected" | "expired" | "error" | "revoked";
+export type McpOAuthClientSource = "dcr" | "manual" | "preregistered";
+
+export interface McpOAuthTokenStatus {
+  id: string;
+  status: McpOAuthStatus;
+  tokenType: string;
+  expiresAt: string | null;
+  scope: string | null;
+  lastErrorMessage: string | null;
+  lastRefreshedAt: string | null;
+  authorizationServerIssuer: string;
+  resourceUrl: string;
+  clientSource: McpOAuthClientSource;
+  hasRefreshToken: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface McpOAuthStatusResponse {
+  mcpServerId: string;
+  authMethod: McpAuthMethod;
+  connected: boolean;
+  token: McpOAuthTokenStatus | null;
+}
+
+export interface McpOAuthMetadataResponse {
+  requiresOAuth: boolean;
+  resourceUrl?: string;
+  authorizationServerIssuer?: string;
+  authorizeUrl?: string;
+  tokenUrl?: string;
+  revocationUrl?: string | null;
+  registrationEndpoint?: string | null;
+  scopes?: string[];
+  dcrSupported?: boolean;
+  bearerMethodsSupported?: string[] | null;
 }
 
 export interface McpServerWithInstallInfo extends McpServer {
@@ -797,4 +847,55 @@ export interface DbQueryResponse {
   rows: unknown[][];
   elapsed: number;
   total: number;
+}
+
+// Budgets & Pricing — see src/types.ts in the API repo for the source of truth.
+export type BudgetScope = "global" | "agent";
+
+export interface Budget {
+  scope: BudgetScope;
+  scopeId: string;
+  dailyBudgetUsd: number;
+  createdAt: number;
+  lastUpdatedAt: number;
+}
+
+export interface BudgetsResponse {
+  budgets: Budget[];
+}
+
+export type BudgetRefusalCause = "agent" | "global";
+
+export interface BudgetRefusalNotification {
+  taskId: string;
+  date: string;
+  agentId: string;
+  cause: BudgetRefusalCause;
+  agentSpendUsd?: number | null;
+  agentBudgetUsd?: number | null;
+  globalSpendUsd?: number | null;
+  globalBudgetUsd?: number | null;
+  followUpTaskId?: string | null;
+  createdAt: number;
+}
+
+export interface BudgetRefusalsResponse {
+  refusals: BudgetRefusalNotification[];
+}
+
+export type PricingProvider = "claude" | "codex" | "pi";
+export type PricingTokenClass = "input" | "cached_input" | "output";
+
+export interface PricingRow {
+  provider: PricingProvider;
+  model: string;
+  tokenClass: PricingTokenClass;
+  effectiveFrom: number;
+  pricePerMillionUsd: number;
+  createdAt: number;
+  lastUpdatedAt: number;
+}
+
+export interface PricingResponse {
+  rows: PricingRow[];
 }

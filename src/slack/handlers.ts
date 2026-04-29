@@ -10,10 +10,12 @@ import {
   resolveUser,
 } from "../be/db";
 import { resolveTemplate } from "../prompts/resolver";
+import { slackContextKey } from "../tasks/context-key";
+import { createTaskWithSiblingAwareness } from "../tasks/sibling-awareness";
 import { workflowEventBus } from "../workflows/event-bus";
 import { buildTreeBlocks, type TreeNode } from "./blocks";
 import type { SlackFile } from "./files";
-import { extractTaskFromMessage, routeMessage } from "./router";
+import { extractTaskFromMessage, hasOtherUserMention, routeMessage } from "./router";
 // Side-effect import: registers all Slack event templates in the in-memory registry
 import "./templates";
 import { bufferThreadMessage, getBufferMessageCount, instantFlush } from "./thread-buffer";
@@ -162,6 +164,12 @@ interface MessageEvent {
  * - `bot_id` present (newer Slack API, may lack subtype)
  * - `user` matches the bot's own user ID (catches edge cases where
  *    messages posted with `username` override lack `bot_id`)
+ *
+ * Note: intentionally does NOT filter on `app_id`/`bot_profile`/`username` —
+ * those signals also appear on human messages sent via Slack apps that proxy
+ * a user (e.g. Claude.ai's Slack integration sends with `app_id` + `bot_profile`
+ * set, but the poster is still a real human). Filtering those drops legitimate
+ * human @mentions of the swarm.
  */
 export function isBotMessage(
   event: { subtype?: string; bot_id?: string; user?: string },
@@ -439,8 +447,17 @@ export function registerMessageHandler(app: App): void {
       }
     }
 
-    // ADDITIVE_SLACK: Buffer non-mention thread messages
+    // ADDITIVE_SLACK: Buffer non-mention thread messages.
+    // Skip if the message @-mentions someone other than our bot (e.g. "@Devin wdyt?"):
+    // that message is directed at a different bot/user and must not be fed to
+    // the swarm as an implicit follow-up.
     if (additiveSlack && !botMentioned && msg.thread_ts && !requireMentionForThreadFollowup) {
+      if (hasOtherUserMention(effectiveText, botUserId)) {
+        console.log(
+          `[Slack] Skipping ADDITIVE buffer in ${msg.channel}/${msg.thread_ts}: message mentions another user`,
+        );
+        return;
+      }
       // Check if this thread has any swarm activity (existing tasks)
       const hasSwarmActivity = getAgentWorkingOnThread(msg.channel, msg.thread_ts) !== null;
 
@@ -523,13 +540,14 @@ export function registerMessageHandler(app: App): void {
       }
 
       const lead = getLeadAgent();
-      createTaskExtended(fullTaskDescription, {
+      createTaskWithSiblingAwareness(fullTaskDescription, {
         agentId: lead?.id,
         source: "slack",
         slackChannelId: msg.channel,
         slackThreadTs: threadTs,
         slackUserId: msg.user,
         requestedByUserId,
+        contextKey: slackContextKey({ channelId: msg.channel, threadTs }),
       });
 
       await say({
@@ -595,7 +613,7 @@ export function registerMessageHandler(app: App): void {
       try {
         const latestTask = getMostRecentTaskInThread(msg.channel, threadTs);
         if (agent.isLead) {
-          const task = createTaskExtended(fullTaskDescription, {
+          const task = createTaskWithSiblingAwareness(fullTaskDescription, {
             agentId: agent.id,
             source: "slack",
             slackChannelId: msg.channel,
@@ -603,19 +621,21 @@ export function registerMessageHandler(app: App): void {
             slackUserId: msg.user,
             parentTaskId: latestTask?.id,
             requestedByUserId,
+            contextKey: slackContextKey({ channelId: msg.channel, threadTs }),
           });
           results.assigned.push({ agentName: agent.name, taskId: task.id });
           continue;
         }
 
         // Workers receive tasks as before
-        const task = createTaskExtended(fullTaskDescription, {
+        const task = createTaskWithSiblingAwareness(fullTaskDescription, {
           agentId: agent.id,
           source: "slack",
           slackChannelId: msg.channel,
           slackThreadTs: threadTs,
           slackUserId: msg.user,
           requestedByUserId,
+          contextKey: slackContextKey({ channelId: msg.channel, threadTs }),
         });
 
         // Check if agent has an in-progress task in this thread (queued follow-up)

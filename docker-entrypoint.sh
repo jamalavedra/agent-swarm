@@ -10,6 +10,63 @@ if [ "$HARNESS_PROVIDER" = "pi" ]; then
         echo "Error: ANTHROPIC_API_KEY, OPENROUTER_API_KEY, or ~/.pi/agent/auth.json required for pi provider"
         exit 1
     fi
+elif [ "$HARNESS_PROVIDER" = "claude-managed" ]; then
+    # Claude Managed Agents — sessions run in Anthropic's cloud sandbox.
+    # No CLI binary needed; the worker process is a thin SSE relay.
+    #
+    # Required env vars (all four):
+    #   ANTHROPIC_API_KEY       — credential for the SDK
+    #   MANAGED_AGENT_ID        — pre-created agent (claude-managed-setup)
+    #   MANAGED_ENVIRONMENT_ID  — pre-created environment (claude-managed-setup)
+    #   MCP_BASE_URL            — public HTTPS URL where Anthropic can reach /mcp
+    #
+    # Restoration order: respect externally-set env vars first; only fall back
+    # to swarm_config when missing. Mirrors the codex_oauth restoration block
+    # above (L13-71) — same fetch endpoint, different keys.
+    if [ -n "$API_KEY" ] && [ -n "$MCP_BASE_URL" ]; then
+        for KEY_TUPLE in "ANTHROPIC_API_KEY:anthropic_api_key" \
+                         "MANAGED_AGENT_ID:managed_agent_id" \
+                         "MANAGED_ENVIRONMENT_ID:managed_environment_id" \
+                         "MANAGED_MCP_VAULT_ID:managed_mcp_vault_id"; do
+            ENV_VAR="${KEY_TUPLE%%:*}"
+            CONFIG_KEY="${KEY_TUPLE##*:}"
+            # Only fill if the env var isn't already set externally.
+            if [ -z "$(eval "echo \$$ENV_VAR")" ]; then
+                VALUE=$(curl -sf -H "Authorization: Bearer ${API_KEY}" \
+                    "${MCP_BASE_URL}/api/config/resolved?includeSecrets=true&key=${CONFIG_KEY}" \
+                    2>/dev/null | jq -r ".configs[] | select(.key == \"${CONFIG_KEY}\") | .value // empty" 2>/dev/null | head -1)
+                if [ -n "$VALUE" ]; then
+                    export "$ENV_VAR=$VALUE"
+                    echo "[entrypoint] Restored claude-managed config from swarm_config: $ENV_VAR"
+                fi
+            fi
+        done
+    fi
+
+    # Validate the four required env vars are present.
+    MISSING=""
+    [ -z "$ANTHROPIC_API_KEY" ] && MISSING="$MISSING ANTHROPIC_API_KEY"
+    [ -z "$MANAGED_AGENT_ID" ] && MISSING="$MISSING MANAGED_AGENT_ID"
+    [ -z "$MANAGED_ENVIRONMENT_ID" ] && MISSING="$MISSING MANAGED_ENVIRONMENT_ID"
+    [ -z "$MCP_BASE_URL" ] && MISSING="$MISSING MCP_BASE_URL"
+    if [ -n "$MISSING" ]; then
+        echo "Error: claude-managed provider requires:$MISSING"
+        echo "Run \`bun run src/cli.tsx claude-managed-setup\` from your laptop to create"
+        echo "the Anthropic-side agent + environment and persist their IDs to swarm_config."
+        echo "MCP_BASE_URL must be a public HTTPS URL (ngrok / Cloudflare Tunnel in dev)."
+        exit 1
+    fi
+elif [ "$HARNESS_PROVIDER" = "devin" ]; then
+    # Devin auth: DEVIN_API_KEY and DEVIN_ORG_ID must exist
+    if [ -z "$DEVIN_API_KEY" ]; then
+        echo "Error: DEVIN_API_KEY is required for Devin provider"
+        exit 1
+    fi
+    if [ -z "$DEVIN_ORG_ID" ]; then
+        echo "Error: DEVIN_ORG_ID is required for Devin provider"
+        exit 1
+    fi
+    echo "Devin API: configured (org: ${DEVIN_ORG_ID})"
 elif [ "$HARNESS_PROVIDER" = "codex" ]; then
     WORKER_CODEX_HOME="/home/worker/.codex"
 
@@ -92,6 +149,11 @@ if [ "$HARNESS_PROVIDER" = "codex" ]; then
         exit 1
     fi
     echo "Codex CLI: $(command -v "$CODEX_BIN")"
+elif [ "$HARNESS_PROVIDER" = "claude-managed" ]; then
+    # Cloud sandbox — no local CLI binary, no skills FS, no MCP discovery.
+    echo "Claude Managed Agents: no local CLI required (sessions run in Anthropic cloud)"
+elif [ "$HARNESS_PROVIDER" = "devin" ]; then
+    echo "Devin: cloud API (no local binary required)"
 elif [ "$HARNESS_PROVIDER" != "pi" ]; then
     CLAUDE_BIN="${CLAUDE_BINARY:-claude}"
     if ! command -v "$CLAUDE_BIN" > /dev/null 2>&1; then
@@ -340,7 +402,12 @@ if [ -n "$AGENT_FS_API_URL" ] && [ -n "$AGENT_ID" ]; then
 fi
 # ---- End agent-fs registration ----
 
-# Create .mcp.json in /workspace (project-level config)
+# Create .mcp.json in /workspace (project-level config).
+# Skip for claude-managed: managed agents read MCP servers from the Agent
+# definition (set by claude-managed-setup), not from a local filesystem file.
+if [ "$HARNESS_PROVIDER" = "claude-managed" ]; then
+    echo "Skipping local .mcp.json (claude-managed reads MCP from agent definition)"
+else
 echo "Creating MCP config in /workspace..."
 # Build base MCP config with jq
 MCP_JSON=$(jq -n \
@@ -361,34 +428,27 @@ if [ -n "$AGENTMAIL_API_KEY" ]; then
 fi
 
 # === Installed MCP servers (from API) ===
+# NOTE (issue #369): we intentionally do NOT bake resolved credentials (OAuth Bearers,
+# env secrets, static headers) into /workspace/.mcp.json. The per-session dispatcher
+# in src/providers/claude-adapter.ts re-fetches the installed server list on every
+# session start and injects fresh credentials into a per-session MCP config via
+# --mcp-config + --strict-mcp-config. Baking credentials here made OAuth re-auth,
+# secret rotation, and install/uninstall silently fail to propagate until the
+# worker was restarted. We still fetch the list at startup so we can pre-register
+# permission patterns (mcp__<name>__*) in settings.json — that is not secret.
 MCP_SERVERS_RESPONSE=""
 SERVER_COUNT=0
 if [ -n "$AGENT_ID" ] && [ -n "$API_KEY" ]; then
-  echo "Fetching installed MCP servers..."
+  echo "Fetching installed MCP server names (for permission patterns only)..."
+  # resolveSecrets=false: we only need names at entrypoint time; credentials are
+  # resolved per-session by the dispatcher.
   MCP_SERVERS_RESPONSE=$(curl -sf -H "Authorization: Bearer $API_KEY" \
-    "${MCP_URL}/api/agents/${AGENT_ID}/mcp-servers?resolveSecrets=true" 2>/dev/null) || true
+    "${MCP_URL}/api/agents/${AGENT_ID}/mcp-servers?resolveSecrets=false" 2>/dev/null) || true
 
   if [ -n "$MCP_SERVERS_RESPONSE" ]; then
     SERVER_COUNT=$(echo "$MCP_SERVERS_RESPONSE" | jq '.servers | length' 2>/dev/null || echo "0")
     if [ "$SERVER_COUNT" -gt 0 ]; then
-      echo "Merging $SERVER_COUNT installed MCP server(s) into .mcp.json"
-      MCP_JSON=$(echo "$MCP_SERVERS_RESPONSE" | jq --argjson base "$MCP_JSON" '
-        reduce .servers[] as $srv ($base;
-          if $srv.transport == "stdio" then
-            .mcpServers[$srv.name] = {
-              command: $srv.command,
-              args: (if $srv.args then ($srv.args | fromjson) else [] end),
-              env: ($srv.resolvedEnv // {})
-            }
-          elif ($srv.transport == "http" or $srv.transport == "sse") then
-            .mcpServers[$srv.name] = {
-              type: $srv.transport,
-              url: $srv.url,
-              headers: ((if $srv.headers then ($srv.headers | fromjson) else {} end) * ($srv.resolvedHeaders // {}))
-            }
-          else . end
-        )
-      ')
+      echo "Found $SERVER_COUNT installed MCP server(s) — will be injected per-session, not baked into .mcp.json"
     fi
   fi
 fi
@@ -410,6 +470,7 @@ if [ -n "$MCP_SERVERS_RESPONSE" ] && [ "$SERVER_COUNT" -gt 0 ]; then
     echo "$UPDATED_SETTINGS" > "$SETTINGS_FILE"
   fi
 fi
+fi  # /HARNESS_PROVIDER != claude-managed (MCP discovery skip)
 
 # Configure GitHub authentication if token is provided
 echo ""
@@ -762,7 +823,11 @@ echo ""
 
 # --- Skill sync ---
 echo "=== Skill Sync ==="
-if [ -n "$AGENT_ID" ] && [ -n "$API_KEY" ] && [ -n "$MCP_BASE_URL" ]; then
+if [ "$HARNESS_PROVIDER" = "claude-managed" ]; then
+    # Managed agents read skills from the Agent definition (uploaded via API
+    # by claude-managed-setup), NOT from the local filesystem. Skip the sync.
+    echo "[entrypoint] Skipping skill sync (claude-managed reads skills from agent definition)"
+elif [ -n "$AGENT_ID" ] && [ -n "$API_KEY" ] && [ -n "$MCP_BASE_URL" ]; then
     echo "[entrypoint] Syncing skills to filesystem..."
     SKILLS_RESPONSE=$(curl -s -f -H "Authorization: Bearer ${API_KEY}" \
         -H "X-Agent-ID: ${AGENT_ID}" \

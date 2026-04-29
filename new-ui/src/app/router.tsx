@@ -12,7 +12,10 @@ const ServicesPage = lazy(() => import("@/pages/services/page"));
 const SchedulesPage = lazy(() => import("@/pages/schedules/page"));
 const ScheduleDetailPage = lazy(() => import("@/pages/schedules/[id]/page"));
 const UsagePage = lazy(() => import("@/pages/usage/page"));
+const BudgetsPage = lazy(() => import("@/pages/budgets/page"));
 const ConfigPage = lazy(() => import("@/pages/config/page"));
+const IntegrationsPage = lazy(() => import("@/pages/integrations/page"));
+const IntegrationDetailPage = lazy(() => import("@/pages/integrations/[id]/page"));
 const ReposPage = lazy(() => import("@/pages/repos/page"));
 const RepoDetailPage = lazy(() => import("@/pages/repos/[id]/page"));
 const WorkflowsPage = lazy(() => import("@/pages/workflows/page"));
@@ -54,7 +57,10 @@ export const router = createBrowserRouter([
       { path: "approval-requests", element: <ApprovalRequestsPage /> },
       { path: "approval-requests/:id", element: <ApprovalRequestDetailPage /> },
       { path: "usage", element: <UsagePage /> },
+      { path: "budgets", element: <BudgetsPage /> },
       { path: "config", element: <ConfigPage /> },
+      { path: "integrations", element: <IntegrationsPage /> },
+      { path: "integrations/:id", element: <IntegrationDetailPage /> },
       { path: "templates", element: <TemplatesPage /> },
       { path: "templates/:id", element: <TemplateDetailPage /> },
       { path: "templates/:id/history/:version", element: <TemplateVersionDetailPage /> },
