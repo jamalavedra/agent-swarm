@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Agent Swarm API",
-    "version": "1.74.1",
+    "version": "1.75.0",
     "description": "Multi-agent orchestration API for Claude Code, Codex, and Gemini CLI. Enables task distribution, agent communication, and service discovery.\n\nMCP tools are documented separately in [MCP.md](./MCP.md)."
   },
   "servers": [
@@ -617,6 +617,126 @@
           },
           "404": {
             "description": "Agent not found"
+          }
+        }
+      }
+    },
+    "/api/agents/{id}/credential-status": {
+      "put": {
+        "summary": "Worker self-report of credential readiness (Phase 3 boot loop)",
+        "tags": [
+          "Agents"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ready": {
+                    "type": "boolean"
+                  },
+                  "missing": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "ready"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "State updated; returns the agent row."
+          },
+          "404": {
+            "description": "Agent not found"
+          }
+        }
+      },
+      "get": {
+        "summary": "Single-agent credential-status snapshot for the dashboard",
+        "tags": [
+          "Agents"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Credential status payload"
+          },
+          "404": {
+            "description": "Agent not found"
+          }
+        }
+      }
+    },
+    "/api/agents/credential-status": {
+      "get": {
+        "summary": "Bulk credential-status across all agents (powers the dashboard)",
+        "tags": [
+          "Agents"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "idle",
+                "busy",
+                "offline",
+                "waiting_for_credentials"
+              ]
+            },
+            "required": false,
+            "name": "status",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of {agentId, status, missing[], lastCheckedAt}"
           }
         }
       }
@@ -3027,6 +3147,167 @@
           },
           "404": {
             "description": "Memory not found"
+          }
+        }
+      }
+    },
+    "/api/memory/rate": {
+      "post": {
+        "summary": "Submit RatingEvents to update memory usefulness posteriors",
+        "tags": [
+          "Memory"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "events": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "memoryId": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "signal": {
+                          "type": "number",
+                          "minimum": -1,
+                          "maximum": 1
+                        },
+                        "weight": {
+                          "type": "number",
+                          "minimum": 0,
+                          "maximum": 1
+                        },
+                        "source": {
+                          "type": "string",
+                          "enum": [
+                            "llm",
+                            "explicit-self"
+                          ]
+                        },
+                        "reasoning": {
+                          "type": "string",
+                          "maxLength": 500
+                        },
+                        "taskId": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "referencesSource": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 512,
+                          "description": "Optional external source ID this memory references. Free-form string, convention \"<source>:<identifier>\" (e.g. \"github:owner/repo#N\", \"linear:KEY-N\", \"customer:<slug>\", \"slack:<channel>:<ts>\", \"agentmail:<thread-id>\"). Pick any prefix that fits — no closed enum. When present, an edge from this memory to the external source is created/updated."
+                        }
+                      },
+                      "required": [
+                        "memoryId",
+                        "signal",
+                        "weight",
+                        "source"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 50
+                  }
+                },
+                "required": [
+                  "events"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ratings applied; per-event rejections returned in body"
+          },
+          "400": {
+            "description": "Validation error or explicit-self R6 spam-guard rejection"
+          },
+          "409": {
+            "description": "Duplicate explicit-self rating for (taskId, memoryId)"
+          }
+        }
+      }
+    },
+    "/api/memory/retrievals": {
+      "get": {
+        "summary": "List memories retrieved for a task or session (rater input)",
+        "tags": [
+          "Memory"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": false,
+            "name": "taskId",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "sessionId",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Retrieval rows joined with agent_memory"
+          },
+          "400": {
+            "description": "Missing taskId/sessionId or X-Agent-ID"
+          }
+        }
+      }
+    },
+    "/api/memory/edges": {
+      "get": {
+        "summary": "List references-source edges for a memory",
+        "tags": [
+          "Memory"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "memoryId",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Edges with computed usefulness scores"
+          },
+          "400": {
+            "description": "Missing memoryId or X-Agent-ID"
           }
         }
       }
@@ -7343,6 +7624,33 @@
         }
       }
     },
+    "/api/trackers/jira/refresh": {
+      "post": {
+        "summary": "Force a Jira OAuth token refresh and return the updated status payload. Useful when an agent observes an expired token via tracker-status / db-query and wants to recover without restarting the server or re-running 3LO.",
+        "tags": [
+          "Trackers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Token refreshed; returns same shape as /status"
+          },
+          "409": {
+            "description": "Jira not connected (no refresh token stored)"
+          },
+          "500": {
+            "description": "Refresh failed (e.g. revoked grant, network error)"
+          },
+          "503": {
+            "description": "Jira integration not configured"
+          }
+        }
+      }
+    },
     "/api/trackers/jira/webhook/{token}": {
       "post": {
         "summary": "Receive Jira webhook events (URL-token authenticated). Phase 2 stub — Phase 3 fills in dispatch.",
@@ -7547,6 +7855,33 @@
         }
       }
     },
+    "/api/trackers/linear/refresh": {
+      "post": {
+        "summary": "Force a Linear OAuth token refresh and return the updated status payload. Useful when an agent observes an expired token and wants to recover without restarting the server or re-running OAuth.",
+        "tags": [
+          "Trackers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Token refreshed; returns same shape as /status"
+          },
+          "409": {
+            "description": "Linear not connected (no refresh token stored)"
+          },
+          "500": {
+            "description": "Refresh failed"
+          },
+          "503": {
+            "description": "Linear integration not configured"
+          }
+        }
+      }
+    },
     "/api/trackers/linear/webhook": {
       "post": {
         "summary": "Handle Linear webhook events (signature-verified)",
@@ -7640,6 +7975,108 @@
           },
           "503": {
             "description": "AgentMail integration not configured"
+          }
+        }
+      }
+    },
+    "/api/workflow-runs/{runId}/events": {
+      "post": {
+        "summary": "Fire a run-scoped event signal",
+        "description": "Emits an event onto the workflow event bus with `_runId` injected. Used by wait nodes in `event` mode with `scope: 'run'`. The body's `name` is the bus event name; `payload` is forwarded as-is plus `_runId`.",
+        "tags": [
+          "WorkflowEvents"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": true,
+            "name": "runId",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "payload": {
+                    "type": "object",
+                    "additionalProperties": {}
+                  }
+                },
+                "required": [
+                  "name"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Event emitted"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "404": {
+            "description": "Workflow run not found"
+          }
+        }
+      }
+    },
+    "/api/workflow-events": {
+      "post": {
+        "summary": "Fire a global workflow event signal",
+        "description": "Emits an event onto the workflow event bus. Wait-states with `scope: 'global'` may match. Run-scoped waits will NOT match this broadcast unless the payload carries a matching `workflowRunId`.",
+        "tags": [
+          "WorkflowEvents"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "payload": {
+                    "type": "object",
+                    "additionalProperties": {}
+                  }
+                },
+                "required": [
+                  "name"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Event emitted"
+          },
+          "400": {
+            "description": "Validation error"
           }
         }
       }
@@ -8651,6 +9088,14 @@
                       "continue"
                     ],
                     "description": "Update the definition-level onNodeFailure behavior"
+                  },
+                  "triggerSchema": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "additionalProperties": {},
+                    "description": "Optional JSON-Schema describing the expected trigger payload shape. Pass an object to set/replace; pass null to clear; omit to leave unchanged. Validator subset: type, required, properties, enum, const, items. Other JSON-Schema keywords are silently ignored."
                   }
                 }
               }
@@ -8910,6 +9355,40 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Workflow not found"
+          }
+        }
+      }
+    },
+    "/api/workflows/{id}/trigger/validate": {
+      "post": {
+        "summary": "Validate a payload against the workflow's triggerSchema (no run)",
+        "tags": [
+          "Workflows"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payload matches the workflow's triggerSchema (or workflow has none)"
+          },
+          "400": {
+            "description": "Payload failed validation; body matches the TriggerSchemaError contract"
           },
           "404": {
             "description": "Workflow not found"

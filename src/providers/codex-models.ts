@@ -11,7 +11,12 @@
  * pulling in the SDK.
  */
 
-/** List of Codex models that can be selected via `ThreadOptions.model`. */
+/**
+ * List of Codex models we know about (drives the onboarding model selector,
+ * the pricing table, and the context-window map). The resolver does NOT
+ * constrain inputs to this list — it passes unknown strings through to the
+ * SDK, so new OpenAI models work without a code change.
+ */
 export const CODEX_MODELS = [
   "gpt-5.4", // default — mainline reasoning model w/ frontier coding
   "gpt-5.4-mini", // faster/cheaper
@@ -29,25 +34,24 @@ export const CODEX_DEFAULT_MODEL: CodexModel = "gpt-5.4";
  * to Codex equivalents. Mirrors `pi-mono-adapter.ts:71-75` shortnames map so
  * a task authored for Claude works unchanged when pointed at a Codex worker.
  */
-const SHORTNAME_TO_CODEX: Record<string, CodexModel> = {
+const CLAUDE_SHORTNAMES: Record<string, CodexModel> = {
   opus: "gpt-5.4",
-  sonnet: "gpt-5.4-mini",
+  sonnet: "gpt-5.4",
   haiku: "gpt-5.4-mini",
-  // explicit passthrough entries so MODEL_OVERRIDE="gpt-5.4" round-trips
-  "gpt-5.4": "gpt-5.4",
-  "gpt-5.4-mini": "gpt-5.4-mini",
-  "gpt-5.3-codex": "gpt-5.3-codex",
-  "gpt-5.2-codex": "gpt-5.2-codex",
 };
 
 /**
- * Resolve an arbitrary model string (shortname or full Codex model id) into
- * a supported `CodexModel`. Unknown values fall back to `CODEX_DEFAULT_MODEL`.
+ * Resolve a model string (shortname or full Codex model id) into the literal
+ * id we hand to the Codex SDK. Behavior:
+ *   - empty/undefined → `CODEX_DEFAULT_MODEL`
+ *   - claude shortname (opus/sonnet/haiku) → mapped Codex id
+ *   - anything else → passthrough (lowercased), so new OpenAI models work
+ *     without a code change. The SDK is the source of truth for validity.
  */
-export function resolveCodexModel(modelStr: string | undefined): CodexModel {
+export function resolveCodexModel(modelStr: string | undefined): string {
   if (!modelStr) return CODEX_DEFAULT_MODEL;
   const normalized = modelStr.toLowerCase();
-  return SHORTNAME_TO_CODEX[normalized] ?? CODEX_DEFAULT_MODEL;
+  return CLAUDE_SHORTNAMES[normalized] ?? normalized;
 }
 
 /**
@@ -65,9 +69,13 @@ export const CODEX_MODEL_CONTEXT_WINDOWS: Record<CodexModel, number> = {
   "gpt-5.2-codex": 200_000,
 };
 
-/** Return the context window in tokens for a given Codex model. */
-export function getCodexContextWindow(model: CodexModel): number {
-  return CODEX_MODEL_CONTEXT_WINDOWS[model] ?? 200_000;
+/**
+ * Return the context window in tokens for a given Codex model. Unknown models
+ * (passthrough strings) get the 200k default — keeps `context_usage` finite
+ * even on a model id we haven't catalogued yet.
+ */
+export function getCodexContextWindow(model: string): number {
+  return CODEX_MODEL_CONTEXT_WINDOWS[model as CodexModel] ?? 200_000;
 }
 
 /**
@@ -126,12 +134,12 @@ export const CODEX_MODEL_PRICING: Record<CodexModel, CodexModelPricing> = {
  * inflate cost on a typo.
  */
 export function computeCodexCostUsd(
-  model: CodexModel,
+  model: string,
   inputTokens: number,
   cachedInputTokens: number,
   outputTokens: number,
 ): number {
-  const pricing = CODEX_MODEL_PRICING[model];
+  const pricing = CODEX_MODEL_PRICING[model as CodexModel];
   if (!pricing) return 0;
   const uncachedInput = Math.max(0, inputTokens - cachedInputTokens);
   const inputCost = (uncachedInput / 1_000_000) * pricing.inputPerMillion;

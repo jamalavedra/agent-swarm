@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.75.0] - 2026-05-06
+
+### Added
+- **Memory rater v1.5 — completion (steps 4–7)**:
+  - **Step 4 (#429)** — `LlmRater` (`src/be/memory/raters/llm.ts`) that piggybacks on the existing Stop-hook session-summary Haiku call. When `MEMORY_LLM_RATER_ENABLED=true` the summarizer prompt is augmented to also rate retrieved memories `useful: true | false`; ratings are POSTed to `/api/memory/rate` with `source: "llm"`. Zero extra LLM round-trips on the worker hot path
+  - **Step 5 (#428)** — `memory_rate` MCP tool. Agents can record explicit usefulness ratings on a retrieved memory in their current task (`useful`, optional short `note`, optional `referencesSource` external pointer). Spam-guarded by the `memory_retrieval` row produced when the memory was surfaced; out-of-task calls are rejected. Wired through the worker `ExplicitSelfRatingRater` and surfaced in the runner-injected memory recall prompt (`src/prompts/memories.ts`)
+  - **Step 6 (#436)** — `referencesSource` edges. The optional free-form `<source>:<identifier>` field on `memory_rate` (e.g. `github:owner/repo#N`, `linear:KEY-N`, `customer:<slug>`, `slack:<channel>:<ts>`) creates/updates an edge from the rated memory to the external artifact it cites. Sanitized for NUL bytes and control characters
+  - **Step 7 (#440)** — v1.5 capstone: docs + business-use flow instrumentation + cross-cutting end-to-end tests covering the implicit-citation, llm, and explicit-self rater paths. `MCP.md` regenerated to surface the new `memory_rate` tool entry
+- **Worker credential safe-loop** (#441) — workers no longer crash-loop when harness credentials are missing. The TypeScript-level `awaitCredentials` (`src/commands/credential-wait.ts`) replaces the bash-level fail-fast in `docker-entrypoint.sh`. The container always boots, calls `join-swarm`, and parks in a `waiting_for_credentials` agent status while polling `swarm_config` for the missing variables. Status is reported via `PUT /api/agents/{id}/credential-status`; the dispatcher's `getIdleWorkersWithCapacity` predicate already excludes non-`idle` workers, so blocked agents are routed around without any extra condition. Self-heals as soon as the credential lands — no container restart required. The single hard exit retained is `API_KEY` (without it the worker can't talk to the API at all)
+
+### Changed
+- **`new-ui` directory renamed to `ui`** (a2e86719) — README, configs, and CI workflows updated to reference the canonical `ui/` path. Standalone landing site removed (60bb0ea8) in favor of the rewritten `agent-swarm.dev` (#438)
+- **`new-ui` design system migration** (#439) — tokens, primitives, and composition layer for the dashboard. Lays groundwork for shared-component reuse across the dashboard, templates UI, and docs site
+- **Landing v2 — Coordination Intelligence rewrite of `agent-swarm.dev`** (#438)
+
+### Fixed
+- **Thin meta descriptions across landing & docs pages** (#433) — automated SEO pass expanded short/missing meta descriptions to improve search snippets
+
+## [1.74.4] - 2026-05-06
+
+### Added
+- **Workflow `wait` executor** (#420) — pause a run for a fixed duration (`mode: "time"`, `durationMs` in 1ms..1y) or until a `workflowEventBus` event satisfies an optional payload filter (`mode: "event"`, `eventName` + `filter` + `scope: run|global` + optional `timeoutMs` routing to the `timeout` port). Time mode and event-mode timeouts wake via the `wait-poller`; event matches resume via the workflow event bus. Brings the built-in executor count to 10
+- **Workflow `triggerSchema` end-to-end authoring** (#423) — workflows can attach an optional JSON Schema to validate `triggerData` across every entry path (manual `/trigger`, webhooks, schedules, `trigger-workflow` MCP). Mismatched payloads are rejected with HTTP 400 (or MCP error) **before** a run is created. New / updated MCP tools: `create-workflow`, `update-workflow`, `patch-workflow` (and `trigger-workflow`'s validator surface). HTTP `POST` / `PUT` / `PATCH /api/workflows/{id}` accept `triggerSchema` (and `null` on `PUT`/`PATCH` to clear). Failure responses echo the active schema so callers can self-correct. Validator subset is deliberate: `type`, `required`, `properties`, `enum`, `const`, `items`; other keywords (`oneOf`, `anyOf`, `$ref`, `pattern`, `format`, …) are silently ignored. Frontend editor + tester in `new-ui/`
+- **Linear: workflow-state gate + `swarm-ready` label override** (#395) — Linear webhooks now only trigger swarm tasks for issues whose `WorkflowState.type` is in the configured allowlist (default: `unstarted, started, completed, canceled` — i.e. everything except `triage` and `backlog`). A configurable label (default `swarm-ready`, override via `LINEAR_SWARM_READY_LABEL`) bypasses the gate so users can pre-stage backlog issues. Skipped assignments leave a comment on the AgentSession explaining how to retry
+- **Memory rater foundations (steps 1–3 of v1.5)** (#425, #426, #427):
+  - Step 1 (#425): `memory_rating` schema, `MemoryRater` spine, and a `NoopRater` reranker as a typed seam for future raters
+  - Step 2 (#426): retrieval bridge (`memory_retrieval` rows) + `ImplicitCitationRater` so citations in agent output map back to the memories that were retrieved into the prompt
+  - Step 3 (#427): `POST /api/memory/rate` (Zod-validated `RatingEvent[]`, max 50, source ∈ `llm, explicit-self`, R6 spam-guard requires a matching `memory_retrieval` row for `explicit-self`, 409 on partial-unique-index dup) and `GET /api/memory/retrievals` (joins `memory_retrieval × agent_memory`, scoped by `X-Agent-ID`, ORDER BY `retrievedAt` DESC, LIMIT 50, 500-char content snippet). OpenAPI + `docs-site/content/docs/api-reference/memory.mdx` regenerated
+
+### Changed
+- **Workflows concept doc + runbook** updated for `wait` (10 executors) and `triggerSchema` (`docs-site/content/docs/(documentation)/concepts/workflows.mdx`)
+- **`.mcp.json` precedence fix for multi-root workspaces** (a2963f2b) — multi-root MCP config resolution now picks the right manifest
+
+### Fixed
+- **Codex provider: prefer OAuth over API key** (`v1.74.4`, c92df43b) — Codex harness now selects the ChatGPT OAuth credential when both an OAuth token and an API key are present, matching the documented precedence
+- **Trackers: ensure tokens are refreshed** (4dcdfd96) — `tracker-status` MCP tool and surrounding integration paths now refresh tracker OAuth tokens before issuing API calls instead of failing on stale tokens
+
 ## [1.74.1] - 2026-05-05
 
 ### Changed

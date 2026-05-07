@@ -58,6 +58,9 @@ import type {
   User,
   VersionableField,
   VersionMeta,
+  WaitMode,
+  WaitStateRow,
+  WaitStateStatus,
   Workflow,
   WorkflowDefinition,
   WorkflowRun,
@@ -552,6 +555,8 @@ type AgentRow = {
   provider: string | null;
   createdAt: string;
   lastUpdatedAt: string;
+  /** JSON array of env-var names; populated only when status is `waiting_for_credentials`. */
+  credentialMissing: string | null;
 };
 
 function rowToAgent(row: AgentRow): Agent {
@@ -575,6 +580,9 @@ function rowToAgent(row: AgentRow): Agent {
     provider: (row.provider as ProviderName | null) ?? undefined,
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
+    credentialMissing: row.credentialMissing
+      ? (JSON.parse(row.credentialMissing) as string[])
+      : null,
   };
 }
 
@@ -593,8 +601,35 @@ export const agentQueries = {
       "UPDATE agents SET status = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? RETURNING *",
     ),
 
+  updateCredentialState: () =>
+    getDb().prepare<AgentRow, [AgentStatus, string | null, string]>(
+      "UPDATE agents SET status = ?, credentialMissing = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? RETURNING *",
+    ),
+
   delete: () => getDb().prepare<null, [string]>("DELETE FROM agents WHERE id = ?"),
 };
+
+/**
+ * Phase 3 of the worker credential safe-loop plan.
+ *
+ * `ready=true` clears the waiting state — the agent transitions to `idle`
+ * and the dispatcher will start handing it tasks again.
+ *
+ * `ready=false` parks the agent on `waiting_for_credentials` with the env-var
+ * names it's blocked on. The capacity dispatch query already filters
+ * `status === 'idle'` so the new value is implicitly excluded with no other
+ * code change.
+ */
+export function updateAgentCredentialState(
+  agentId: string,
+  ready: boolean,
+  missing: string[] | null,
+): Agent | null {
+  const status: AgentStatus = ready ? "idle" : "waiting_for_credentials";
+  const missingJson = ready ? null : missing && missing.length > 0 ? JSON.stringify(missing) : null;
+  const row = agentQueries.updateCredentialState().get(status, missingJson, agentId);
+  return row ? rowToAgent(row) : null;
+}
 
 export function createAgent(
   agent: Omit<Agent, "id" | "createdAt" | "lastUpdatedAt"> & { id?: string },
@@ -771,6 +806,10 @@ export function getRemainingCapacity(agentId: string): number {
 export function updateAgentStatusFromCapacity(agentId: string): void {
   const agent = getAgentById(agentId);
   if (!agent || agent.status === "offline") return;
+  // `waiting_for_credentials` is owned by the worker's credential-wait
+  // tick — task-completion shouldn't accidentally promote a blocked agent
+  // back to idle.
+  if (agent.status === "waiting_for_credentials") return;
 
   const activeCount = getActiveTaskCount(agentId);
   const newStatus = activeCount > 0 ? "busy" : "idle";
@@ -6779,6 +6818,281 @@ export function getExpiredPendingApprovals(): ApprovalRequest[] {
     )
     .all();
   return rows.map(rowToApprovalRequest);
+}
+
+// ============================================================================
+// Wait States (workflow `wait` node side table)
+// ============================================================================
+//
+// Mirrors approval-request helpers above. Time-mode rows carry `wakeUpAt`;
+// event-mode rows carry `eventName` + optional `eventFilter` (object or
+// arrow-fn body string) and optional `expiresAt`. `resolveWaitState` is the
+// race-safe transition gate — concurrent callers (poller + bus listener)
+// rely on `WHERE status='pending'` so only the first one wins.
+
+interface WaitStateRowDb {
+  id: string;
+  workflowRunId: string;
+  workflowRunStepId: string;
+  mode: string;
+  wakeUpAt: string | null;
+  eventName: string | null;
+  eventFilter: string | null;
+  expiresAt: string | null;
+  status: string;
+  firedPayload: string | null;
+  resolvedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  eventScope: string;
+}
+
+function rowToWaitState(row: WaitStateRowDb): WaitStateRow {
+  let parsedFilter: WaitStateRow["eventFilter"] = null;
+  if (row.eventFilter !== null) {
+    // eventFilter is stored as JSON: either an object or a JSON-encoded string.
+    try {
+      const decoded = JSON.parse(row.eventFilter);
+      // Accept both shapes — string filter (arrow-fn body) or object filter.
+      if (typeof decoded === "string" || (typeof decoded === "object" && decoded !== null)) {
+        parsedFilter = decoded as WaitStateRow["eventFilter"];
+      }
+    } catch {
+      parsedFilter = null;
+    }
+  }
+  return {
+    id: row.id,
+    workflowRunId: row.workflowRunId,
+    workflowRunStepId: row.workflowRunStepId,
+    mode: row.mode as WaitMode,
+    wakeUpAt: normalizeDate(row.wakeUpAt),
+    eventName: row.eventName,
+    eventFilter: parsedFilter,
+    expiresAt: normalizeDate(row.expiresAt),
+    status: row.status as WaitStateStatus,
+    firedPayload: row.firedPayload ? JSON.parse(row.firedPayload) : null,
+    resolvedAt: normalizeDate(row.resolvedAt),
+    createdAt: normalizeDateRequired(row.createdAt),
+    updatedAt: normalizeDateRequired(row.updatedAt),
+    eventScope: (row.eventScope as "run" | "global") ?? "run",
+  };
+}
+
+export interface CreateWaitStateInput {
+  id: string;
+  workflowRunId: string;
+  workflowRunStepId: string;
+  mode: WaitMode;
+  wakeUpAt?: string | null;
+  eventName?: string | null;
+  eventFilter?: Record<string, unknown> | string | null;
+  expiresAt?: string | null;
+  scope?: "run" | "global";
+}
+
+export function createWaitState(input: CreateWaitStateInput): WaitStateRow {
+  const now = new Date().toISOString();
+  const row = getDb()
+    .prepare<
+      WaitStateRowDb,
+      [
+        string,
+        string,
+        string,
+        string,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+        string,
+        string,
+        string,
+      ]
+    >(
+      `INSERT INTO wait_states
+         (id, workflowRunId, workflowRunStepId, mode, wakeUpAt, eventName, eventFilter, expiresAt, eventScope, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       RETURNING *`,
+    )
+    .get(
+      input.id,
+      input.workflowRunId,
+      input.workflowRunStepId,
+      input.mode,
+      input.wakeUpAt ?? null,
+      input.eventName ?? null,
+      input.eventFilter !== undefined && input.eventFilter !== null
+        ? JSON.stringify(input.eventFilter)
+        : null,
+      input.expiresAt ?? null,
+      input.scope ?? "run",
+      now,
+      now,
+    );
+  return rowToWaitState(row!);
+}
+
+export function getWaitStateById(id: string): WaitStateRow | null {
+  const row = getDb()
+    .prepare<WaitStateRowDb, [string]>("SELECT * FROM wait_states WHERE id = ?")
+    .get(id);
+  return row ? rowToWaitState(row) : null;
+}
+
+/**
+ * Idempotency lookup — mirrors `getApprovalRequestByStepId`. A re-execution of
+ * the same wait node finds its existing row instead of inserting a duplicate.
+ */
+export function getWaitStateByStepId(stepId: string): WaitStateRow | null {
+  const row = getDb()
+    .prepare<WaitStateRowDb, [string]>("SELECT * FROM wait_states WHERE workflowRunStepId = ?")
+    .get(stepId);
+  return row ? rowToWaitState(row) : null;
+}
+
+/**
+ * Scan for waits the poller should resume now:
+ *   - mode='time' with `wakeUpAt <= now`, OR
+ *   - mode='event' with non-null `expiresAt <= now` (timeout branch).
+ */
+export function getDueWaitStates(): WaitStateRow[] {
+  const rows = getDb()
+    .prepare<WaitStateRowDb, []>(
+      `SELECT * FROM wait_states
+       WHERE status = 'pending'
+         AND (
+           (mode = 'time' AND wakeUpAt IS NOT NULL
+              AND wakeUpAt <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+           OR
+           (mode = 'event' AND expiresAt IS NOT NULL
+              AND expiresAt <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         )`,
+    )
+    .all();
+  return rows.map(rowToWaitState);
+}
+
+/**
+ * Distinct `eventName` values across pending event-mode waits. Used at boot
+ * by the wait-bus subscription system to register one listener per event name.
+ */
+export function getPendingEventWaitNames(): string[] {
+  const rows = getDb()
+    .prepare<{ eventName: string }, []>(
+      `SELECT DISTINCT eventName FROM wait_states
+       WHERE status = 'pending' AND eventName IS NOT NULL`,
+    )
+    .all();
+  return rows.map((r) => r.eventName);
+}
+
+/**
+ * Find pending event-mode waits matching `eventName`. Optional `runId` narrows
+ * to a single run for run-scoped signals. The Phase 3 listener applies the
+ * declarative/JS filter on top of this; the DB query is the cheap pre-filter.
+ */
+export function getPendingWaitsByEvent(eventName: string, runId?: string): WaitStateRow[] {
+  if (runId !== undefined) {
+    const rows = getDb()
+      .prepare<WaitStateRowDb, [string, string]>(
+        `SELECT * FROM wait_states
+         WHERE status = 'pending' AND mode = 'event' AND eventName = ? AND workflowRunId = ?`,
+      )
+      .all(eventName, runId);
+    return rows.map(rowToWaitState);
+  }
+  const rows = getDb()
+    .prepare<WaitStateRowDb, [string]>(
+      `SELECT * FROM wait_states
+       WHERE status = 'pending' AND mode = 'event' AND eventName = ?`,
+    )
+    .all(eventName);
+  return rows.map(rowToWaitState);
+}
+
+/**
+ * Atomic state transition: pending → fired|timeout. Returns `{updated: true}`
+ * iff the caller won the race (UPDATE matched a pending row). Concurrent
+ * callers see `{updated: false}` and should bail without further side effects.
+ */
+export function resolveWaitState(
+  id: string,
+  data: { status: Exclude<WaitStateStatus, "pending">; firedPayload?: unknown },
+): { updated: boolean; row: WaitStateRow | null } {
+  const now = new Date().toISOString();
+  const row = getDb()
+    .prepare<WaitStateRowDb, [string, string | null, string, string, string]>(
+      `UPDATE wait_states
+       SET status = ?, firedPayload = ?, resolvedAt = ?, updatedAt = ?
+       WHERE id = ? AND status = 'pending'
+       RETURNING *`,
+    )
+    .get(
+      data.status,
+      data.firedPayload !== undefined ? JSON.stringify(data.firedPayload) : null,
+      now,
+      now,
+      id,
+    );
+  return { updated: row !== null, row: row ? rowToWaitState(row) : null };
+}
+
+export interface StuckWaitRun {
+  runId: string;
+  stepId: string;
+  nodeId: string;
+  workflowId: string;
+  waitId: string;
+  waitMode: string;
+  waitStatus: string;
+  wakeUpAt: string | null;
+  expiresAt: string | null;
+  firedPayload: string | null;
+}
+
+/**
+ * Recovery scan: workflow runs in `waiting` whose wait_state is either
+ *   (a) already non-pending — signal arrived / timeout fired while down and
+ *       the in-memory bus event was lost, OR
+ *   (b) still pending but overdue (`wakeUpAt`/`expiresAt` already past).
+ *
+ * Case (b) overlaps with the wait-poller's first tick after boot, but explicit
+ * recovery avoids the up-to-5s startup latency window for stuck runs.
+ */
+export function getStuckWaitRuns(): StuckWaitRun[] {
+  return getDb()
+    .prepare<StuckWaitRun, []>(
+      `SELECT
+        wr.id as runId,
+        wrs.id as stepId,
+        wrs.nodeId,
+        wr.workflowId,
+        ws.id as waitId,
+        ws.mode as waitMode,
+        ws.status as waitStatus,
+        ws.wakeUpAt as wakeUpAt,
+        ws.expiresAt as expiresAt,
+        ws.firedPayload as firedPayload
+      FROM workflow_runs wr
+      JOIN workflow_run_steps wrs ON wrs.runId = wr.id AND wrs.status = 'waiting' AND wrs.nodeType = 'wait'
+      JOIN wait_states ws ON ws.workflowRunStepId = wrs.id
+      WHERE wr.status = 'waiting'
+        AND (
+          ws.status IN ('fired', 'timeout')
+          OR (
+            ws.status = 'pending'
+            AND (
+              (ws.wakeUpAt IS NOT NULL
+                AND ws.wakeUpAt <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+              OR
+              (ws.expiresAt IS NOT NULL
+                AND ws.expiresAt <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )
+          )
+        )`,
+    )
+    .all();
 }
 
 // ============================================================================

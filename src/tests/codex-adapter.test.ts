@@ -628,8 +628,8 @@ describe("resolveCodexModel", () => {
     expect(resolveCodexModel("opus")).toBe("gpt-5.4");
   });
 
-  test("claude shortname 'sonnet' → gpt-5.4-mini", () => {
-    expect(resolveCodexModel("sonnet")).toBe("gpt-5.4-mini");
+  test("claude shortname 'sonnet' → gpt-5.4", () => {
+    expect(resolveCodexModel("sonnet")).toBe("gpt-5.4");
   });
 
   test("claude shortname 'haiku' → gpt-5.4-mini", () => {
@@ -652,8 +652,9 @@ describe("resolveCodexModel", () => {
     expect(resolveCodexModel("GPT-5.4")).toBe("gpt-5.4");
   });
 
-  test("unknown model → CODEX_DEFAULT_MODEL", () => {
-    expect(resolveCodexModel("unknown-model")).toBe(CODEX_DEFAULT_MODEL);
+  test("unknown model passes through verbatim (lowercased)", () => {
+    expect(resolveCodexModel("gpt-5.5-experimental")).toBe("gpt-5.5-experimental");
+    expect(resolveCodexModel("GPT-9-FUTURE")).toBe("gpt-9-future");
   });
 });
 

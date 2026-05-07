@@ -3,10 +3,19 @@ import { z } from "zod";
 import { chunkContent } from "../be/chunking";
 import { getEmbeddingProvider, getMemoryStore } from "../be/memory";
 import { CANDIDATE_SET_MULTIPLIER } from "../be/memory/constants";
+import { listEdgesForAgent } from "../be/memory/edges-store";
+import { recordRetrievals } from "../be/memory/raters/retrieval";
+import { applyRating, ExplicitSelfDuplicateError } from "../be/memory/raters/store";
+import {
+  type RatingEvent,
+  REFERENCES_SOURCE_MAX_LENGTH,
+  sanitizeReferencesSource,
+} from "../be/memory/raters/types";
 import { rerank } from "../be/memory/reranker";
+import { getRetrievalsForAgent, hasRetrievalForTask } from "../be/memory/retrieval-store";
 import { AgentMemoryScopeSchema, AgentMemorySourceSchema } from "../types";
 import { route } from "./route-def";
-import { json, jsonError } from "./utils";
+import { json, jsonError, parseQueryParams } from "./utils";
 
 // ─── Route Definitions ───────────────────────────────────────────────────────
 
@@ -115,6 +124,105 @@ const deleteMemoryById = route({
   },
 });
 
+// Memory rater v1.5 — worker-facing rating endpoints. Plan:
+// thoughts/taras/plans/2026-05-05-memory-rater-v1.5/step-3.md
+//
+// `source` is restricted to `llm` and `explicit-self` at the HTTP boundary —
+// `implicit-citation` runs in-process server-side via applyRating directly
+// and must never arrive over HTTP (defence against worker spoofing).
+// `referencesSource` (step-6 §4) — Q2 free-form contract: ≤512 chars,
+// control-char strip, NUL byte rejection. Convention `<source>:<identifier>`
+// (e.g. github:owner/repo#N, linear:KEY-N, customer:<slug>) is documented
+// only in the OpenAPI description — server does NOT validate prefixes and
+// does NOT enforce a closed enum. The transform throws via `z.NEVER` when
+// sanitization rejects the input so the request fails with a clear 400.
+const ReferencesSourceSchema = z
+  .string()
+  .min(1)
+  .max(REFERENCES_SOURCE_MAX_LENGTH)
+  .transform((value, ctx) => {
+    const cleaned = sanitizeReferencesSource(value);
+    if (cleaned === null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "referencesSource must not contain NUL bytes or strip to empty",
+      });
+      return z.NEVER;
+    }
+    return cleaned;
+  })
+  .describe(
+    'Optional external source ID this memory references. Free-form string, convention "<source>:<identifier>" (e.g. "github:owner/repo#N", "linear:KEY-N", "customer:<slug>", "slack:<channel>:<ts>", "agentmail:<thread-id>"). Pick any prefix that fits — no closed enum. When present, an edge from this memory to the external source is created/updated.',
+  );
+
+const RateEventSchema = z.object({
+  memoryId: z.string().min(1),
+  signal: z.number().min(-1).max(1),
+  weight: z.number().min(0).max(1),
+  source: z.enum(["llm", "explicit-self"]),
+  reasoning: z.string().max(500).optional(),
+  taskId: z.string().uuid().optional(),
+  referencesSource: ReferencesSourceSchema.optional(),
+});
+
+const rateMemory = route({
+  method: "post",
+  path: "/api/memory/rate",
+  pattern: ["api", "memory", "rate"],
+  summary: "Submit RatingEvents to update memory usefulness posteriors",
+  tags: ["Memory"],
+  auth: { apiKey: true, agentId: true },
+  body: z.object({
+    events: z.array(RateEventSchema).min(1).max(50),
+  }),
+  responses: {
+    200: { description: "Ratings applied; per-event rejections returned in body" },
+    400: { description: "Validation error or explicit-self R6 spam-guard rejection" },
+    409: { description: "Duplicate explicit-self rating for (taskId, memoryId)" },
+  },
+});
+
+const getRetrievals = route({
+  method: "get",
+  path: "/api/memory/retrievals",
+  pattern: ["api", "memory", "retrievals"],
+  summary: "List memories retrieved for a task or session (rater input)",
+  tags: ["Memory"],
+  auth: { apiKey: true, agentId: true },
+  query: z
+    .object({
+      taskId: z.string().uuid().optional(),
+      sessionId: z.string().optional(),
+    })
+    .refine((q) => q.taskId || q.sessionId, {
+      message: "taskId or sessionId required",
+    }),
+  responses: {
+    200: { description: "Retrieval rows joined with agent_memory" },
+    400: { description: "Missing taskId/sessionId or X-Agent-ID" },
+  },
+});
+
+// Memory rater v1.5 step-6 — the edges-list endpoint that powers the
+// homepage demo ("this memory references PR #377"). Auth by X-Agent-ID +
+// Bearer with defence-in-depth: the joined `agent_memory` row must either
+// be swarm-scope or owned by the requesting agent. Plan §7.
+const getMemoryEdges = route({
+  method: "get",
+  path: "/api/memory/edges",
+  pattern: ["api", "memory", "edges"],
+  summary: "List references-source edges for a memory",
+  tags: ["Memory"],
+  auth: { apiKey: true, agentId: true },
+  query: z.object({
+    memoryId: z.string().min(1),
+  }),
+  responses: {
+    200: { description: "Edges with computed usefulness scores" },
+    400: { description: "Missing memoryId or X-Agent-ID" },
+  },
+});
+
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
 export async function handleMemory(
@@ -210,6 +318,27 @@ export async function handleMemory(
         isLead: false,
       });
       const ranked = rerank(candidates, { limit: Math.min(limit, 20) });
+
+      // Retrieval bridge — when caller passed `X-Source-Task-ID`, record one
+      // `memory_retrieval` row per returned memory so server-side raters
+      // (ImplicitCitationRater, fired from store-progress on task completion)
+      // know which memories were surfaced. Best-effort: a logging failure must
+      // never poison search.
+      const sourceTaskIdHeader = req.headers["x-source-task-id"];
+      const sourceTaskId = Array.isArray(sourceTaskIdHeader)
+        ? sourceTaskIdHeader[0]
+        : sourceTaskIdHeader;
+      if (sourceTaskId) {
+        try {
+          recordRetrievals(
+            sourceTaskId,
+            myAgentId,
+            ranked.map((r) => ({ memoryId: r.id, similarity: r.similarity })),
+          );
+        } catch (err) {
+          console.error("[memory-search] recordRetrievals failed:", (err as Error).message);
+        }
+      }
 
       json(res, {
         results: ranked.map((r) => ({
@@ -386,6 +515,106 @@ export async function handleMemory(
       console.log(`[memory] Re-embedding complete: ${memories.length} memories`);
     })();
 
+    return true;
+  }
+
+  if (rateMemory.match(req.method, pathSegments)) {
+    if (!myAgentId) {
+      jsonError(res, "Missing X-Agent-ID header", 400);
+      return true;
+    }
+
+    const parsed = await rateMemory.parse(req, res, pathSegments, new URLSearchParams());
+    if (!parsed) return true;
+
+    const { events } = parsed.body;
+
+    // R6 spam guard: explicit-self requires a matching memory_retrieval row.
+    // Reject the whole batch on first offender so the worker sees a clear 400.
+    for (const evt of events) {
+      if (evt.source !== "explicit-self") continue;
+      if (!evt.taskId) {
+        jsonError(res, `explicit-self rating for memoryId=${evt.memoryId} requires taskId`, 400);
+        return true;
+      }
+      if (!hasRetrievalForTask(evt.taskId, evt.memoryId)) {
+        jsonError(
+          res,
+          `explicit-self rating rejected: memoryId=${evt.memoryId} not present in memory_retrieval for task=${evt.taskId}`,
+          400,
+        );
+        return true;
+      }
+    }
+
+    // applyRating's ctx carries a single taskId for the batch. Group events by
+    // taskId so each call gets a single coherent ctx (and one transaction).
+    const groups = new Map<string | undefined, typeof events>();
+    for (const evt of events) {
+      const list = groups.get(evt.taskId) ?? [];
+      list.push(evt);
+      groups.set(evt.taskId, list);
+    }
+
+    let applied = 0;
+    const rejected: { memoryId: string; reason: string }[] = [];
+    try {
+      for (const [taskId, batch] of groups) {
+        const ratingEvents: RatingEvent[] = batch.map((e) => ({
+          memoryId: e.memoryId,
+          signal: e.signal,
+          weight: e.weight,
+          source: e.source,
+          reasoning: e.reasoning,
+          ...(e.referencesSource !== undefined ? { referencesSource: e.referencesSource } : {}),
+        }));
+        const result = applyRating(ratingEvents, { taskId });
+        applied += result.applied;
+        for (const r of result.rejected) {
+          rejected.push({ memoryId: r.event.memoryId, reason: r.reason });
+        }
+      }
+    } catch (err) {
+      if (err instanceof ExplicitSelfDuplicateError) {
+        jsonError(res, `Duplicate explicit-self rating for memoryId=${err.event.memoryId}`, 409);
+        return true;
+      }
+      throw err;
+    }
+
+    json(res, { applied, rejected });
+    return true;
+  }
+
+  if (getRetrievals.match(req.method, pathSegments)) {
+    if (!myAgentId) {
+      jsonError(res, "Missing X-Agent-ID header", 400);
+      return true;
+    }
+
+    const queryParams = parseQueryParams(req.url || "");
+    const parsed = await getRetrievals.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const { taskId, sessionId } = parsed.query;
+    const rows = getRetrievalsForAgent(myAgentId, { taskId, sessionId });
+    json(res, { results: rows });
+    return true;
+  }
+
+  if (getMemoryEdges.match(req.method, pathSegments)) {
+    if (!myAgentId) {
+      jsonError(res, "Missing X-Agent-ID header", 400);
+      return true;
+    }
+
+    const queryParams = parseQueryParams(req.url || "");
+    const parsed = await getMemoryEdges.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const { memoryId } = parsed.query;
+    const edges = listEdgesForAgent(myAgentId, memoryId);
+    json(res, { edges });
     return true;
   }
 

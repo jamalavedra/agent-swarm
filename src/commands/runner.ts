@@ -9,6 +9,7 @@ import {
   generateDefaultSoulMd,
   generateDefaultToolsMd,
 } from "../prompts/defaults.ts";
+import { renderMemoriesPrompt } from "../prompts/memories.ts";
 import { configureHttpResolver, resolveTemplateAsync } from "../prompts/resolver.ts";
 import { authJsonToCredentialSelection } from "../providers/codex-oauth/auth-json.js";
 import {
@@ -28,6 +29,7 @@ import { prettyPrintLine, prettyPrintStderr } from "../utils/pretty-print.ts";
 import { scrubSecrets } from "../utils/secret-scrubber.ts";
 import { detectVcsProvider } from "../vcs/index.ts";
 import { interpolate } from "../workflows/template.ts";
+import { awaitCredentials, BootMaxWaitExceededError, EX_CONFIG } from "./credential-wait.ts";
 // Side-effect import: registers runner trigger/resumption templates
 import "./templates.ts";
 
@@ -1543,6 +1545,7 @@ async function fetchRelevantMemories(
   apiKey: string,
   agentId: string,
   taskDescription: string,
+  taskId?: string,
 ): Promise<string | null> {
   try {
     const headers: Record<string, string> = {
@@ -1550,6 +1553,11 @@ async function fetchRelevantMemories(
       "X-Agent-ID": agentId,
     };
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    // Memory rater v1.5: server uses this header to log `memory_retrieval`
+    // rows so server-side raters (ImplicitCitationRater) can score the
+    // memories they surface against this task's session_logs at completion.
+    // Plan: thoughts/taras/plans/2026-05-05-memory-rater-v1.5/step-2.md §2
+    if (taskId) headers["X-Source-Task-ID"] = taskId;
 
     const response = await fetch(`${apiUrl}/api/memory/search`, {
       method: "POST",
@@ -1563,14 +1571,7 @@ async function fetchRelevantMemories(
       results: Array<{ id: string; name: string; content: string; similarity: number }>;
     };
 
-    const useful = (data.results || []).filter((m) => m.similarity > 0.4);
-    if (useful.length === 0) return null;
-
-    const memoryContext = useful
-      .map((m) => `- **${m.name}** (id: ${m.id}): ${m.content.substring(0, 300)}`)
-      .join("\n");
-
-    return `\n\n### Relevant Past Knowledge\n\nThese memories from your previous sessions may be useful. Use \`memory-get\` with the memory ID to retrieve full details.\n\n${memoryContext}\n`;
+    return renderMemoriesPrompt(data.results || []);
   } catch {
     // Non-blocking — don't fail task start because of memory search
     return null;
@@ -2541,6 +2542,43 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       process.exit(1);
     }
 
+    // Block until harness credentials are present in env. This loop replaces
+    // the old bash-level fail-fast in `docker-entrypoint.sh` — the worker is
+    // already registered (visible to the dashboard) and self-heals once
+    // creds appear in `swarm_config`. See plans/2026-05-06-worker-credential-safe-loop.md.
+    const harnessProvider = process.env.HARNESS_PROVIDER || "claude";
+    try {
+      await awaitCredentials({
+        provider: harnessProvider,
+        refreshEnv: async () => {
+          const { env } = await fetchResolvedEnv(apiUrl, apiKey, agentId);
+          return env;
+        },
+        onTick: (status) => {
+          // Best-effort status report — the dispatcher uses it to route
+          // around blocked agents. Failures are non-fatal (the wait loop
+          // already swallows onTick exceptions).
+          fetch(`${apiUrl}/api/agents/${encodeURIComponent(agentId)}/credential-status`, {
+            method: "PUT",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              "X-Agent-ID": agentId,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ ready: status.ready, missing: status.missing }),
+          }).catch(() => {
+            // Swallowed — Phase 2 wait loop logs every tick anyway.
+          });
+        },
+      });
+    } catch (err) {
+      if (err instanceof BootMaxWaitExceededError) {
+        console.error(`[${role}] ${err.message}`);
+        process.exit(EX_CONFIG);
+      }
+      throw err;
+    }
+
     // Clean up any stale active sessions from previous runs (crash recovery)
     await cleanupActiveSessions(apiConfig);
     console.log(`[${role}] Cleaned up stale active sessions`);
@@ -2865,6 +2903,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             apiKey,
             agentId,
             task.task,
+            task.id,
           );
           if (resumeMemoryContext) {
             resumePrompt += resumeMemoryContext;
@@ -3150,7 +3189,13 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
                 ? (trigger.task as { task: string; id?: string })
                 : null;
             if (task?.task) {
-              const memoryContext = await fetchRelevantMemories(apiUrl, apiKey, agentId, task.task);
+              const memoryContext = await fetchRelevantMemories(
+                apiUrl,
+                apiKey,
+                agentId,
+                task.task,
+                task.id,
+              );
               if (memoryContext) {
                 triggerPrompt += memoryContext;
                 console.log(`[${role}] Injected relevant memories into task prompt`);

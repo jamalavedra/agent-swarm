@@ -5,13 +5,13 @@
     "secrets-encryption",
     "harness-configuration",
     "harness-providers",
+    "worker-credential-recovery",
     "provider-auth",
     "slack-integration",
     "github-integration",
     "gitlab-integration",
     "agentmail-integration",
     "sentry-integration",
-    "linear-integration",
     "jira-integration",
     "x402-payments"
   ]
