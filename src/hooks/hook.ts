@@ -396,6 +396,21 @@ export async function runStopHookSessionSummary(
  * Main hook handler - processes Claude Code hook events
  */
 export async function handleHook(): Promise<void> {
+  // Recursive-hook guard: when an inner `claude -p` is spawned by
+  // src/utils/internal-ai/complete-structured.ts (memory rater, session
+  // summarizer) it inherits ~/.claude/settings.json and would fire its own
+  // Stop hook → spawn another `claude -p` → … fork bomb. The spawner sets
+  // AGENT_SWARM_DISABLE_HOOKS=1 to opt out. Drain stdin so claude doesn't
+  // block waiting for the hook to consume the message.
+  if (process.env.AGENT_SWARM_DISABLE_HOOKS === "1") {
+    try {
+      await Bun.stdin.json();
+    } catch {
+      // ignore — stdin may be empty
+    }
+    return;
+  }
+
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 
   let mcpConfig: McpServerConfig | undefined;

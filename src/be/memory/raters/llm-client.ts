@@ -124,12 +124,19 @@ export class ClaudeCliLlmRaterClient implements LlmRaterClient {
     let stdout = "";
     try {
       await Bun.write(tmpFile, prompt);
+      // `--bare` skips hook/skill/plugin/MCP/CLAUDE.md auto-discovery. Without
+      // it, the inner `claude -p` fires its own Stop hook on exit which can
+      // recursively spawn another `claude -p` (fork-bomb shape — see #460).
       const proc = Bun.spawn(
-        ["bash", "-c", `cat "${tmpFile}" | claude -p --model ${this.model} --output-format json`],
+        [
+          "bash",
+          "-c",
+          `cat "${tmpFile}" | claude -p --bare --model ${this.model} --output-format json`,
+        ],
         {
           stdout: "pipe",
           stderr: "pipe",
-          env: { ...process.env, SKIP_SESSION_SUMMARY: "1" },
+          env: { ...process.env, SKIP_SESSION_SUMMARY: "1", AGENT_SWARM_DISABLE_HOOKS: "1" },
         },
       );
       const timeoutId = setTimeout(() => proc.kill(), this.timeoutMs);
