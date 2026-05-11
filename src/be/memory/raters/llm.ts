@@ -57,6 +57,30 @@ export const SummaryWithRatingsSchema = z.object({
 export type LlmRating = z.infer<typeof RatingSchema>;
 export type SummaryWithRatings = z.infer<typeof SummaryWithRatingsSchema>;
 
+/**
+ * Base prompt for session summarization. Extracted from `src/hooks/hook.ts`
+ * so both the claude Stop hook and the worker-side `summarizeSession` helper
+ * in `src/utils/internal-ai/summarize-session.ts` share one source of truth.
+ *
+ * Callers append a `Task: <prompt>` line (optional) and `Transcript:\n<text>`
+ * block, then wrap with `buildSummaryWithRatingsPrompt(basePrompt, retrievals)`.
+ */
+export const BASE_SUMMARIZE_PROMPT = `You are summarizing an AI agent's work session. Extract ONLY high-value learnings.
+
+DO NOT include:
+- Generic descriptions of what was done ("worked on task X")
+- Tool calls or file reads
+- Routine progress updates
+
+DO include (if present):
+- **Mistakes made and corrections** — what went wrong and what fixed it
+- **Discovered patterns** — reusable approaches, APIs, or codebase conventions
+- **Codebase knowledge** — important file paths, architecture decisions, gotchas
+- **Environment knowledge** — service URLs, config details, tool quirks
+- **Failed approaches** — what was tried and didn't work (and why)
+
+Format as a bulleted list of concrete, reusable facts. If the session was routine with no significant learnings, respond with exactly: "No significant learnings."`;
+
 /** Context augmentations LlmRater consumes when called directly (per-memory path). */
 export type LlmRatingContext = RatingContext & {
   /** What the agent asked the memory system. */
@@ -193,7 +217,9 @@ export function buildSummaryWithRatingsPrompt(
 
   return `${basePrompt}
 
-CRITICAL: Return JSON conforming to this schema (no prose outside the JSON, no markdown fences):
+CRITICAL: Your entire response MUST be a single JSON object that conforms to the schema below. Do NOT wrap it in triple-backtick fences (no \`\`\`json or \`\`\`), do NOT add a prose preamble, do NOT add trailing commentary. Just the JSON object, nothing else.
+
+Schema:
 {
   "summary": string,                        // your existing summary text
   "ratings": [                              // one entry per memory you can score
@@ -216,80 +242,6 @@ ${memoryBlock}`;
 }
 
 /**
- * Best-effort parse of the structured `SummaryWithRatingsSchema` JSON out of
- * the `claude -p --output-format json` envelope (`{ result: "<inner json>" }`).
- *
- * Returns `null` on any parse failure — the caller falls back to the existing
- * summary-only path. NEVER throws.
- */
-export function parseSummaryWithRatings(claudeStdout: string): SummaryWithRatings | null {
-  let envelope: { result?: unknown };
-  try {
-    envelope = JSON.parse(claudeStdout) as { result?: unknown };
-  } catch {
-    return null;
-  }
-  const inner = envelope.result;
-  let candidate: unknown;
-  if (typeof inner === "string") {
-    try {
-      candidate = JSON.parse(inner.trim());
-    } catch {
-      return null;
-    }
-  } else if (inner && typeof inner === "object") {
-    candidate = inner;
-  } else {
-    return null;
-  }
-  const parsed = SummaryWithRatingsSchema.safeParse(candidate);
-  return parsed.success ? parsed.data : null;
-}
-
-/**
- * Fallback summary-text extractor for the hook's `claude -p` envelope. Used
- * when {@link parseSummaryWithRatings} returns null — i.e., when the LLM
- * returned a valid envelope but the inner payload either wasn't structured
- * JSON (unstructured prompt path) OR was structured JSON whose ratings failed
- * `SummaryWithRatingsSchema` validation (e.g., out-of-range scores).
- *
- * In the latter case `envelope.result` is the full inner JSON STRING such as
- * `{"summary":"...","ratings":[...]}`; indexing that verbatim into agent
- * memory would violate the step-4 contract that ratings are best-effort and
- * the existing summary-indexing behavior remains unchanged. We extract the
- * inner `summary` field if present, else return the inner string (treating
- * it as plain summary text). NEVER throws.
- */
-export function extractSummaryFromClaudeStdout(claudeStdout: string): string {
-  let envelope: { result?: unknown };
-  try {
-    envelope = JSON.parse(claudeStdout) as { result?: unknown };
-  } catch {
-    return claudeStdout;
-  }
-  const inner = envelope.result;
-  if (typeof inner === "string") {
-    try {
-      const innerParsed = JSON.parse(inner.trim()) as { summary?: unknown };
-      if (innerParsed && typeof innerParsed.summary === "string") {
-        return innerParsed.summary;
-      }
-    } catch {
-      // inner wasn't JSON — treat it as plain summary text
-    }
-    return inner;
-  }
-  if (
-    inner &&
-    typeof inner === "object" &&
-    typeof (inner as { summary?: unknown }).summary === "string"
-  ) {
-    return (inner as { summary: string }).summary;
-  }
-  return claudeStdout;
-}
-
-/**
  * `MEMORY_RATERS=...` includes `llm`? Used by the hook to gate the piggyback
  * path — strict opt-in so existing deployments are byte-identical when unset.
  */
@@ -308,10 +260,64 @@ export type RetrievalRow = {
   name: string;
   content: string;
   scope?: string;
+  /** `agent_memory.source` — present once the API surfaces it (post-PR #451 amendment). */
+  source?: string;
+  /** `agent_tasks.scheduleId` for the writing task, or null when not a scheduled run. */
+  scheduleId?: string | null;
   similarity?: number | null;
   retrievedAt?: string;
 };
 
+/**
+ * Dedupe candidate memories before LLM rating to prevent posterior inflation
+ * from scheduled-task self-similarity.
+ *
+ * **Why this exists.** Scheduled tasks fire identical task text on every
+ * run, and the task-completion path names each memory
+ * `"Task: ${task.task.slice(0, 80)}"` (`src/tools/store-progress.ts`). When
+ * the next run searches memory, its own past runs surface as "highly
+ * similar" rows. Without dedup, the LLM rater scored 5+ near-clones at +1.0
+ * each — bumping alpha 5x in a single session and distorting the Beta(α,β)
+ * ranking vs. a normal one-shot session. Concrete case (Lead's audit of the
+ * first 37 `llm` ratings, post-PR #450): the Claude Code Changelog Monitor
+ * hourly cron (taskId `f938d74d-05af-44a7-a0aa-3463d22be502`) produced 5
+ * saturating +1s in one rater pass — every rated memory was a prior hourly
+ * run.
+ *
+ * **Discriminator.** `agent_tasks.scheduleId`. Memories sharing a non-null
+ * `scheduleId` are by definition from the same scheduled job — that is the
+ * exact duplicate class the audit identified, and the only one we want to
+ * collapse. We do NOT key on `name` alone, because the 80-char truncation in
+ * task-completion names ("Task: …") and session-summary names ("Session: …")
+ * means two distinct one-shot tasks/summaries that happen to share the first
+ * 80 chars of their description would silently collapse — the false-positive
+ * path the PR #451 reviewer flagged.
+ *
+ * **Pass-through cases (NOT deduped).**
+ *   - `scheduleId` is null/undefined (manual one-shot tasks, manual memories,
+ *     file-index memories) — no scheduled-clone risk.
+ *   - Two memories from different scheduled jobs that happen to surface in
+ *     the same retrieval set — different `scheduleId`s, both kept.
+ *
+ * **Tie-break.** Input is `ORDER BY mr.retrievedAt DESC` from
+ * `getRetrievalsForAgent`, so "first occurrence per scheduleId" = "freshest
+ * surfaced run", which is the representative we want.
+ */
+export function dedupeRetrievalsForRater<T extends { scheduleId?: string | null }>(rows: T[]): T[] {
+  const seenSchedules = new Set<string>();
+  const out: T[] = [];
+  for (const row of rows) {
+    const scheduleId = row.scheduleId;
+    if (typeof scheduleId === "string" && scheduleId.length > 0) {
+      if (seenSchedules.has(scheduleId)) continue;
+      seenSchedules.add(scheduleId);
+    }
+    out.push(row);
+  }
+  return out;
+}
+
+// Worker-safe: uses fetch() only, no bun:sqlite import.
 /**
  * GET `/api/memory/retrievals?taskId=` — best-effort. Returns `[]` on any
  * failure so a transient API outage never blocks the summary-indexing path.
@@ -346,6 +352,7 @@ export async function fetchRetrievalsForTask(opts: {
   }
 }
 
+// Worker-safe: uses fetch() only, no bun:sqlite import.
 /**
  * POST `/api/memory/rate` — best-effort. Logs on 4xx/5xx, never throws. The
  * worker hook wraps the whole rating block in its own try/catch as a final

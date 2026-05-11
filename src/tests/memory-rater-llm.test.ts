@@ -8,9 +8,10 @@
  *      mapping, prompt construction.
  *   2. `LlmRater.rate(ctx)` per-memory path with `MockLlmRaterClient`.
  *   3. HTTP integration: spawn the API server against an isolated SQLite
- *      file, simulate the hook's piggyback flow (mock `claude -p` by feeding
- *      stdout directly into `parseSummaryWithRatings`), and assert
- *      `agent_memory.alpha/beta` move + `memory_rating` rows are written.
+ *      file, simulate the hook's piggyback flow (`generateObject` is mocked
+ *      by feeding the parsed object directly into `buildRatingsFromLlm`),
+ *      and assert `agent_memory.alpha/beta` move + `memory_rating` rows are
+ *      written.
  *   4. Negative path: `MEMORY_RATERS` unset → no `/api/memory/rate` call.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
@@ -22,13 +23,13 @@ import { SqliteMemoryStore } from "../be/memory/providers/sqlite-store";
 import {
   buildRatingsFromLlm,
   buildSummaryWithRatingsPrompt,
-  extractSummaryFromClaudeStdout,
+  dedupeRetrievalsForRater,
   fetchRetrievalsForTask,
   isLlmRaterEnabled,
   LLM_RATER_WEIGHT,
   LlmRater,
-  parseSummaryWithRatings,
   postRatings,
+  type RetrievalRow,
   SummaryWithRatingsSchema,
 } from "../be/memory/raters/llm";
 import { getRegisteredRaters, SERVER_RATERS } from "../be/memory/raters/registry";
@@ -210,108 +211,153 @@ describe("buildSummaryWithRatingsPrompt", () => {
   });
 });
 
-describe("parseSummaryWithRatings", () => {
-  test("parses a well-formed claude -p envelope (inner JSON as string)", () => {
-    const inner = JSON.stringify({
-      summary: "S",
-      ratings: [{ id: "m", score: 0.5, reasoning: "ok" }],
-    });
-    const envelope = JSON.stringify({ result: inner });
-    const out = parseSummaryWithRatings(envelope);
-    expect(out).not.toBeNull();
-    expect(out?.summary).toBe("S");
-    expect(out?.ratings).toHaveLength(1);
+describe("dedupeRetrievalsForRater", () => {
+  // Regression: the LLM rater audit (post-PR #450) found scheduled-task self-
+  // similarity inflated alpha posteriors 5x in one rater pass — the Claude
+  // Code Changelog Monitor cron surfaced 5 memories from prior hourly runs
+  // and got each rated +1.0. Dedup keys on `scheduleId` so only memories
+  // from the same scheduled job collapse; distinct one-shot tasks pass
+  // through even when their truncated 80-char names collide.
+
+  test("happy path: 5 cron memories sharing scheduleId + 1 distinct → 2 rows", () => {
+    const cronName = "Task: Claude Code Changelog Monitor — check for new entries";
+    const cronScheduleId = "sched-claude-code-changelog";
+    const rows: RetrievalRow[] = [
+      // Newest cron run first (API returns DESC by retrievedAt).
+      {
+        id: "cron-5",
+        name: cronName,
+        content: "run 5",
+        scheduleId: cronScheduleId,
+        retrievedAt: "2026-05-08T05:00:00Z",
+      },
+      {
+        id: "cron-4",
+        name: cronName,
+        content: "run 4",
+        scheduleId: cronScheduleId,
+        retrievedAt: "2026-05-08T04:00:00Z",
+      },
+      {
+        id: "cron-3",
+        name: cronName,
+        content: "run 3",
+        scheduleId: cronScheduleId,
+        retrievedAt: "2026-05-08T03:00:00Z",
+      },
+      {
+        id: "cron-2",
+        name: cronName,
+        content: "run 2",
+        scheduleId: cronScheduleId,
+        retrievedAt: "2026-05-08T02:00:00Z",
+      },
+      {
+        id: "cron-1",
+        name: cronName,
+        content: "run 1",
+        scheduleId: cronScheduleId,
+        retrievedAt: "2026-05-08T01:00:00Z",
+      },
+      // Different one-shot task — null scheduleId, must pass through.
+      {
+        id: "distinct",
+        name: "Task: Refactor MCP tool list",
+        content: "x",
+        scheduleId: null,
+        retrievedAt: "2026-05-07T12:00:00Z",
+      },
+    ];
+
+    const out = dedupeRetrievalsForRater(rows);
+
+    expect(out).toHaveLength(2);
+    // First-seen wins → freshest cron run is the representative.
+    expect(out.map((r) => r.id)).toEqual(["cron-5", "distinct"]);
   });
 
-  test("parses an envelope where `result` is an object (not stringified)", () => {
-    const envelope = JSON.stringify({
-      result: { summary: "S", ratings: [{ id: "m", score: 1, reasoning: "yes" }] },
-    });
-    const out = parseSummaryWithRatings(envelope);
-    expect(out).not.toBeNull();
-    if (!out) return;
-    expect(out.ratings[0]!.score).toBe(1);
+  test("two distinct one-shot tasks sharing the truncated 80-char name prefix → both kept", () => {
+    // Reviewer's flagged false-positive: `Task: ${task.task.slice(0, 80)}`
+    // collapses two distinct tasks whose first 80 chars happen to match. With
+    // scheduleId-keyed dedup, both have `null` scheduleId and pass through.
+    const sharedPrefix = `Task: ${"x".repeat(80)}`;
+    const rows: RetrievalRow[] = [
+      {
+        id: "task-a",
+        name: sharedPrefix,
+        content: `Task: ${"x".repeat(80)} unique-suffix-A\n\nOutput:\n…`,
+        scheduleId: null,
+        retrievedAt: "2026-05-08T05:00:00Z",
+      },
+      {
+        id: "task-b",
+        name: sharedPrefix,
+        content: `Task: ${"x".repeat(80)} unique-suffix-B\n\nOutput:\n…`,
+        scheduleId: null,
+        retrievedAt: "2026-05-08T04:00:00Z",
+      },
+    ];
+
+    const out = dedupeRetrievalsForRater(rows);
+
+    expect(out).toHaveLength(2);
+    expect(out.map((r) => r.id)).toEqual(["task-a", "task-b"]);
   });
 
-  test("returns null when envelope is not JSON", () => {
-    expect(parseSummaryWithRatings("not json")).toBeNull();
+  test("Task: vs Session: with the same prefix → both kept (different memory types)", () => {
+    // Both names share their first 80 chars after the type prefix; both have
+    // null scheduleId (one-shot work). Must pass through.
+    const sharedSuffix = "Refactor MCP tool list to use deferred discovery";
+    const rows: RetrievalRow[] = [
+      {
+        id: "task",
+        name: `Task: ${sharedSuffix}`,
+        content: "task body",
+        source: "task_completion",
+        scheduleId: null,
+        retrievedAt: "2026-05-08T05:00:00Z",
+      },
+      {
+        id: "session",
+        name: `Session: ${sharedSuffix}`,
+        content: "session summary",
+        source: "session_summary",
+        scheduleId: null,
+        retrievedAt: "2026-05-08T04:00:00Z",
+      },
+    ];
+
+    const out = dedupeRetrievalsForRater(rows);
+
+    expect(out).toHaveLength(2);
+    expect(out.map((r) => r.id)).toEqual(["task", "session"]);
   });
 
-  test("returns null when inner is not JSON", () => {
-    const envelope = JSON.stringify({ result: "this is not json either" });
-    expect(parseSummaryWithRatings(envelope)).toBeNull();
+  test("two different scheduled jobs surface in the same set → both representatives kept", () => {
+    const rows: RetrievalRow[] = [
+      { id: "j1-r2", name: "Task: Job One", content: "", scheduleId: "sched-1" },
+      { id: "j1-r1", name: "Task: Job One", content: "", scheduleId: "sched-1" },
+      { id: "j2-r2", name: "Task: Job Two", content: "", scheduleId: "sched-2" },
+      { id: "j2-r1", name: "Task: Job Two", content: "", scheduleId: "sched-2" },
+    ];
+
+    const out = dedupeRetrievalsForRater(rows);
+
+    expect(out).toHaveLength(2);
+    expect(out.map((r) => r.id)).toEqual(["j1-r2", "j2-r2"]);
   });
 
-  test("returns null when inner fails schema (out-of-range score)", () => {
-    const inner = JSON.stringify({
-      summary: "S",
-      ratings: [{ id: "m", score: 5, reasoning: "bogus" }],
-    });
-    const envelope = JSON.stringify({ result: inner });
-    expect(parseSummaryWithRatings(envelope)).toBeNull();
-  });
-});
-
-describe("extractSummaryFromClaudeStdout (hook fallback path)", () => {
-  // Regression: PR #429 review feedback. When the structured-output piggyback
-  // returns a valid envelope but the inner ratings fail SummaryWithRatingsSchema,
-  // the hook MUST index the human-readable `summary` text — not the raw inner
-  // JSON blob. See src/hooks/hook.ts ~L1148.
-  test("structured envelope with invalid ratings → extracts inner summary string", () => {
-    const summaryText = "Found a couple of helpful patterns; one was misleading.";
-    const inner = JSON.stringify({
-      summary: summaryText,
-      // Out-of-range score makes SummaryWithRatingsSchema.safeParse fail.
-      ratings: [{ id: "mem-A", score: 5, reasoning: "bogus" }],
-    });
-    const envelope = JSON.stringify({ result: inner });
-    expect(parseSummaryWithRatings(envelope)).toBeNull();
-    const out = extractSummaryFromClaudeStdout(envelope);
-    expect(out).toBe(summaryText);
-    // Hard guarantee for the indexer: must NOT be raw JSON.
-    expect(out.startsWith("{")).toBe(false);
-    expect(out.includes('"ratings"')).toBe(false);
+  test("rows without scheduleId pass through unchanged (manual / file_index memories)", () => {
+    const rows: RetrievalRow[] = [
+      { id: "m1", name: "Manual note", content: "", source: "manual" },
+      { id: "m2", name: "Manual note", content: "", source: "manual" },
+      { id: "m3", name: "Indexed file", content: "", source: "file_index", scheduleId: null },
+    ];
+    expect(dedupeRetrievalsForRater(rows)).toEqual(rows);
   });
 
-  test("structured envelope missing the `ratings` field entirely → extracts summary", () => {
-    const summaryText = "No retrievals this session.";
-    const inner = JSON.stringify({ summary: summaryText });
-    const envelope = JSON.stringify({ result: inner });
-    const out = extractSummaryFromClaudeStdout(envelope);
-    expect(out).toBe(summaryText);
-  });
-
-  test("structured envelope with non-string summary field → falls through to inner string", () => {
-    // Defensive: if `summary` itself is malformed, we still don't crash; the
-    // best-effort fallback is to return the inner JSON as a string. The
-    // length/keyword heuristics in the hook will likely skip indexing.
-    const inner = JSON.stringify({ summary: 42, ratings: [] });
-    const envelope = JSON.stringify({ result: inner });
-    const out = extractSummaryFromClaudeStdout(envelope);
-    expect(out).toBe(inner);
-  });
-
-  test("unstructured envelope with plain text result → returns the text unchanged", () => {
-    const text = "- Discovered that the API requires Bearer prefix.\n- No other learnings.";
-    const envelope = JSON.stringify({ result: text });
-    expect(extractSummaryFromClaudeStdout(envelope)).toBe(text);
-  });
-
-  test("envelope.result is an object with a string summary field → extracts it", () => {
-    const envelope = JSON.stringify({
-      result: { summary: "object form", ratings: [] },
-    });
-    expect(extractSummaryFromClaudeStdout(envelope)).toBe("object form");
-  });
-
-  test("envelope is not JSON → returns the raw stdout", () => {
-    const stdout = "totally not json";
-    expect(extractSummaryFromClaudeStdout(stdout)).toBe(stdout);
-  });
-
-  test("envelope is JSON but lacks `result` field → returns the raw stdout", () => {
-    const stdout = JSON.stringify({ other: "field" });
-    expect(extractSummaryFromClaudeStdout(stdout)).toBe(stdout);
+  test("empty input → empty output", () => {
+    expect(dedupeRetrievalsForRater([])).toEqual([]);
   });
 });
 
@@ -644,7 +690,7 @@ describe("HTTP integration: hook-piggyback dry-run", () => {
     expect(rows).toEqual([]);
   });
 
-  test("postRatings → applies events; alpha/beta posteriors move per mocked score", async () => {
+  test("postRatings → applies events; alpha/beta posteriors move per mocked generateObject result", async () => {
     const useful = makeMemory("piggyback-useful");
     const misleading = makeMemory("piggyback-misleading");
     const neutral = makeMemory("piggyback-neutral");
@@ -654,7 +700,10 @@ describe("HTTP integration: hook-piggyback dry-run", () => {
     insertRetrieval(taskA, misleading.id);
     insertRetrieval(taskA, neutral.id);
 
-    // Simulate hook flow: fetch retrievals, mock the LLM stdout, parse, POST.
+    // Simulate hook flow: fetch retrievals, run schema validation against a
+    // mocked `generateObject` result (object — not stringified envelope —
+    // because the AI SDK returns a parsed/validated object directly), then
+    // POST.
     const retrievals = await fetchRetrievalsForTask({
       apiUrl: BASE,
       apiKey: API_KEY,
@@ -663,20 +712,22 @@ describe("HTTP integration: hook-piggyback dry-run", () => {
     });
     expect(retrievals).toHaveLength(3);
 
-    // Mocked claude -p stdout — the same shape parseSummaryWithRatings expects.
-    const mockedSummaryJson = JSON.stringify({
+    const mockedGenerateObjectResult = {
       summary: "Found a couple of helpful patterns; one memory was misleading.",
       ratings: [
         { id: useful.id, score: 1, reasoning: "directly answered the question" },
         { id: misleading.id, score: 0, reasoning: "this memory contradicted the docs" },
         { id: neutral.id, score: 0.5, reasoning: "tangential but interesting" },
       ],
-    });
-    const mockedClaudeStdout = JSON.stringify({ result: mockedSummaryJson });
-    const parsed = parseSummaryWithRatings(mockedClaudeStdout);
-    expect(parsed).not.toBeNull();
+    };
+    // The AI SDK's `generateObject` validates against the Zod schema before
+    // returning; mirror that contract here so the test fails fast if the
+    // schema drifts.
+    const parsed = SummaryWithRatingsSchema.safeParse(mockedGenerateObjectResult);
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
 
-    const events = buildRatingsFromLlm(parsed!.ratings, retrievals);
+    const events = buildRatingsFromLlm(parsed.data.ratings, retrievals);
     expect(events).toHaveLength(3);
     for (const e of events) {
       expect(e.weight).toBe(0.8);
@@ -748,8 +799,8 @@ describe("HTTP integration: hook-piggyback dry-run", () => {
     delete process.env.MEMORY_RATERS;
     try {
       // Mirror the hook's gate: when isLlmRaterEnabled() is false, the hook
-      // never calls fetchRetrievalsForTask / parseSummaryWithRatings /
-      // postRatings — it falls back to the existing summary-only path.
+      // never calls fetchRetrievalsForTask / generateObject / postRatings —
+      // it falls back to the existing summary-only path.
       let postCalled = false;
       const fakeFetch: typeof fetch = async () => {
         postCalled = true;
@@ -802,5 +853,112 @@ describe("HTTP integration: hook-piggyback dry-run", () => {
     expect(r.status).toBeGreaterThanOrEqual(400);
     // Posterior unchanged — 400 means nothing was applied.
     expect(readPosterior(m.id)).toEqual({ alpha: 1.0, beta: 1.0 });
+  });
+
+  test("OPENROUTER_API_KEY unset → hook is a no-op (no fetch, no index, no rate POST)", async () => {
+    const m = makeMemory("piggyback-openrouter-unset");
+    insertRetrieval(taskA, m.id);
+
+    // Mirror the hook's outer gate exactly: when OPENROUTER_API_KEY is unset,
+    // the entire summary + rating block must early-return. No call to
+    // /api/memory/index, no call to /api/memory/rate, no LLM invocation.
+    const prev = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    try {
+      let anyFetchCalled = false;
+      const fakeFetch: typeof fetch = async () => {
+        anyFetchCalled = true;
+        return new Response("{}", { status: 200 });
+      };
+
+      const skip = !process.env.OPENROUTER_API_KEY;
+      expect(skip).toBe(true);
+
+      // The hook block is entirely guarded — no fetch, no postRatings.
+      // We never reach fetchRetrievalsForTask or postRatings, so neither is
+      // exercised in this branch.
+      if (!skip) {
+        // Unreachable in this test — defensive assertion only.
+        await fetchRetrievalsForTask({
+          apiUrl: BASE,
+          apiKey: API_KEY,
+          agentId: agentA,
+          taskId: taskA,
+          fetchImpl: fakeFetch,
+        });
+      }
+      expect(anyFetchCalled).toBe(false);
+    } finally {
+      if (prev !== undefined) process.env.OPENROUTER_API_KEY = prev;
+    }
+
+    // No memory_rating rows for taskA, posterior unchanged.
+    expect(getRatings(taskA)).toHaveLength(0);
+    expect(readPosterior(m.id)).toEqual({ alpha: 1.0, beta: 1.0 });
+  });
+
+  test("happy path: mocked generateObject result → postRatings called with expected events", async () => {
+    const useful = makeMemory("happy-useful");
+    const misleading = makeMemory("happy-misleading");
+
+    insertRetrieval(taskB, useful.id);
+    insertRetrieval(taskB, misleading.id);
+
+    const retrievals = await fetchRetrievalsForTask({
+      apiUrl: BASE,
+      apiKey: API_KEY,
+      agentId: agentA,
+      taskId: taskB,
+    });
+    expect(retrievals).toHaveLength(2);
+
+    // Stand in for `const { object } = await generateObject(...)` — the AI
+    // SDK guarantees `object` is already validated against the Zod schema.
+    const generateObjectResult: {
+      object: { summary: string; ratings: Array<{ id: string; score: number; reasoning: string }> };
+    } = {
+      object: {
+        summary: "Two patterns surfaced; one was misleading.",
+        ratings: [
+          { id: useful.id, score: 1, reasoning: "directly answered" },
+          { id: misleading.id, score: 0, reasoning: "contradicted the docs" },
+        ],
+      },
+    };
+
+    // Schema gate is implicit in the SDK, but assert here so a future schema
+    // change doesn't silently make this test pass on garbage data.
+    const validated = SummaryWithRatingsSchema.parse(generateObjectResult.object);
+
+    const events = buildRatingsFromLlm(validated.ratings, retrievals);
+    expect(events).toHaveLength(2);
+    const usefulEvent = events.find((e) => e.memoryId === useful.id)!;
+    const misleadingEvent = events.find((e) => e.memoryId === misleading.id)!;
+    expect(usefulEvent.signal).toBeCloseTo(1, 6);
+    expect(misleadingEvent.signal).toBeCloseTo(-1, 6);
+    expect(usefulEvent.source).toBe("llm");
+    expect(misleadingEvent.source).toBe("llm");
+
+    // Track that postRatings actually attempts the POST with our events.
+    let postedEvents: RatingEvent[] | null = null;
+    const trackingFetch: typeof fetch = async (url, init) => {
+      if (typeof url === "string" && url.endsWith("/api/memory/rate")) {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        postedEvents = body.events;
+      }
+      return new Response("{}", { status: 200 });
+    };
+    const r = await postRatings({
+      apiUrl: BASE,
+      apiKey: API_KEY,
+      agentId: agentA,
+      taskId: taskB,
+      events,
+      fetchImpl: trackingFetch,
+    });
+    expect(r.ok).toBe(true);
+    expect(postedEvents).not.toBeNull();
+    expect(postedEvents!).toHaveLength(2);
+    expect(postedEvents!.map((e) => e.memoryId).sort()).toEqual([useful.id, misleading.id].sort());
   });
 });

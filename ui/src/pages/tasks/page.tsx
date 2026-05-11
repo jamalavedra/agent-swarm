@@ -1,13 +1,15 @@
 import type { ColDef, RowClickedEvent } from "ag-grid-community";
 import { ChevronLeft, ChevronRight, Clock, GitBranch, Plus, Search, X } from "lucide-react";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAgents } from "@/api/hooks/use-agents";
 import { useScheduledTasks } from "@/api/hooks/use-schedules";
+import { useTaskTemplates } from "@/api/hooks/use-task-templates";
 import { useCreateTask, useTasks } from "@/api/hooks/use-tasks";
 import type { AgentTask, AgentTaskStatus } from "@/api/types";
 import { DataGrid } from "@/components/shared/data-grid";
 import { StatusBadge } from "@/components/shared/status-badge";
+import { TemplateRecommendationCard } from "@/components/shared/template-recommendation-card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -30,6 +32,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { useCurrentUser } from "@/contexts/current-user-context";
 import { formatElapsed, formatSmartTime } from "@/lib/utils";
 
 interface TaskFormData {
@@ -54,16 +57,35 @@ function CreateTaskDialog({
   open,
   onOpenChange,
   onSubmit,
+  initialValues,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSubmit: (data: TaskFormData) => void;
+  /** Optional starting values — used by the dashboard "To start" inbox bucket
+   *  to pre-fill the dialog from a `task_templates` row. Applied each time
+   *  the dialog opens; cleared on submit/cancel via the existing reset path. */
+  initialValues?: Partial<TaskFormData>;
 }) {
   const { data: agents } = useAgents();
   const { data: tasksData } = useTasks({ status: "pending", limit: 200 });
   const { data: runningTasksData } = useTasks({ status: "in_progress", limit: 200 });
-  const [form, setForm] = useState<TaskFormData>(emptyTaskForm);
+  const [form, setForm] = useState<TaskFormData>(() => ({ ...emptyTaskForm, ...initialValues }));
   const [depSearch, setDepSearch] = useState("");
+
+  // Re-seed the form whenever the dialog transitions from closed → open. We
+  // capture the latest `initialValues` via a ref so the effect doesn't fire
+  // on every parent render (where callers typically pass a fresh object
+  // literal). Reusing the same dialog instance across "To start" templates
+  // relies on this re-seed.
+  const initialValuesRef = useRef(initialValues);
+  initialValuesRef.current = initialValues;
+  useEffect(() => {
+    if (open) {
+      setForm({ ...emptyTaskForm, ...initialValuesRef.current });
+      setDepSearch("");
+    }
+  }, [open]);
 
   const leadAgent = agents?.find((a) => a.isLead) ?? agents?.[0];
 
@@ -312,7 +334,52 @@ export default function TasksPage() {
 
   const { data: tasksData, isLoading } = useTasks(filters);
   const createTask = useCreateTask();
+  const { userId: currentUserId } = useCurrentUser();
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [dialogInitialValues, setDialogInitialValues] = useState<Partial<TaskFormData> | undefined>(
+    undefined,
+  );
+
+  // Templates list (Phase 6) — only fetched when a `prefill` param is in the
+  // URL, so we don't pay for it on the cold path.
+  const prefillId = searchParams.get("prefill");
+  const { data: templates } = useTaskTemplates(prefillId ? { kind: "task" } : undefined);
+
+  // Auto-open the create-task dialog when navigated with `?new=true`
+  // (used by the home page's "First task" CTA AND the dashboard "To start"
+  // inbox bucket via `?new=true&prefill=<template_id>`). Strips both params
+  // after firing so refresh / back doesn't re-open.
+  useEffect(() => {
+    if (searchParams.get("new") === "true") {
+      // If a `prefill` param is present and the templates query has resolved,
+      // pre-fill the dialog from that template; otherwise open with empty
+      // defaults. We wait for templates to land before opening so the user
+      // doesn't briefly see an empty form on the prefill path.
+      if (prefillId) {
+        if (!templates) return;
+        const template = templates.find((t) => t.id === prefillId) ?? null;
+        if (template) {
+          setDialogInitialValues({
+            task: template.prompt || template.title,
+            taskType: "",
+            tags: template.tags.join(", "),
+          });
+        }
+      } else {
+        setDialogInitialValues(undefined);
+      }
+      setDialogOpen(true);
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete("new");
+          next.delete("prefill");
+          return next;
+        },
+        { replace: true },
+      );
+    }
+  }, [searchParams, setSearchParams, prefillId, templates]);
 
   function handleCreateSubmit(data: TaskFormData) {
     const tags = data.tags
@@ -326,6 +393,9 @@ export default function TasksPage() {
       ...(tags.length > 0 && { tags }),
       ...(data.priority !== 50 && { priority: data.priority }),
       ...(data.dependsOn.length > 0 && { dependsOn: data.dependsOn }),
+      // Phase 3: attribute the task to the current identity. `source` is left
+      // unset so the server's "api" default applies.
+      ...(currentUserId && { requestedByUserId: currentUserId }),
     });
   }
 
@@ -572,6 +642,18 @@ export default function TasksPage() {
         )}
       </div>
 
+      {/* Phase 3: smart empty state — when the swarm has zero tasks total
+          (not just zero matching the current filter), promote the
+          recommended starter template based on detected integrations. */}
+      {!isLoading && total === 0 && !hasActiveFilters ? (
+        <div className="py-4">
+          <TemplateRecommendationCard
+            eyebrow="Try this to get going"
+            actionLabel="Browse templates"
+          />
+        </div>
+      ) : null}
+
       <DataGrid
         rowData={tasksData?.tasks ?? []}
         columnDefs={columnDefs}
@@ -617,6 +699,7 @@ export default function TasksPage() {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         onSubmit={handleCreateSubmit}
+        initialValues={dialogInitialValues}
       />
     </div>
   );
