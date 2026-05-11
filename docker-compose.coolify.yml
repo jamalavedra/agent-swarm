@@ -3,11 +3,27 @@
 # Required env vars (set in Coolify UI):
 #   - API_KEY: Secret key for API authentication
 #   - CLAUDE_CODE_OAUTH_TOKEN: From `claude setup-token`
+#   - OTEL_AUTH_TOKEN: Bearer token for otel.openfort.io OTLP ingest
 #
 # Optional env vars:
 #   - SLACK_BOT_TOKEN, SLACK_APP_TOKEN: For Slack integration
 #   - GITHUB_TOKEN: For git operations in workers
 #   - GITHUB_WEBHOOK_SECRET: For GitHub webhook integration
+
+# Shared OpenTelemetry config for Claude Code subprocesses running in the lead
+# and workers. Exports metrics + traces to otel.openfort.io (VictoriaMetrics /
+# VictoriaTraces). Bearer token comes from Coolify env var OTEL_AUTH_TOKEN.
+x-claude-otel: &claude-otel
+  CLAUDE_CODE_ENABLE_TELEMETRY: "1"
+  OTEL_LOGS_EXPORTER: "none"
+  OTEL_METRICS_EXPORTER: "otlp"
+  OTEL_TRACES_EXPORTER: "otlp"
+  OTEL_METRICS_INCLUDE_SESSION_ID: "false"
+  OTEL_METRICS_INCLUDE_ACCOUNT_UUID: "false"
+  OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+  OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "https://otel.openfort.io/opentelemetry/v1/metrics"
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "https://otel.openfort.io/insert/opentelemetry/v1/traces"
+  OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer ${OTEL_AUTH_TOKEN:?}"
 
 services:
   api:
@@ -64,26 +80,27 @@ services:
       api:
         condition: service_healthy
     environment:
+      <<: *claude-otel
       # Required
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
-      - API_KEY=${API_KEY:?}
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:?}"
+      API_KEY: "${API_KEY:?}"
 
       # Agent identity (stable ID for task resume)
-      - AGENT_ID=${AGENT_ID_LEAD:-d454d1a5-4df9-49bd-8a89-e58d6a657dc3}
-      - AGENT_NAME=${AGENT_NAME_LEAD:-lead}
-      - AGENT_ROLE=lead
+      AGENT_ID: "${AGENT_ID_LEAD:-d454d1a5-4df9-49bd-8a89-e58d6a657dc3}"
+      AGENT_NAME: "${AGENT_NAME_LEAD:-lead}"
+      AGENT_ROLE: "lead"
 
       # Internal connection to API
-      - MCP_BASE_URL=http://api:3013
+      MCP_BASE_URL: "http://api:3013"
 
       # Behavior
-      - YOLO=${YOLO:-true}
-      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+      YOLO: "${YOLO:-true}"
+      SHUTDOWN_TIMEOUT: "${SHUTDOWN_TIMEOUT:-30000}"
 
       # Git config
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
-      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_EMAIL: "${GITHUB_EMAIL:-agent@swarm.local}"
+      GITHUB_NAME: "${GITHUB_NAME:-Agent Swarm}"
 
     volumes:
       - type: bind
@@ -111,29 +128,30 @@ services:
       api:
         condition: service_healthy
     environment:
+      <<: *claude-otel
       # Required
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
-      - API_KEY=${API_KEY:?}
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:?}"
+      API_KEY: "${API_KEY:?}"
 
       # Agent identity (stable ID for task resume)
-      - AGENT_ID=${AGENT_ID_WORKER1:-38d36438-58a0-45b5-8602-a5d52b07c2f1}
-      - AGENT_NAME=${AGENT_NAME_WORKER1:-worker-1}
-      - AGENT_ROLE=worker
+      AGENT_ID: "${AGENT_ID_WORKER1:-38d36438-58a0-45b5-8602-a5d52b07c2f1}"
+      AGENT_NAME: "${AGENT_NAME_WORKER1:-worker-1}"
+      AGENT_ROLE: "worker"
 
       # Internal connection to API
-      - MCP_BASE_URL=http://api:3013
+      MCP_BASE_URL: "http://api:3013"
 
       # Behavior
-      - YOLO=${YOLO:-true}
-      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+      YOLO: "${YOLO:-true}"
+      SHUTDOWN_TIMEOUT: "${SHUTDOWN_TIMEOUT:-30000}"
 
       # Git config
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
-      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_EMAIL: "${GITHUB_EMAIL:-agent@swarm.local}"
+      GITHUB_NAME: "${GITHUB_NAME:-Agent Swarm}"
 
       # Specialist prompt (optional)
-      - SYSTEM_PROMPT=${SYSTEM_PROMPT_WORKER1:-}
+      SYSTEM_PROMPT: "${SYSTEM_PROMPT_WORKER1:-}"
 
     volumes:
       - type: bind
@@ -161,29 +179,30 @@ services:
       api:
         condition: service_healthy
     environment:
+      <<: *claude-otel
       # Required
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
-      - API_KEY=${API_KEY:?}
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:?}"
+      API_KEY: "${API_KEY:?}"
 
       # Agent identity (stable ID for task resume)
-      - AGENT_ID=${AGENT_ID_WORKER2:-7904b1d0-110e-4e12-994b-6b468f0a4518}
-      - AGENT_NAME=${AGENT_NAME_WORKER2:-worker-2}
-      - AGENT_ROLE=worker
+      AGENT_ID: "${AGENT_ID_WORKER2:-7904b1d0-110e-4e12-994b-6b468f0a4518}"
+      AGENT_NAME: "${AGENT_NAME_WORKER2:-worker-2}"
+      AGENT_ROLE: "worker"
 
       # Internal connection to API
-      - MCP_BASE_URL=http://api:3013
+      MCP_BASE_URL: "http://api:3013"
 
       # Behavior
-      - YOLO=${YOLO:-true}
-      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+      YOLO: "${YOLO:-true}"
+      SHUTDOWN_TIMEOUT: "${SHUTDOWN_TIMEOUT:-30000}"
 
       # Git config
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
-      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_EMAIL: "${GITHUB_EMAIL:-agent@swarm.local}"
+      GITHUB_NAME: "${GITHUB_NAME:-Agent Swarm}"
 
       # Specialist prompt (optional)
-      - SYSTEM_PROMPT=${SYSTEM_PROMPT_WORKER2:-}
+      SYSTEM_PROMPT: "${SYSTEM_PROMPT_WORKER2:-}"
 
     volumes:
       - type: bind
@@ -211,29 +230,30 @@ services:
       api:
         condition: service_healthy
     environment:
+      <<: *claude-otel
       # Required
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
-      - API_KEY=${API_KEY:?}
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:?}"
+      API_KEY: "${API_KEY:?}"
 
       # Agent identity (stable ID for task resume)
-      - AGENT_ID=${AGENT_ID_WORKER3:-f00ed190-8066-4e4a-b7b7-f688e407430c}
-      - AGENT_NAME=${AGENT_NAME_WORKER3:-worker-3}
-      - AGENT_ROLE=worker
+      AGENT_ID: "${AGENT_ID_WORKER3:-f00ed190-8066-4e4a-b7b7-f688e407430c}"
+      AGENT_NAME: "${AGENT_NAME_WORKER3:-worker-3}"
+      AGENT_ROLE: "worker"
 
       # Internal connection to API
-      - MCP_BASE_URL=http://api:3013
+      MCP_BASE_URL: "http://api:3013"
 
       # Behavior
-      - YOLO=${YOLO:-true}
-      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+      YOLO: "${YOLO:-true}"
+      SHUTDOWN_TIMEOUT: "${SHUTDOWN_TIMEOUT:-30000}"
 
       # Git config
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
-      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_EMAIL: "${GITHUB_EMAIL:-agent@swarm.local}"
+      GITHUB_NAME: "${GITHUB_NAME:-Agent Swarm}"
 
       # Specialist prompt (optional)
-      - SYSTEM_PROMPT=${SYSTEM_PROMPT_WORKER3:-}
+      SYSTEM_PROMPT: "${SYSTEM_PROMPT_WORKER3:-}"
 
     volumes:
       - type: bind
@@ -261,29 +281,30 @@ services:
       api:
         condition: service_healthy
     environment:
+      <<: *claude-otel
       # Required
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
-      - API_KEY=${API_KEY:?}
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:?}"
+      API_KEY: "${API_KEY:?}"
 
       # Agent identity (stable ID for task resume)
-      - AGENT_ID=${AGENT_ID_WORKER4:-a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d}
-      - AGENT_NAME=${AGENT_NAME_WORKER4:-worker-4}
-      - AGENT_ROLE=worker
+      AGENT_ID: "${AGENT_ID_WORKER4:-a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d}"
+      AGENT_NAME: "${AGENT_NAME_WORKER4:-worker-4}"
+      AGENT_ROLE: "worker"
 
       # Internal connection to API
-      - MCP_BASE_URL=http://api:3013
+      MCP_BASE_URL: "http://api:3013"
 
       # Behavior
-      - YOLO=${YOLO:-true}
-      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+      YOLO: "${YOLO:-true}"
+      SHUTDOWN_TIMEOUT: "${SHUTDOWN_TIMEOUT:-30000}"
 
       # Git config
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
-      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_EMAIL: "${GITHUB_EMAIL:-agent@swarm.local}"
+      GITHUB_NAME: "${GITHUB_NAME:-Agent Swarm}"
 
       # Specialist prompt (optional)
-      - SYSTEM_PROMPT=${SYSTEM_PROMPT_WORKER4:-}
+      SYSTEM_PROMPT: "${SYSTEM_PROMPT_WORKER4:-}"
 
     volumes:
       - type: bind
@@ -311,29 +332,30 @@ services:
       api:
         condition: service_healthy
     environment:
+      <<: *claude-otel
       # Required
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
-      - API_KEY=${API_KEY:?}
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:?}"
+      API_KEY: "${API_KEY:?}"
 
       # Agent identity (stable ID for task resume)
-      - AGENT_ID=${AGENT_ID_WORKER5:-b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e}
-      - AGENT_NAME=${AGENT_NAME_WORKER5:-worker-5}
-      - AGENT_ROLE=worker
+      AGENT_ID: "${AGENT_ID_WORKER5:-b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e}"
+      AGENT_NAME: "${AGENT_NAME_WORKER5:-worker-5}"
+      AGENT_ROLE: "worker"
 
       # Internal connection to API
-      - MCP_BASE_URL=http://api:3013
+      MCP_BASE_URL: "http://api:3013"
 
       # Behavior
-      - YOLO=${YOLO:-true}
-      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+      YOLO: "${YOLO:-true}"
+      SHUTDOWN_TIMEOUT: "${SHUTDOWN_TIMEOUT:-30000}"
 
       # Git config
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
-      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_EMAIL: "${GITHUB_EMAIL:-agent@swarm.local}"
+      GITHUB_NAME: "${GITHUB_NAME:-Agent Swarm}"
 
       # Specialist prompt (optional)
-      - SYSTEM_PROMPT=${SYSTEM_PROMPT_WORKER5:-}
+      SYSTEM_PROMPT: "${SYSTEM_PROMPT_WORKER5:-}"
 
     volumes:
       - type: bind
@@ -361,29 +383,30 @@ services:
       api:
         condition: service_healthy
     environment:
+      <<: *claude-otel
       # Required
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
-      - API_KEY=${API_KEY:?}
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:?}"
+      API_KEY: "${API_KEY:?}"
 
       # Agent identity (stable ID for task resume)
-      - AGENT_ID=${AGENT_ID_WORKER6:-c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f}
-      - AGENT_NAME=${AGENT_NAME_WORKER6:-worker-6}
-      - AGENT_ROLE=worker
+      AGENT_ID: "${AGENT_ID_WORKER6:-c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f}"
+      AGENT_NAME: "${AGENT_NAME_WORKER6:-worker-6}"
+      AGENT_ROLE: "worker"
 
       # Internal connection to API
-      - MCP_BASE_URL=http://api:3013
+      MCP_BASE_URL: "http://api:3013"
 
       # Behavior
-      - YOLO=${YOLO:-true}
-      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+      YOLO: "${YOLO:-true}"
+      SHUTDOWN_TIMEOUT: "${SHUTDOWN_TIMEOUT:-30000}"
 
       # Git config
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
-      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_EMAIL: "${GITHUB_EMAIL:-agent@swarm.local}"
+      GITHUB_NAME: "${GITHUB_NAME:-Agent Swarm}"
 
       # Specialist prompt (optional)
-      - SYSTEM_PROMPT=${SYSTEM_PROMPT_WORKER6:-}
+      SYSTEM_PROMPT: "${SYSTEM_PROMPT_WORKER6:-}"
 
     volumes:
       - type: bind
@@ -411,29 +434,30 @@ services:
       api:
         condition: service_healthy
     environment:
+      <<: *claude-otel
       # Required
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
-      - API_KEY=${API_KEY:?}
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:?}"
+      API_KEY: "${API_KEY:?}"
 
       # Agent identity (stable ID for task resume)
-      - AGENT_ID=${AGENT_ID_WORKER7:-d4e5f6a7-b8c9-4d0e-1f2a-3b4c5d6e7f8a}
-      - AGENT_NAME=${AGENT_NAME_WORKER7:-worker-7}
-      - AGENT_ROLE=worker
+      AGENT_ID: "${AGENT_ID_WORKER7:-d4e5f6a7-b8c9-4d0e-1f2a-3b4c5d6e7f8a}"
+      AGENT_NAME: "${AGENT_NAME_WORKER7:-worker-7}"
+      AGENT_ROLE: "worker"
 
       # Internal connection to API
-      - MCP_BASE_URL=http://api:3013
+      MCP_BASE_URL: "http://api:3013"
 
       # Behavior
-      - YOLO=${YOLO:-true}
-      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+      YOLO: "${YOLO:-true}"
+      SHUTDOWN_TIMEOUT: "${SHUTDOWN_TIMEOUT:-30000}"
 
       # Git config
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
-      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_EMAIL: "${GITHUB_EMAIL:-agent@swarm.local}"
+      GITHUB_NAME: "${GITHUB_NAME:-Agent Swarm}"
 
       # Specialist prompt (optional)
-      - SYSTEM_PROMPT=${SYSTEM_PROMPT_WORKER7:-}
+      SYSTEM_PROMPT: "${SYSTEM_PROMPT_WORKER7:-}"
 
     volumes:
       - type: bind
@@ -461,29 +485,30 @@ services:
       api:
         condition: service_healthy
     environment:
+      <<: *claude-otel
       # Required
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:?}
-      - API_KEY=${API_KEY:?}
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:?}"
+      API_KEY: "${API_KEY:?}"
 
       # Agent identity (stable ID for task resume)
-      - AGENT_ID=${AGENT_ID_WORKER8:-e5f6a7b8-c9d0-4e1f-2a3b-4c5d6e7f8a9b}
-      - AGENT_NAME=${AGENT_NAME_WORKER8:-worker-8}
-      - AGENT_ROLE=worker
+      AGENT_ID: "${AGENT_ID_WORKER8:-e5f6a7b8-c9d0-4e1f-2a3b-4c5d6e7f8a9b}"
+      AGENT_NAME: "${AGENT_NAME_WORKER8:-worker-8}"
+      AGENT_ROLE: "worker"
 
       # Internal connection to API
-      - MCP_BASE_URL=http://api:3013
+      MCP_BASE_URL: "http://api:3013"
 
       # Behavior
-      - YOLO=${YOLO:-true}
-      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30000}
+      YOLO: "${YOLO:-true}"
+      SHUTDOWN_TIMEOUT: "${SHUTDOWN_TIMEOUT:-30000}"
 
       # Git config
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITHUB_EMAIL=${GITHUB_EMAIL:-agent@swarm.local}
-      - GITHUB_NAME=${GITHUB_NAME:-Agent Swarm}
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_EMAIL: "${GITHUB_EMAIL:-agent@swarm.local}"
+      GITHUB_NAME: "${GITHUB_NAME:-Agent Swarm}"
 
       # Specialist prompt (optional)
-      - SYSTEM_PROMPT=${SYSTEM_PROMPT_WORKER8:-}
+      SYSTEM_PROMPT: "${SYSTEM_PROMPT_WORKER8:-}"
 
     volumes:
       - type: bind
