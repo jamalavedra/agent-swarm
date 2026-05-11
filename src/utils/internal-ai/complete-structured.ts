@@ -78,15 +78,20 @@ function stripJsonFences(raw: string): string {
   return fenced?.[1] ? fenced[1].trim() : trimmed;
 }
 
-async function defaultSpawnClaudeCli(
-  prompt: string,
-  model: string,
-  signal?: AbortSignal,
-  jsonSchema?: object,
-): Promise<string> {
+/**
+ * Build the argv for an inner `claude -p` shellout. Exported for unit tests
+ * (regression guard for the `--bare` flag — see #460 fork-bomb).
+ *
+ * `--bare` skips auto-discovery of hooks, skills, plugins, MCP servers,
+ * auto memory, and CLAUDE.md. Without it, the inner `claude -p` reads the
+ * same ~/.claude/settings.json as the outer session and fires its own Stop
+ * hook on exit, which spawns another `claude -p` — recursive fork bomb.
+ */
+export function _buildClaudeCliCmd(model: string, jsonSchema?: object): string[] {
   const cmd = [
     process.env.CLAUDE_BINARY ?? "claude",
     "-p",
+    "--bare",
     "--model",
     model,
     "--output-format",
@@ -95,6 +100,16 @@ async function defaultSpawnClaudeCli(
   if (jsonSchema) {
     cmd.push("--json-schema", JSON.stringify(jsonSchema));
   }
+  return cmd;
+}
+
+async function defaultSpawnClaudeCli(
+  prompt: string,
+  model: string,
+  signal?: AbortSignal,
+  jsonSchema?: object,
+): Promise<string> {
+  const cmd = _buildClaudeCliCmd(model, jsonSchema);
   // The hook subprocess receives an empty CLAUDE_CODE_OAUTH_TOKEN (claude
   // CLI strips it from hooks). Restore it from the mirror set by
   // claude-adapter.ts so the inner `claude -p` invocation authenticates.
@@ -102,6 +117,9 @@ async function defaultSpawnClaudeCli(
   if (!env.CLAUDE_CODE_OAUTH_TOKEN && env.AGENT_SWARM_CLAUDE_OAUTH_TOKEN) {
     env.CLAUDE_CODE_OAUTH_TOKEN = env.AGENT_SWARM_CLAUDE_OAUTH_TOKEN;
   }
+  // Defense in depth: if a future claude CLI version stops honoring --bare,
+  // the hook handler in src/hooks/hook.ts also no-ops when this var is set.
+  env.AGENT_SWARM_DISABLE_HOOKS = "1";
   const proc = Bun.spawn({
     cmd,
     env,

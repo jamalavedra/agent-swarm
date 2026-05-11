@@ -527,8 +527,11 @@ ${JSON.stringify(taskData.outputSchema, null, 2)}
 Extract the structured data from the progress updates above. Return ONLY valid JSON matching the schema.`;
 
     const schemaJson = JSON.stringify(taskData.outputSchema);
+    // `--bare` skips hook/skill/plugin/MCP auto-discovery so this fallback
+    // call doesn't recursively fire the worker's own settings.json hooks.
     const result =
-      await Bun.$`claude -p ${extractionPrompt} --json-schema ${schemaJson} --output-format json --model sonnet`
+      await Bun.$`claude -p --bare ${extractionPrompt} --json-schema ${schemaJson} --output-format json --model sonnet`
+        .env({ ...process.env, AGENT_SWARM_DISABLE_HOOKS: "1" })
         .json()
         .catch(() => null);
 

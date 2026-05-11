@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { Type } from "typebox";
 import { z } from "zod";
-import { completeStructured } from "../../utils/internal-ai/complete-structured.js";
+import {
+  _buildClaudeCliCmd,
+  completeStructured,
+} from "../../utils/internal-ai/complete-structured.js";
 import type { ResolvedCredential } from "../../utils/internal-ai/credentials.js";
 
 const ResultZodSchema = z.object({
@@ -272,5 +275,29 @@ describe("completeStructured", () => {
         l.includes("internal-ai: kind=openrouter") && l.includes("callerTag=session-summary:test"),
     );
     expect(match).toBeDefined();
+  });
+});
+
+// Regression guard for #460: the inner `claude -p` must run with `--bare` so
+// it does not re-fire the outer session's settings.json hooks (Stop hook ->
+// inner claude -p -> Stop hook -> ... fork bomb).
+describe("_buildClaudeCliCmd", () => {
+  test("always includes --bare flag", () => {
+    expect(_buildClaudeCliCmd("haiku")).toContain("--bare");
+    expect(_buildClaudeCliCmd("haiku", { type: "object" })).toContain("--bare");
+  });
+
+  test("--bare appears before --model so claude parses it correctly", () => {
+    const cmd = _buildClaudeCliCmd("haiku");
+    const bareIdx = cmd.indexOf("--bare");
+    const modelIdx = cmd.indexOf("--model");
+    expect(bareIdx).toBeGreaterThan(0);
+    expect(bareIdx).toBeLessThan(modelIdx);
+  });
+
+  test("passes the model and json-schema through", () => {
+    const cmd = _buildClaudeCliCmd("sonnet", { type: "object", required: ["x"] });
+    expect(cmd).toContain("sonnet");
+    expect(cmd.join(" ")).toContain('"required":["x"]');
   });
 });
